@@ -748,6 +748,15 @@ internal fun rememberAvailableMetrics(): List<Metric> {
     }
 }
 
+/**
+ * 「颜色」胶囊的固定底色（Material Purple 200 的淡紫）。
+ *
+ * 有意**不随昼夜主题与曲线色变化**：它是一枚功能按钮（点开颜色选择面板），
+ * 不是颜色指示器。固定色让标题行右侧的视觉权重稳定；浅紫底 + 亮度反算出的深色文字
+ * 在明暗两种主题下都有足够对比度。
+ */
+private val ColorButtonLilac = Color(0xFFB39DDB)
+
 @Composable
 internal fun TrendCard(
     samples: List<PowerSample>,
@@ -784,12 +793,16 @@ internal fun TrendCard(
                     modifier = Modifier.align(Alignment.CenterEnd),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    // 底色 = 当前曲线色，一眼看出"这根线是什么颜色"；
-                    // 文字颜色按亮度反算（色值由用户自由指定，不能像 SportLink 那样写死白色）
+                    // 底色固定为淡紫，**不再跟随曲线色**（2026-09-21 用户约定）：
+                    // 跟随曲线色时，用户把线调成黄/白等浅色后按钮会跟着变浅，既让标题行右侧
+                    // 两枚胶囊的视觉权重随数据漂移，也和"这是按钮、不是色块"的语义打架。
+                    // 曲线色改由 tab 上的色点表达（见下方 FilterChip 的 leadingIcon）——
+                    // 色点紧贴指标名，位置唯一、不会被误读成按钮底纹。
+                    // 文字色仍按亮度反算，保留"底浅则字深"的自适应能力。
                     ChartPillButton(
                         text = stringResource(R.string.action_color),
-                        background = metricColor,
-                        contentColor = onColorFor(metricColor),
+                        background = ColorButtonLilac,
+                        contentColor = onColorFor(ColorButtonLilac),
                         onClick = onColorClick,
                     )
                     FullscreenPillButton(onClick = onFullscreenClick)
@@ -798,10 +811,20 @@ internal fun TrendCard(
             Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 tabs.forEach { m ->
+                    // 色点标出该指标当前的曲线色，口径与全屏趋势页的 tab 完全一致
+                    // （TrendFullscreenActivity 的 leadingIcon 同一写法：8dp 圆点 + 该指标色）
+                    val chipColor = rememberMetricColor(m)
                     FilterChip(
                         selected = metric == m,
                         onClick = { onMetricChange(m) },
                         label = { Text(m.label()) },
+                        leadingIcon = {
+                            Box(
+                                Modifier
+                                    .size(8.dp)
+                                    .background(chipColor, RoundedCornerShape(50)),
+                            )
+                        },
                         shape = RoundedCornerShape(50),
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
