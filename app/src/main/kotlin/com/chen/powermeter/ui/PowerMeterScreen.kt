@@ -1,4 +1,4 @@
-package com.kongj.powermeter.ui
+package com.chen.powermeter.ui
 
 import android.content.res.Configuration
 import android.os.Build
@@ -49,6 +49,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -66,11 +67,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.kongj.powermeter.data.BatteryInfo
-import com.kongj.powermeter.data.PowerSample
-import com.kongj.powermeter.data.SessionStats
-import com.kongj.powermeter.ui.common.BlurTopBar
-import com.kongj.powermeter.ui.theme.LocalCornerRadius
+import com.chen.powermeter.data.BatteryInfo
+import com.chen.powermeter.data.PowerSample
+import com.chen.powermeter.data.RootPowerReader
+import com.chen.powermeter.data.SessionStats
+import com.chen.powermeter.ui.common.BlurTopBar
+import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import dev.chrisbanes.haze.HazeState
@@ -94,6 +96,11 @@ private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
 
 private fun Double?.f3OrDash(): String = this?.f3() ?: "—"
 
+/** 温度类（电池/接口/最高温度）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余温度仍 3 位 */
+private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
+
+private fun Double?.f1OrDash(): String = this?.f1() ?: "—"
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun PowerMeterScreen(
@@ -107,6 +114,12 @@ fun PowerMeterScreen(
     chargeMonitor: Boolean,
     /** 串联双电池：电压按整组（单节读数 ×2）换算，功率同步 ×2 */
     seriesDualBattery: Boolean,
+    /** Shizuku 是否在位（已安装且服务运行） */
+    shizukuAvailable: Boolean,
+    /** Shizuku 是否已授权本应用 */
+    shizukuGranted: Boolean,
+    /** Shizuku UserService 是否已绑定（真正可以执行命令） */
+    shizukuBound: Boolean,
     /** 非空 = 当前展示的是导入的 CSV（而非实时采样），值为文件名 */
     importedName: String?,
     onStart: () -> Unit,
@@ -115,6 +128,10 @@ fun PowerMeterScreen(
     onWakeLockChange: (Boolean) -> Unit,
     onChargeMonitorChange: (Boolean) -> Unit,
     onSeriesDualBatteryChange: (Boolean) -> Unit,
+    /** 申请 Shizuku 授权（弹系统授权框） */
+    onShizukuRequest: () -> Unit,
+    /** 强制重绑 Shizuku UserService */
+    onShizukuRetry: () -> Unit,
     onExport: () -> Unit,
     onClear: () -> Unit,
     onExitImport: () -> Unit,
@@ -303,11 +320,16 @@ fun PowerMeterScreen(
             wakeLock = wakeLock,
             chargeMonitor = chargeMonitor,
             seriesDualBattery = seriesDualBattery,
+            shizukuAvailable = shizukuAvailable,
+            shizukuGranted = shizukuGranted,
+            shizukuBound = shizukuBound,
             corner = corner,
             onIntervalChange = onIntervalChange,
             onWakeLockChange = onWakeLockChange,
             onChargeMonitorChange = onChargeMonitorChange,
             onSeriesDualBatteryChange = onSeriesDualBatteryChange,
+            onShizukuRequest = onShizukuRequest,
+            onShizukuRetry = onShizukuRetry,
             onClear = onClear,
             onDismiss = { settingsOpen = false },
         )
@@ -446,7 +468,12 @@ private fun HeroPowerCard(
                 }
             }
             Spacer(Modifier.height(8.dp))
-            Row(verticalAlignment = Alignment.Bottom) {
+            // 整组贴右缘：单位 "W" 右端钉死，数值长度变化（— → 4.421）时只向左侧扩展，单位不位移
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.Bottom,
+            ) {
                 Text(
                     sample?.powerW?.f3() ?: "—",
                     style = MaterialTheme.typography.displayLarge.copy(fontSize = 56.sp),
@@ -482,18 +509,28 @@ private fun HeroPowerCard(
 
 @Composable
 private fun MetricGrid(sample: PowerSample?, shape: RoundedCornerShape) {
+    // Shizuku binder 兜底（sysfs 被 SELinux 拦截的机器）拿不到接口/充电 IC 温度：
+    // 开路电压顶替接口温度的位置，接口温度与充电 IC 温度两张卡片隐藏（用户拍板 2026-09-21）
+    val binderFallback by RootPowerReader.binderFallback.collectAsState()
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             MetricCard("电压", sample?.voltageV.f3OrDash(), "V", shape, Modifier.weight(1f))
             MetricCard("电流", sample?.currentMa.f3OrDash(), "mA", shape, Modifier.weight(1f))
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricCard("电池温度", sample?.tempBatteryC.f3OrDash(), "℃", shape, Modifier.weight(1f))
-            MetricCard("接口温度", sample?.tempUsbC.f3OrDash(), "℃", shape, Modifier.weight(1f))
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricCard("开路电压", sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.weight(1f))
-            MetricCard("充电 IC 温度", sample?.tempChargerC.f3OrDash(), "℃", shape, Modifier.weight(1f))
+        if (binderFallback) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                MetricCard("电池温度", sample?.tempBatteryC.f1OrDash(), "℃", shape, Modifier.weight(1f))
+                MetricCard("开路电压", sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.weight(1f))
+            }
+        } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                MetricCard("电池温度", sample?.tempBatteryC.f1OrDash(), "℃", shape, Modifier.weight(1f))
+                MetricCard("接口温度", sample?.tempUsbC.f1OrDash(), "℃", shape, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                MetricCard("开路电压", sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.weight(1f))
+                MetricCard("充电 IC 温度", sample?.tempChargerC.f3OrDash(), "℃", shape, Modifier.weight(1f))
+            }
         }
     }
 }
@@ -520,7 +557,12 @@ private fun MetricCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(6.dp))
-            Row(verticalAlignment = Alignment.Bottom) {
+            // 同上：数值 + 单位整组贴右，采样开始后单位不会随数值位数变化而左右跳动
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.Bottom,
+            ) {
                 Text(
                     value,
                     style = MaterialTheme.typography.headlineSmall,
@@ -763,7 +805,7 @@ private fun StatsCard(stats: SessionStats, shape: RoundedCornerShape) {
             StatRow("峰值充电", "${stats.peakChargeW.f3()} W")
             StatRow("峰值放电", "${stats.peakDischargeW.f3()} W")
             StatRow("电压范围", "${stats.minVoltageV.f3()} ~ ${stats.maxVoltageV.f3()} V")
-            StatRow("最高温度", "${stats.maxTempC.f3()} ℃")
+            StatRow("最高温度", "${stats.maxTempC.f1()} ℃")
             StatRow("累计充入", "${stats.chargedMah.f3()} mAh · ${stats.chargedWh.f3()} Wh")
             StatRow("累计放出", "${stats.dischargedMah.f3()} mAh · ${stats.dischargedWh.f3()} Wh")
         }
@@ -875,18 +917,42 @@ private fun SettingsSheet(
     wakeLock: Boolean,
     chargeMonitor: Boolean,
     seriesDualBattery: Boolean,
+    shizukuAvailable: Boolean,
+    shizukuGranted: Boolean,
+    shizukuBound: Boolean,
     corner: Dp,
     onIntervalChange: (Long) -> Unit,
     onWakeLockChange: (Boolean) -> Unit,
     onChargeMonitorChange: (Boolean) -> Unit,
     onSeriesDualBatteryChange: (Boolean) -> Unit,
+    onShizukuRequest: () -> Unit,
+    onShizukuRetry: () -> Unit,
     onClear: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val options = listOf(500L to "0.5s", 1_000L to "1s", 2_000L to "2s", 5_000L to "5s")
+    // 开板态按方向区分（口径与 ColorPickerSheet 完全一致）：
+    // ⚠️ material3 1.5.0-alpha27 的 rememberBottomSheetState 没有 skipPartiallyExpanded 参数
+    //    （那是旧 API rememberModalBottomSheetState 的），它用 enabledValues 集合；
+    //    SheetState.show() 的落点是「enabledValues 含 PartiallyExpanded → 先停半展开；否则 → Expanded」。
+    // · 竖屏：去掉 PartiallyExpanded → 开板即全展开。本面板内容约 500dp（标题 + 采样间隔 +
+    //   三个开关 + 权限区块 + 清空按钮），超过竖屏半屏，停在半展开会把底部「清空采样数据」
+    //   压到屏幕外，用户还得再上滑一次。
+    // · 横屏：维持默认（含 PartiallyExpanded），可用高度只有 360dp 上下，开板观感与改动前一致；
+    //   内容已加 verticalScroll，超高时照旧可滚。
+    //   enabledValues 是 rememberSaveable 的 key，旋转后会正确重建状态。
+    val isLandscape =
+        LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden),
+        sheetState = rememberBottomSheetState(
+            initialValue = SheetValue.Hidden,
+            enabledValues = if (isLandscape) {
+                setOf(SheetValue.Hidden, SheetValue.PartiallyExpanded, SheetValue.Expanded)
+            } else {
+                setOf(SheetValue.Hidden, SheetValue.Expanded)
+            },
+        ),
         containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         // 自定义拖拽横条已移入 sheet 内容区（见下方 Column 首项），此处 dragHandle = null，
         // 彻底规避 M3 默认 SheetDefaults.DragHandle 长按弹出的"拖动手柄" tooltip；
@@ -896,6 +962,9 @@ private fun SettingsSheet(
         Column(
             Modifier
                 .fillMaxWidth()
+                // 可竖向滚动：横屏半展开时可用高度只有 360dp 上下，内容必然超出；
+                // 无滚动则底部「清空采样数据」按钮点不到（与 ColorPickerSheet 同口径）
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp)
                 .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)),
         ) {
@@ -980,7 +1049,7 @@ private fun SettingsSheet(
                 Column(Modifier.weight(1f)) {
                     Text("串联双电池", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "对于串联双电池机器，电压与功率计算要 ×2（小米机器不需要开启）",
+                        "内核上报单节电压，串联机型整组电压 ×2，功率随之 ×2（小米机器不需要开启）",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -990,6 +1059,41 @@ private fun SettingsSheet(
                     onCheckedChange = onSeriesDualBatteryChange,
                 )
             }
+            Spacer(Modifier.height(20.dp))
+
+            // ---- 数据读取权限（Shizuku） ----
+            // 非 root 机器必须装 Shizuku 并授权，才能以 shell 身份读 /sys 电量节点；
+            // 已 root 设备走 su 通道，本节显示「未检测到 Shizuku」可忽略。
+            val shizukuUi: Triple<String, String?, (() -> Unit)?> = when {
+                shizukuBound -> Triple("已就绪 · 以 shell 身份读取底层节点", null, null)
+                shizukuAvailable && shizukuGranted -> Triple("已授权 · 正在连接 Shizuku 服务…", "重试", onShizukuRetry)
+                shizukuAvailable -> Triple("Shizuku 正在运行 · 尚未授权本应用", "授权", onShizukuRequest)
+                else -> Triple("未检测到 Shizuku（已 root 设备可忽略此项）", null, null)
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("数据读取权限", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        shizukuUi.first,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                shizukuUi.third?.let { action ->
+                    Spacer(Modifier.width(12.dp))
+                    FilledTonalButton(
+                        onClick = action,
+                        shape = RoundedCornerShape(50),
+                    ) {
+                        Text(shizukuUi.second ?: "")
+                    }
+                }
+            }
+
             Spacer(Modifier.height(20.dp))
             FilledTonalButton(
                 onClick = { onClear(); onDismiss() },

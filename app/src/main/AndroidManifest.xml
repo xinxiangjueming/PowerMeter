@@ -9,13 +9,32 @@
     <!-- 锁屏后保持 CPU 运行 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Shizuku：非 root 机器经 adb（无线调试）授权后，以 shell 身份读取 /sys 电量节点。
+         权限名固定为 API_V3，与 fold 同口径 -->
+    <uses-permission android:name="rikka.shizuku.permission.API_V3" />
+
+    <!-- Application 需注册自定义类：onCreate 里初始化 ShizukuHelper（注册 binder 监听器） -->
     <application
+        android:name=".PowerMeterApp"
         android:allowBackup="true"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@drawable/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.PowerMeter">
+
+        <!-- ShizukuProvider：自动初始化与 Shizuku 服务的 binder 连接。
+             ⚠️ authority 必须是 `${applicationId}.shizuku`；
+             ⚠️ permission 必须是 android.permission.INTERACT_ACROSS_USERS_FULL，
+             不能写成 rikka.shizuku.permission.API_V3（后者是给 uses-permission 用的，
+             写在这里会导致 Shizuku 无法连接）。口径对齐 fold AndroidManifest.xml:62-69 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <!-- configChanges 与两个参照实现同口径：fold 的 MainActivity（app/src/main/AndroidManifest.xml:82-116）
              与 sportlink 的 DeviceManageActivity（AndroidManifest.xml:330-332）都保留 orientation|screenSize

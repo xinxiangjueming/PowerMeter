@@ -1,4 +1,4 @@
-package com.kongj.powermeter.util
+package com.chen.powermeter.util
 
 import android.app.Activity
 import android.os.Build
@@ -79,11 +79,20 @@ object NavigationBarHelper {
         }
     }
 
-    /** 退出真沉浸：恢复系统栏常驻显示（全屏页 finish 前无需调用，窗口随 Activity 销毁） */
+    /**
+     * 退出真沉浸：恢复状态栏与小白条常驻显示。
+     *
+     * 调用点：`TrendFullscreenActivity.requestClose()`（关闭全屏页的 C+ 时序第一步）。
+     * 必须在 finish 之前调用 —— 主页顶栏高度 = `safeDrawing` 顶部 inset + 64dp，若等窗口销毁
+     * 才由系统恢复系统栏，主页首帧会先按"无系统栏"排一次、再跳一次（返回瞬闪的第二个来源）。
+     *
+     * ⚠️ **有意不碰** `setDecorFitsSystemWindows`：本方法的使用场景是"全屏页即将销毁"，
+     *    改成 true 只会让窗口在过渡期按系统栏内缩、在栏一侧露出色带；edge-to-edge 的窗口属性
+     *    由 [applyWindowProperties] 无条件维护（重放链的公共出口），此处改回去反而制造断层。
+     */
     fun exitImmersive(activity: Activity) {
         WindowInsetsControllerCompat(activity.window, activity.window.decorView)
             .show(WindowInsetsCompat.Type.systemBars())
-        WindowCompat.setDecorFitsSystemWindows(activity.window, true)
     }
 
     /**

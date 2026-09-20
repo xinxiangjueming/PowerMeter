@@ -128,7 +128,7 @@ X 轴按**时间比例**映射（预计算归一化时间分数），而非按�
 ## 4. 架构与模块地图
 
 ```
-app/src/main/kotlin/com/kongj/powermeter/
+app/src/main/kotlin/com/chen/powermeter/
 ├── MainActivity.kt              253 行  入口：权限、外部 Intent 分发、导出、配置变更重放
 ├── data/
 │   ├── PowerSample.kt            70 行  采样快照 PowerSample / 会话统计 SessionStats

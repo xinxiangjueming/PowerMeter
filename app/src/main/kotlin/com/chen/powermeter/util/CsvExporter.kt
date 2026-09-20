@@ -1,11 +1,11 @@
-package com.kongj.powermeter.util
+package com.chen.powermeter.util
 
 import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.content.ContentValues
-import com.kongj.powermeter.data.PowerSample
+import com.chen.powermeter.data.PowerSample
 import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -55,8 +55,8 @@ object CsvExporter {
                                 s.currentMa.f3(),
                                 s.fgCurrentMa?.f3() ?: "",
                                 s.powerW.f3(),
-                                s.tempBatteryC.f3(),
-                                s.tempUsbC?.f3() ?: "",
+                                s.tempBatteryC.f1(),
+                                s.tempUsbC?.f1() ?: "",
                                 s.tempChargerC?.f3() ?: "",
                                 s.socPct.toString(),
                                 s.status,
@@ -81,4 +81,7 @@ object CsvExporter {
     }
 
     private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
+
+    /** 温度类（电池/接口）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余列仍 3 位 */
+    private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 }

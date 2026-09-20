@@ -1,4 +1,4 @@
-package com.kongj.powermeter.service
+package com.chen.powermeter.service
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -14,17 +14,18 @@ import android.os.PowerManager
 import android.provider.OpenableColumns
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import com.kongj.powermeter.MainActivity
-import com.kongj.powermeter.R
-import com.kongj.powermeter.data.BatteryInfo
-import com.kongj.powermeter.data.PowerSample
-import com.kongj.powermeter.data.RootPowerReader
-import com.kongj.powermeter.util.CsvExporter
-import com.kongj.powermeter.util.Prefs
-import com.kongj.powermeter.util.ScreenController
+import com.chen.powermeter.MainActivity
+import com.chen.powermeter.R
+import com.chen.powermeter.data.BatteryInfoStore
+import com.chen.powermeter.data.PowerSample
+import com.chen.powermeter.data.RootPowerReader
+import com.chen.powermeter.util.CsvExporter
+import com.chen.powermeter.util.Prefs
+import com.chen.powermeter.util.ScreenController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,14 +37,14 @@ import java.util.Locale
 
 /**
  * 前台采样服务：
- * - 锁屏后持续以 root 读取底层电量节点
+ * - 锁屏后持续读取底层电量节点（Shizuku 优先、root 兜底，见 [RootPowerReader]）
  * - 常驻通知实时显示功率/电压/电流/温度
  * - 可选 PARTIAL_WAKE_LOCK 保证息屏后采样连续
  */
 class SamplingService : Service() {
 
     companion object {
-        const val ACTION_STOP = "com.kongj.powermeter.action.STOP"
+        const val ACTION_STOP = "com.chen.powermeter.action.STOP"
 
         private const val NOTIF_ID = 2001
 
@@ -81,9 +82,6 @@ class SamplingService : Service() {
         private val _running = MutableStateFlow(false)
         val running: StateFlow<Boolean> = _running.asStateFlow()
 
-        private val _batteryInfo = MutableStateFlow<BatteryInfo?>(null)
-        val batteryInfo: StateFlow<BatteryInfo?> = _batteryInfo.asStateFlow()
-
         private val _error = MutableStateFlow<String?>(null)
         val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -99,7 +97,17 @@ class SamplingService : Service() {
         }
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /**
+     * 服务级 Job：`onDestroy` 时统一取消。
+     *
+     * ⚠️ 必须显式取消，不能只 cancel [samplingJob]（2026-09-21 修）：
+     * [scheduleScreenOff] 的协程带 `delay(SCREEN_OFF_DELAY_MS)`，若用户开始采样后 5s 内点
+     * 「停止采样」，服务销毁时该协程仍在 delay 中，随后照样醒来执行熄屏 —— 它只检查
+     * 充电监测开关，不看服务是否还在跑，于是出现「已停止采样，屏幕却被熄掉」。
+     * 同时该协程 lambda 捕获 Service 实例，不取消会延迟其回收。
+     */
+    private val scopeJob = SupervisorJob()
+    private val scope = CoroutineScope(scopeJob + Dispatchers.Default)
     private var samplingJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastNotifyAt = 0L
@@ -134,9 +142,10 @@ class SamplingService : Service() {
         startForegroundCompat(buildNotification(null))
         acquireWakeLock()
 
-        scope.launch(Dispatchers.IO) {
-            _batteryInfo.value = RootPowerReader.readBatteryInfo()
-        }
+        // 电池静态信息已迁到进程级仓库（冷启动时 MainActivity 已预读过）；此处强制刷新一次，
+        // 拿到最新的循环次数 / 健康度。仓库自带 IO 作用域，无需再包 launch，
+        // 也不会像旧实现那样在偶发读取失败时把已有值覆盖成 null。
+        BatteryInfoStore.refresh()
         samplingJob = scope.launch { samplingLoop() }
         scheduleScreenOff()
         return START_STICKY
@@ -235,7 +244,9 @@ class SamplingService : Service() {
 
         autoSaved = true
         lowPowerSince = null
-        scope.launch(Dispatchers.IO) { autoSaveCsv() }
+        // NonCancellable：服务可能在写盘途中被销毁（scopeJob.cancel），写一半会留下
+        // MediaStore 的 IS_PENDING=1 孤儿记录 —— 让本次导出写完再响应取消
+        scope.launch(Dispatchers.IO + NonCancellable) { autoSaveCsv() }
     }
 
     /**
@@ -323,7 +334,7 @@ class SamplingService : Service() {
             "正在启动采样…"
         } else {
             "${sample.powerW.f3()} W · ${sample.voltageV.f3()} V · " +
-                "${sample.currentMa.f3()} mA · ${sample.tempBatteryC.f3()} ℃"
+                "${sample.currentMa.f3()} mA · ${sample.tempBatteryC.f1()} ℃"
         }
         val title = when {
             sample == null -> "功率监测"
@@ -368,7 +379,9 @@ class SamplingService : Service() {
     }
 
     override fun onDestroy() {
-        samplingJob?.cancel()
+        // 取消服务级 Job：samplingJob 与 scheduleScreenOff 的 delay 协程一并结束，
+        // 避免服务销毁后仍有协程在跑（见 scopeJob 的注释）
+        scopeJob.cancel()
         samplingJob = null
         releaseWakeLock()
         _running.value = false
@@ -384,4 +397,7 @@ class SamplingService : Service() {
     override fun onBind(intent: Intent?) = null
 
     private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
+
+    /** 常驻通知里的电池温度按用户约定取 1 位小数（2026-09-21） */
+    private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 }

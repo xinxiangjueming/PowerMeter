@@ -1,4 +1,4 @@
-package com.kongj.powermeter.data
+package com.chen.powermeter.data
 
 /**
  * 一次采样快照。

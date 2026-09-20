@@ -18,5 +18,14 @@
 
 # Manifest 中声明的组件（MainActivity / SamplingService）由 AAPT 自动生成 keep 规则，
 # 此处显式声明仅为提高可读性，防止后续被误改
--keep class com.kongj.powermeter.MainActivity { <init>(...); }
--keep class com.kongj.powermeter.service.SamplingService { <init>(...); }
+-keep class com.chen.powermeter.MainActivity { <init>(...); }
+-keep class com.chen.powermeter.service.SamplingService { <init>(...); }
+
+# ---- Shizuku ----
+# Shizuku SDK 内部靠类名/反射访问（ShizukuProvider、Binder 接口等），必须整包保留
+-keep class rikka.shizuku.** { *; }
+-keep class moe.shizuku.** { *; }
+# 自研 Shizuku UserService：Shizuku 通过 UserServiceArgs 里的 ComponentName **反射加载**本类，
+# R8 混淆会重命名类名 → bindUserService 永久失败 → 表现为「已授权但读不到数据」。
+# ShellService 已加 @Keep，此处 keep 规则为双保险（与 fold 同口径）。
+-keep class com.chen.powermeter.shizuku.** { *; }

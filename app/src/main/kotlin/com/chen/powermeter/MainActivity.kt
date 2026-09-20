@@ -1,4 +1,4 @@
-package com.kongj.powermeter
+package com.chen.powermeter
 
 import android.Manifest
 import android.content.Intent
@@ -20,15 +20,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import com.kongj.powermeter.data.CsvImporter
-import com.kongj.powermeter.data.ImportedSeries
-import com.kongj.powermeter.service.SamplingService
-import com.kongj.powermeter.ui.ChartColors
-import com.kongj.powermeter.ui.PowerMeterScreen
-import com.kongj.powermeter.ui.theme.PowerMeterTheme
-import com.kongj.powermeter.util.CsvExporter
-import com.kongj.powermeter.util.NavigationBarHelper
-import com.kongj.powermeter.util.Prefs
+import com.chen.powermeter.data.BatteryInfoStore
+import com.chen.powermeter.data.CsvImporter
+import com.chen.powermeter.data.ImportedSeries
+import com.chen.powermeter.service.SamplingService
+import com.chen.powermeter.ui.ChartColors
+import com.chen.powermeter.ui.PowerMeterScreen
+import com.chen.powermeter.ui.theme.PowerMeterTheme
+import com.chen.powermeter.util.CsvExporter
+import com.chen.powermeter.util.NavigationBarHelper
+import com.chen.powermeter.util.Prefs
+import com.chen.powermeter.util.ShizukuHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -46,6 +48,9 @@ class MainActivity : ComponentActivity() {
         NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
         // 曲线颜色从 Prefs 恢复一次；全屏页同样会 load 一次，两处共用一个仓库
         ChartColors.load(this)
+        // 电池静态信息冷启动即预读：root 机器上不点「开始采样」也能看到电池卡片。
+        // 内部为 IO 协程 + 幂等（已有值即返回），不阻塞首帧，Activity 重建也不会重复执行 su
+        BatteryInfoStore.loadIfNeeded()
 
         setContent {
             PowerMeterTheme {
@@ -53,8 +58,12 @@ class MainActivity : ComponentActivity() {
                 val liveSamples by SamplingService.samples.collectAsState()
                 val importedSamples by ImportedSeries.samples.collectAsState()
                 val importedFileName by ImportedSeries.fileName.collectAsState()
-                val batteryInfo by SamplingService.batteryInfo.collectAsState()
+                val batteryInfo by BatteryInfoStore.info.collectAsState()
                 val error by SamplingService.error.collectAsState()
+                // Shizuku 三态（供「采样设置」里的权限区块显示 + 授权/重试操作）
+                val shizukuAvailable by ShizukuHelper.available.collectAsState()
+                val shizukuGranted by ShizukuHelper.granted.collectAsState()
+                val shizukuBound by ShizukuHelper.serviceBound.collectAsState()
 
                 // 数据源二选一：导入态优先。查看历史文件期间实时采样照常进行、互不覆盖，
                 // 退出查看（onExitImport）后自动回到实时曲线
@@ -79,6 +88,9 @@ class MainActivity : ComponentActivity() {
                     wakeLock = wakeLock,
                     chargeMonitor = chargeMonitor,
                     seriesDualBattery = seriesDualBattery,
+                    shizukuAvailable = shizukuAvailable,
+                    shizukuGranted = shizukuGranted,
+                    shizukuBound = shizukuBound,
                     importedName = if (viewingImport) importedFileName.ifEmpty { "CSV" } else null,
                     onStart = { startSampling() },
                     onStop = { stopSampling() },
@@ -99,6 +111,8 @@ class MainActivity : ComponentActivity() {
                         seriesDualBattery = value
                         Prefs.setSeriesDualBattery(this@MainActivity, value)
                     },
+                    onShizukuRequest = { ShizukuHelper.requestPermission() },
+                    onShizukuRetry = { ShizukuHelper.forceRebind() },
                     onExport = { exportCsv() },
                     onClear = { SamplingService.clearSamples() },
                     onExitImport = { ImportedSeries.clear() },
@@ -242,14 +256,27 @@ class MainActivity : ComponentActivity() {
             toast("暂无采样数据")
             return
         }
-        val uri = CsvExporter.export(this, list)
-        toast(
-            if (uri != null) "已导出：Download/PowerMeter/${uri.lastPathSegment}" else "导出失败",
-        )
+        // ⚠️ 不能在主线程导出：CsvExporter 内含 MediaStore insert / openOutputStream /
+        //    逐行 String.format / update，全部同步。实时态上限 3600 行、导入态上限 20000 行
+        //    （约 20 万次格式化），主线程执行会冻结界面数百 ms ~ 1s+，有 ANR 风险。
+        lifecycleScope.launch {
+            val uri = withContext(Dispatchers.IO) { CsvExporter.export(this@MainActivity, list) }
+            // Toast 回到主线程弹（lifecycleScope 默认 Dispatchers.Main）
+            toast(
+                if (uri != null) "已导出：Download/PowerMeter/${uri.lastPathSegment}" else "导出失败",
+            )
+        }
     }
 
     private fun toast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 用户可能刚在 Shizuku 里完成授权，或重启过 Shizuku 服务；回到前台重新探测一次
+        // （绑定 UserService 是异步的，recheck 内部会按需重新绑定）
+        ShizukuHelper.recheck()
     }
 
     // 配置变更（旋转/深浅色切换/180° 翻转）后重放透明系统栏设置

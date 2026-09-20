@@ -1,4 +1,4 @@
-package com.kongj.powermeter.data
+package com.chen.powermeter.data
 
 import android.content.ContentResolver
 import android.content.Context
@@ -15,7 +15,7 @@ import java.util.Locale
 /**
  * CSV 导入解析器 —— 支持「打开本应用导出的 CSV 查看历史数据」。
  *
- * 口径严格对齐 [com.kongj.powermeter.util.CsvExporter] 写出的 15 列表头：
+ * 口径严格对齐 [com.chen.powermeter.util.CsvExporter] 写出的 15 列表头：
  * ```
  * timestamp,datetime,voltage_v,voltage_ocv_v,current_ma,fg_current_ma,power_w,
  * temp_battery_c,temp_usb_c,temp_charger_c,soc_pct,status,charge_type,
@@ -29,7 +29,7 @@ import java.util.Locale
  * - 单元格被加双引号；
  * - `power_w` 缺失或留空 → 由 voltage × current 现算，与实时路径口径一致。
  *
- * 与实时采样路径的边界：导入是**只读展示**，不写 [com.kongj.powermeter.service.SamplingService]
+ * 与实时采样路径的边界：导入是**只读展示**，不写 [com.chen.powermeter.service.SamplingService]
  * 的实时缓冲、不参与 root 节点采样；退出查看即回到实时数据。
  */
 object CsvImporter {
@@ -236,7 +236,7 @@ object CsvImporter {
 /**
  * 「查看中」的导入序列（进程内单例）。
  *
- * 与 [com.kongj.powermeter.service.SamplingService.samples]（实时缓冲）**并列且互不写入**：
+ * 与 [com.chen.powermeter.service.SamplingService.samples]（实时缓冲）**并列且互不写入**：
  * UI 统一按 `if (imported 非空) imported else live` 取数源，因此
  * ① 查看历史文件时实时采样照常进行、不被覆盖；
  * ② [clear] 之后自动回到实时曲线，无需任何额外状态同步。

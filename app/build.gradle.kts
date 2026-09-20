@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.kongj.powermeter"
+    namespace = "com.chen.powermeter"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.kongj.powermeter"
+        applicationId = "com.chen.powermeter"
         minSdk = 30
         targetSdk = 36
         versionCode = 1
@@ -23,6 +23,9 @@ android {
 
     buildFeatures {
         compose = true
+        // Shizuku UserService 走 AIDL（见 src/main/aidl/.../IShellService.aidl），
+        // AGP 需显式开启 aidl 编译开关（口径对齐 fold app/build.gradle.kts:45-48）
+        aidl = true
     }
 
     buildTypes {
@@ -74,4 +77,10 @@ dependencies {
     // 若日后解析出 org.jetbrains.compose.* 传递依赖导致 duplicate class，
     // 按上方 backdrop 的写法加同样的 exclude 即可（当前与 SportLink 实测配置一致，未加）。
     implementation(libs.yukonga.miuix.ui)
+
+    // Shizuku：非 root 机器通过 adb（无线调试）授权，以 shell 身份读取 /sys 电量节点。
+    // 版本与 fold 完全一致（13.1.5）。api = 宿主侧 SDK；provider = 声明 ShizukuProvider
+    // 自动初始化 binder 连接。UserService（ShellService）由 Shizuku 反射加载，无需在 Manifest 注册。
+    implementation(libs.dev.rikka.shizuku.api)
+    implementation(libs.dev.rikka.shizuku.provider)
 }

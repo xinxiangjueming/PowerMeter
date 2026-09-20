@@ -1,4 +1,4 @@
-package com.kongj.powermeter.ui
+package com.chen.powermeter.ui
 
 import android.content.Context
 import android.content.res.Configuration
@@ -49,8 +49,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import com.kongj.powermeter.ui.theme.LocalCornerRadius
-import com.kongj.powermeter.util.Prefs
+import com.chen.powermeter.ui.theme.LocalCornerRadius
+import com.chen.powermeter.util.Prefs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -86,20 +86,31 @@ internal object ChartColors {
     }
 }
 
+/** 指标当前的曲线色（自定义色优先，否则回落到默认配色）。[Metric.seriesColor] 的 Composable 封装 */
+@Composable
+internal fun rememberMetricColor(metric: Metric): Color = metric.seriesColor(
+    custom = ChartColors.colors.collectAsState().value,
+    primary = MaterialTheme.colorScheme.primary,
+)
+
 /**
- * 指标默认配色。
+ * 指标曲线色：**自定义色优先，否则回落到默认配色**。
  *
  * - **POWER 默认沿用主题 `primary`**：这是「只画一条功率曲线」这一最常用形态，
  *   保持既有观感不变（改动前 TrendChart 用的就是 `colorScheme.primary`）。
  * - VOLTAGE / CURRENT / TEMP 给定固定色：横屏全屏页可多选叠加，四条曲线必须彼此可区分，
  *   若都跟随主题色则叠在一起无法辨识。色值口径与 SportLink 曲线默认调色板同源。
+ *
+ * 做成非 Composable 纯函数，是为了让需要在 `remember` 键里取色的调用方（趋势全屏页缓存
+ * 曲线序列）也能复用 —— 否则那里得另写一份 when 分支，日后改默认色就会两处分叉。
+ *
+ * @param custom 用户自定义色表（指标名 → ARGB），一般来自 `ChartColors.colors`
+ * @param primary 主题主色（仅 POWER 未自定义时使用）
  */
-@Composable
-internal fun rememberMetricColor(metric: Metric): Color {
-    val custom = ChartColors.colors.collectAsState().value[metric.name]
-    if (custom != null) return Color(custom)
-    return when (metric) {
-        Metric.POWER -> MaterialTheme.colorScheme.primary
+internal fun Metric.seriesColor(custom: Map<String, Int>, primary: Color): Color {
+    custom[name]?.let { return Color(it) }
+    return when (this) {
+        Metric.POWER -> primary
         Metric.VOLTAGE -> Color(0xFF2979FF)
         Metric.CURRENT -> Color(0xFF00E676)
         Metric.TEMP -> Color(0xFFFF9100)

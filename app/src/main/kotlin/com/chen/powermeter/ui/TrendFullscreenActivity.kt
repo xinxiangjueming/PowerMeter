@@ -1,4 +1,4 @@
-package com.kongj.powermeter.ui
+package com.chen.powermeter.ui
 
 import android.content.Context
 import android.content.Intent
@@ -7,7 +7,10 @@ import android.content.res.Configuration
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.addCallback
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -37,15 +40,30 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.kongj.powermeter.data.ImportedSeries
-import com.kongj.powermeter.service.SamplingService
-import com.kongj.powermeter.ui.theme.LocalCornerRadius
-import com.kongj.powermeter.ui.theme.PowerMeterTheme
-import com.kongj.powermeter.util.NavigationBarHelper
+import com.chen.powermeter.data.ImportedSeries
+import com.chen.powermeter.service.SamplingService
+import com.chen.powermeter.ui.theme.LocalCornerRadius
+import com.chen.powermeter.ui.theme.PowerMeterTheme
+import com.chen.powermeter.util.NavigationBarHelper
+
+/**
+ * 关闭时内容淡到主题底色的时长。全屏页（[TrendFullscreenScreen]）与 Activity 的关闭时序共用，
+ * 故放在文件级而非 companion 内。
+ */
+private const val CLOSE_FADE_MS = 120
+
+/**
+ * 关闭时等待「显示方向转回」落地的最长时间。
+ *
+ * 解锁方向后若设备本就横握（解锁不产生旋转），`onConfigurationChanged` 不会来 ——
+ * 由本超时兜底，避免页面卡在"已淡出但不关闭"的状态。
+ */
+private const val ORIENTATION_SETTLE_TIMEOUT_MS = 250L
 
 /**
  * 趋势卡全屏页。
@@ -67,6 +85,16 @@ import com.kongj.powermeter.util.NavigationBarHelper
  *
  * 数据源按 `if (导入非空) 导入 else 实时` 取 —— 与主页面同一口径，
  * 因此从主页面进入本页时看到的一定是同一份数据。
+ *
+ * **关闭时序（C+，勿简化回直接 `finish()`）**：
+ * 本页把**显示方向**锁成横屏（见 [onCreate] ⓪），而被它覆盖的 MainActivity 是 `configChanges`
+ * 含 `orientation|screenSize` 的（不重建）。因此直接 `finish()` 会出现：本页滑出的同时显示才转回
+ * 竖屏，主页先按**横屏两列**画出来、随后再翻回竖屏单列 —— 趋势卡宽度与位置同时改变，
+ * 观感就是"返回主页闪一下"。关闭必须走 [requestClose]：
+ * 内容先淡到主题底色（纯色屏没有可重排的内容）→ 解锁方向（旋转发生在纯色之下）→
+ * 等方向落地（`onConfigurationChanged` 或超时兜底）→ 才 `finish()` 交给主题的滑窗动画。
+ * 打开方向不需要这套处理：本页是**独立窗口**，`setRequestedOrientation` 的效果在启动窗口
+ * （StartingWindow）底下就生效了，首帧即横屏。
  */
 class TrendFullscreenActivity : ComponentActivity() {
 
@@ -93,6 +121,15 @@ class TrendFullscreenActivity : ComponentActivity() {
             )
         }
     }
+
+    /**
+     * 正在关闭（Compose 可读的 state）。
+     *
+     * true = 已解除方向锁定、内容已/正在淡到主题底色，等显示方向转回落地后再真正 `finish()`。
+     * 同时作为**幂等护栏**：✕ 与系统返回手势可能在极短时间内都触发一次，重复执行会让
+     * 超时兜底与 `onConfigurationChanged` 两条路径各调一次 `finish()`。
+     */
+    private var closing by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -129,18 +166,60 @@ class TrendFullscreenActivity : ComponentActivity() {
             PowerMeterTheme {
                 TrendFullscreenScreen(
                     initialMetric = initialMetric,
-                    onFinish = { finish() },
+                    closing = closing,
+                    onFinish = { requestClose() },
                 )
             }
         }
+
+        // 系统返回手势 / 返回键必须走同一套关闭时序：放行给默认实现（直接 finish()）时，
+        // 本页会在显示仍是横屏的状态下被移除 → 主页先按横屏两列画出来再翻回竖屏（返回瞬闪）
+        onBackPressedDispatcher.addCallback(this) { requestClose() }
+    }
+
+    /**
+     * 关闭全屏页 —— C+ 时序，四步缺一不可（原因见类注释）：
+     *
+     * ① 先恢复系统栏（[NavigationBarHelper.exitImmersive]）；
+     * ② 再解除横屏锁定，让显示在"纯色屏"之下转回竖屏；
+     * ③ 等方向落地：`onConfigurationChanged` 接住；设备本就横握时不会触发 → 超时兜底；
+     * ④ 方向落地后才 `finish()`，此时交给主题的四向滑窗动画，主页已是正确的竖屏单列。
+     *
+     * t=0 就有可见反馈（第 ①+② 步同时触发内容淡出），不会让 ✕ 看起来点了没反应。
+     */
+    private fun requestClose() {
+        if (closing) return
+        closing = true
+        // ① 系统栏恢复要在主页被绘制之前完成：主页顶栏高度 = safeDrawing 顶部 inset + 64dp
+        //    （PowerMeterScreen 的 topBarHeight），若等窗口销毁才恢复，主页首帧会先按
+        //    "无系统栏"排一次、再跳一次 —— 这是返回瞬闪的第二个来源
+        NavigationBarHelper.exitImmersive(this)
+        // ② 解锁方向 → 显示开始转回。旋转发生在上一步那块纯色屏之下，没有内容可重排
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        // ③ 兜底：解锁不产生旋转（设备本就横握）时不会有 onConfigurationChanged
+        window.decorView.postDelayed({ finishIfClosing() }, ORIENTATION_SETTLE_TIMEOUT_MS)
+    }
+
+    /** 方向已落地（或超时）→ 真正 finish()，交给主题的 activityClose* 滑窗动画 */
+    private fun finishIfClosing() {
+        if (closing && !isFinishing && !isDestroyed) finish()
     }
 
     /**
      * 旋转 / 深浅色切换（声明 configChanges → 不重建 Activity）后重放沉浸设置。
      * 系统与 MIUI/HyperOS 会在配置变更后按主题默认值重放系统栏属性，可能把栏重新显示出来。
+     *
+     * ⚠️ 关闭中（[closing]）走另一条分支：此时系统栏**已恢复**，重放 [replayImmersive] 会把刚
+     * 显示的栏再收回去；而这里的配置变更正是"方向已转回"的信号 —— 只重放窗口属性（不 hide），
+     * 等一帧让窗口按新尺寸完成绘制，再执行关闭。
      */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        if (closing) {
+            NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
+            window.decorView.post { finishIfClosing() }
+            return
+        }
         replayImmersive()
         // 延迟一帧兜底：确保系统重放之后再压一次
         window.decorView.post {
@@ -148,10 +227,10 @@ class TrendFullscreenActivity : ComponentActivity() {
         }
     }
 
-    /** 从多任务/锁屏回到前台时系统可能重新显示系统栏，重新隐藏 */
+    /** 从多任务/锁屏回到前台时系统可能重新显示系统栏，重新隐藏（关闭中不再隐藏） */
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) replayImmersive()
+        if (hasFocus && !closing) replayImmersive()
     }
 
     private fun replayImmersive() {
@@ -171,6 +250,8 @@ class TrendFullscreenActivity : ComponentActivity() {
 @Composable
 private fun TrendFullscreenScreen(
     initialMetric: Metric,
+    /** true = 正在关闭：整页内容淡到主题底色（见 Activity 的 requestClose） */
+    closing: Boolean,
     onFinish: () -> Unit,
 ) {
     val corner = LocalCornerRadius.current
@@ -186,11 +267,35 @@ private fun TrendFullscreenScreen(
     var selected by rememberSaveable { mutableStateOf(listOf(initialMetric.name)) }
     val metrics = selected.mapNotNull { name -> runCatching { Metric.valueOf(name) }.getOrNull() }
         .ifEmpty { listOf(initialMetric) }
+
+    // 曲线序列必须缓存：`toSeries` 是 O(n) 构建（实时态 n 最多 3600，导入态 20000），
+    // 而关闭时的淡出动画（animateFloatAsState，120ms）会逐帧驱动重组 —— 不缓存则每帧重建
+    // 全部序列。键里的 samples 在同一份数据下是同一实例，List.equals 走引用快路径 O(1)。
+    //
+    // 颜色也必须是键的一部分：POWER 的默认色跟随主题 `primary`，且用户可在本页改色。
+    // 取色复用 ColorPickerDialog 的 Metric.seriesColor，避免默认色值在这里再写一份。
+    val customColors by ChartColors.colors.collectAsState()
+    val themePrimary = MaterialTheme.colorScheme.primary
+    val seriesColors = remember(metrics, customColors, themePrimary) {
+        metrics.map { m -> m.seriesColor(customColors, themePrimary) }
+    }
+    val seriesList = remember(samples, metrics, seriesColors) {
+        seriesColors.mapIndexed { i, color -> metrics[i].toSeries(samples, color) }
+    }
     // 非空 = 颜色面板打开中，值为正在编辑的指标
     var colorTarget by remember { mutableStateOf<Metric?>(null) }
     val chartState = remember { TrendChartState() }
 
     val bg = MaterialTheme.colorScheme.background
+
+    // 关闭中：内容淡到主题底色（bg 由外层 Box 铺满，故淡出即"整页变纯色"）。
+    // 纯色屏没有可重排的内容 —— 紧随其后的显示方向旋转（本页解锁方向后转回竖屏）
+    // 因此完全不可见；窗口尺寸变化时纯色只是重新铺一次。
+    val contentAlpha by animateFloatAsState(
+        targetValue = if (closing) 0f else 1f,
+        animationSpec = tween(durationMillis = CLOSE_FADE_MS),
+        label = "trendFullscreenCloseFade",
+    )
 
     // 背景铺满全屏（含系统栏与挖孔区）——真沉浸的前提：底色延伸到栏下，
     // 而不是把整块内容用 insets 顶开
@@ -198,6 +303,8 @@ private fun TrendFullscreenScreen(
         Column(
             Modifier
                 .fillMaxSize()
+                // 关闭淡出：只作用于内容，底色由外层 Box 保留（淡出后即"整页纯色"）
+                .alpha(contentAlpha)
                 // 避开摄像头（竖屏顶部中央打孔 / 横屏左右侧打孔，全边避让一次覆盖）。
                 // 只避 cutout，**不**避 systemBars：系统栏已隐藏，内容必须延伸到屏幕最底，
                 // 这才是真沉浸；用 safeDrawing 全边避让只会把系统栏区域换成一条背景色带。
@@ -301,8 +408,6 @@ private fun TrendFullscreenScreen(
                             )
                         }
                     } else {
-                        val seriesList = ArrayList<ChartSeries>(metrics.size)
-                        metrics.forEach { m -> seriesList += m.toSeries(samples, rememberMetricColor(m)) }
                         TrendChart(
                             samples = samples,
                             series = seriesList,
@@ -320,7 +425,9 @@ private fun TrendFullscreenScreen(
         }
     }
 
-    colorTarget?.let { target ->
+    // 关闭中整页已是纯色底，浮层不该继续挂在上面
+    val sheetTarget = if (closing) null else colorTarget
+    sheetTarget?.let { target ->
         ColorPickerSheet(
             title = "${target.label}曲线颜色",
             initialColor = rememberMetricColor(target),

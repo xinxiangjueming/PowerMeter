@@ -1,4 +1,4 @@
-package com.kongj.powermeter.ui
+package com.chen.powermeter.ui
 
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -59,7 +59,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.kongj.powermeter.data.PowerSample
+import com.chen.powermeter.data.PowerSample
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -104,6 +104,11 @@ private const val NO_INDEX = -1
 private val ChartNumericFont = FontFamily.Monospace
 
 private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
+
+private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
+
+/** 温度指标（电池温度）一律 1 位小数（用户约定 2026-09-21），其余指标维持 3 位 */
+private fun Double.fMetric(metric: Metric?): String = if (metric == Metric.TEMP) f1() else f3()
 
 /** 一条曲线的绘制数据；[values] 与传入的 samples 按下标一一对应 */
 internal data class ChartSeries(
@@ -641,7 +646,7 @@ private fun ColumnScope.ChartBody(
                                 )
                                 Spacer(Modifier.width(5.dp))
                                 Text(
-                                    "${sr.label} ${sr.values[idx].f3()} ${sr.unit}",
+                                    "${sr.label} ${sr.values[idx].fMetric(sr.metric)} ${sr.unit}",
                                     fontSize = 11.sp,
                                     fontFamily = ChartNumericFont,
                                     fontWeight = FontWeight.Medium,
