@@ -14,10 +14,18 @@ import java.util.Locale
 /** 导出采样序列为 CSV（保存到系统 Download 目录，Android 10+ 无需存储权限） */
 object CsvExporter {
 
-    fun export(context: Context, samples: List<PowerSample>): Uri? {
+    /**
+     * @param prefix 文件名前缀，默认 `powermeter`（手动导出）。自动导出传 `powermeter_charge`，
+     *               以便与手动导出的文件在 Download 目录里一眼区分。
+     */
+    fun export(
+        context: Context,
+        samples: List<PowerSample>,
+        prefix: String = "powermeter",
+    ): Uri? {
         if (samples.isEmpty()) return null
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val fileName = "powermeter_$stamp.csv"
+        val fileName = "${prefix}_$stamp.csv"
 
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)

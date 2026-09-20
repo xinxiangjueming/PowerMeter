@@ -103,12 +103,18 @@ fun PowerMeterScreen(
     error: String?,
     intervalMs: Long,
     wakeLock: Boolean,
+    /** 充电功率监测：开始采样 5s 后自动熄屏，低功率持续 5min 时自动保存 CSV */
+    chargeMonitor: Boolean,
+    /** 串联双电池：电压按整组（单节读数 ×2）换算，功率同步 ×2 */
+    seriesDualBattery: Boolean,
     /** 非空 = 当前展示的是导入的 CSV（而非实时采样），值为文件名 */
     importedName: String?,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onIntervalChange: (Long) -> Unit,
     onWakeLockChange: (Boolean) -> Unit,
+    onChargeMonitorChange: (Boolean) -> Unit,
+    onSeriesDualBatteryChange: (Boolean) -> Unit,
     onExport: () -> Unit,
     onClear: () -> Unit,
     onExitImport: () -> Unit,
@@ -295,9 +301,13 @@ fun PowerMeterScreen(
         SettingsSheet(
             intervalMs = intervalMs,
             wakeLock = wakeLock,
+            chargeMonitor = chargeMonitor,
+            seriesDualBattery = seriesDualBattery,
             corner = corner,
             onIntervalChange = onIntervalChange,
             onWakeLockChange = onWakeLockChange,
+            onChargeMonitorChange = onChargeMonitorChange,
+            onSeriesDualBatteryChange = onSeriesDualBatteryChange,
             onClear = onClear,
             onDismiss = { settingsOpen = false },
         )
@@ -863,9 +873,13 @@ private fun ControlRow(
 private fun SettingsSheet(
     intervalMs: Long,
     wakeLock: Boolean,
+    chargeMonitor: Boolean,
+    seriesDualBattery: Boolean,
     corner: Dp,
     onIntervalChange: (Long) -> Unit,
     onWakeLockChange: (Boolean) -> Unit,
+    onChargeMonitorChange: (Boolean) -> Unit,
+    onSeriesDualBatteryChange: (Boolean) -> Unit,
     onClear: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -940,6 +954,41 @@ private fun SettingsSheet(
                     )
                 }
                 Switch(checked = wakeLock, onCheckedChange = onWakeLockChange)
+            }
+            Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("充电功率监测", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "点击开始采样 5s 后熄灭屏幕；充电功率低于 1W 且持续超过 5min 时自动保存 CSV 文件（不停止采样）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = chargeMonitor, onCheckedChange = onChargeMonitorChange)
+            }
+            Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("串联双电池", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "对于串联双电池机器，电压与功率计算要 ×2（小米机器不需要开启）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = seriesDualBattery,
+                    onCheckedChange = onSeriesDualBatteryChange,
+                )
             }
             Spacer(Modifier.height(20.dp))
             FilledTonalButton(

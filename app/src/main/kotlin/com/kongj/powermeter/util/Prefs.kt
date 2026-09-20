@@ -7,6 +7,8 @@ object Prefs {
     private const val NAME = "powermeter"
     private const val KEY_INTERVAL = "interval_ms"
     private const val KEY_WAKELOCK = "wake_lock"
+    private const val KEY_CHARGE_MONITOR = "charge_monitor"
+    private const val KEY_SERIES_DUAL_BATTERY = "series_dual_battery"
 
     /** 曲线自定义颜色（ARGB Int），按指标名分键存储 */
     private const val KEY_METRIC_COLOR_PREFIX = "metric_color_"
@@ -27,6 +29,33 @@ object Prefs {
     fun setWakeLock(context: Context, value: Boolean) {
         context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_WAKELOCK, value).apply()
+    }
+
+    /**
+     * 充电功率监测：开始采样 5s 后自动熄屏，并在「充电功率低于阈值持续足够久」时自动导出 CSV。
+     * 默认关闭 —— 该开关会主动改变屏幕状态，必须由用户显式开启。
+     */
+    fun getChargeMonitor(context: Context): Boolean =
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_CHARGE_MONITOR, false)
+
+    fun setChargeMonitor(context: Context, value: Boolean) {
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_CHARGE_MONITOR, value).apply()
+    }
+
+    /**
+     * 串联双电池：内核上报的是**单节**电芯电压，串联机型整组电压为两节叠加（×2），功率随之 ×2。
+     * 默认关闭 —— 这是机型相关的换算口径，误开会让电压、功率读数翻倍。
+     * 小米机型内核口径不同，无需开启。
+     */
+    fun getSeriesDualBattery(context: Context): Boolean =
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SERIES_DUAL_BATTERY, false)
+
+    fun setSeriesDualBattery(context: Context, value: Boolean) {
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_SERIES_DUAL_BATTERY, value).apply()
     }
 
     /**

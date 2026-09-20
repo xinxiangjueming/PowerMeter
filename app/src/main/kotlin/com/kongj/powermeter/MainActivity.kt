@@ -63,6 +63,12 @@ class MainActivity : ComponentActivity() {
 
                 var interval by remember { mutableLongStateOf(Prefs.getIntervalMs(this@MainActivity)) }
                 var wakeLock by remember { mutableStateOf(Prefs.getWakeLock(this@MainActivity)) }
+                var chargeMonitor by remember {
+                    mutableStateOf(Prefs.getChargeMonitor(this@MainActivity))
+                }
+                var seriesDualBattery by remember {
+                    mutableStateOf(Prefs.getSeriesDualBattery(this@MainActivity))
+                }
 
                 PowerMeterScreen(
                     running = running,
@@ -71,6 +77,8 @@ class MainActivity : ComponentActivity() {
                     error = error,
                     intervalMs = interval,
                     wakeLock = wakeLock,
+                    chargeMonitor = chargeMonitor,
+                    seriesDualBattery = seriesDualBattery,
                     importedName = if (viewingImport) importedFileName.ifEmpty { "CSV" } else null,
                     onStart = { startSampling() },
                     onStop = { stopSampling() },
@@ -82,6 +90,14 @@ class MainActivity : ComponentActivity() {
                     onWakeLockChange = { value ->
                         wakeLock = value
                         Prefs.setWakeLock(this@MainActivity, value)
+                    },
+                    onChargeMonitorChange = { value ->
+                        chargeMonitor = value
+                        Prefs.setChargeMonitor(this@MainActivity, value)
+                    },
+                    onSeriesDualBatteryChange = { value ->
+                        seriesDualBattery = value
+                        Prefs.setSeriesDualBattery(this@MainActivity, value)
                     },
                     onExport = { exportCsv() },
                     onClear = { SamplingService.clearSamples() },
