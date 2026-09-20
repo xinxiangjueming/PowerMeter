@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Activity 过渡（进入方向）：新页面从右侧推入。
+
+  口径照搬 SportLink `res/anim/slide_in_right.xml`（同为 300ms + decelerate），
+  挂载方式也一致：写在主题的 `android:windowAnimationStyle` 上（见 values/themes.xml
+  的 ActivitySlideWindowAnimation），而不是代码里 overrideActivityTransition ——
+  后者只对 API 34+ 生效，还要为旧版本另写 overridePendingTransition 分支。
+
+  300ms / decelerate 的取法：入场「快起慢收」，落位时速度趋零，与 M3 的进场手感一致。
+-->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:anim/decelerate_interpolator">
+    <translate
+        android:fromXDelta="100%"
+        android:toXDelta="0"
+        android:duration="300" />
+</set>

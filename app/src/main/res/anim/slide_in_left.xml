@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Activity 过渡（返回方向）：被还原的旧页面从左推回。
+
+  与 slide_out_right 配对，构成「返回」的一组 —— 与进入方向严格镜像，
+  返回手势才会读作「把刚推走的那一页拉回来」，而不是另一次前进。
+
+  口径照搬 SportLink `res/anim/slide_in_left.xml`。
+-->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:anim/decelerate_interpolator">
+    <translate
+        android:fromXDelta="-100%"
+        android:toXDelta="0"
+        android:duration="300" />
+</set>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Activity 过渡（返回方向）：当前页面向右移出。
+
+  口径照搬 SportLink `res/anim/slide_out_right.xml`。
+  与 slide_in_left 配对使用：返回时「当前页右移 + 上一页从左推回」同时发生。
+-->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:anim/accelerate_interpolator">
+    <translate
+        android:fromXDelta="0"
+        android:toXDelta="100%"
+        android:duration="300" />
+</set>

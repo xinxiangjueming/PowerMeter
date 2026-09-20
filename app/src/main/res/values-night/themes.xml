@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 夜间变体：深色基类，与 values/themes.xml 的 Light 基类配对。
+         两者只差基类，windowBackground 也各自显式声明（详见 values/themes.xml 注释）。 -->
+    <style name="Theme.PowerMeter" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+
+        <!-- 与 values/themes.xml 同口径：显式声明窗口属性，不依赖框架基类默认值
+             （基类夜间底色为 #303030，会被 MIUI/HyperOS 按 windowBackground 判为深色窗口） -->
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+
+        <!-- Activity 过渡动画：夜间变体必须**重复声明**（值只在 values/themes.xml 定义一次）。
+             过渡动画可能取自打开方或被打开方的主题，只在白天变体挂载的话夜间会退回默认动画。 -->
+        <item name="android:windowAnimationStyle">@style/ActivitySlideWindowAnimation</item>
+    </style>
+</resources>

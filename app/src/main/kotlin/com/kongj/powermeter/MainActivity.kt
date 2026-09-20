@@ -1,0 +1,253 @@
+package com.kongj.powermeter
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import com.kongj.powermeter.data.CsvImporter
+import com.kongj.powermeter.data.ImportedSeries
+import com.kongj.powermeter.service.SamplingService
+import com.kongj.powermeter.ui.ChartColors
+import com.kongj.powermeter.ui.PowerMeterScreen
+import com.kongj.powermeter.ui.theme.PowerMeterTheme
+import com.kongj.powermeter.util.CsvExporter
+import com.kongj.powermeter.util.NavigationBarHelper
+import com.kongj.powermeter.util.Prefs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+class MainActivity : ComponentActivity() {
+
+    private val requestNotificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) launchService()
+            else Toast.makeText(this, "需要通知权限才能在锁屏后常驻采样", Toast.LENGTH_SHORT).show()
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
+        // 曲线颜色从 Prefs 恢复一次；全屏页同样会 load 一次，两处共用一个仓库
+        ChartColors.load(this)
+
+        setContent {
+            PowerMeterTheme {
+                val running by SamplingService.running.collectAsState()
+                val liveSamples by SamplingService.samples.collectAsState()
+                val importedSamples by ImportedSeries.samples.collectAsState()
+                val importedFileName by ImportedSeries.fileName.collectAsState()
+                val batteryInfo by SamplingService.batteryInfo.collectAsState()
+                val error by SamplingService.error.collectAsState()
+
+                // 数据源二选一：导入态优先。查看历史文件期间实时采样照常进行、互不覆盖，
+                // 退出查看（onExitImport）后自动回到实时曲线
+                val viewingImport = importedSamples.isNotEmpty()
+                val samples = if (viewingImport) importedSamples else liveSamples
+
+                var interval by remember { mutableLongStateOf(Prefs.getIntervalMs(this@MainActivity)) }
+                var wakeLock by remember { mutableStateOf(Prefs.getWakeLock(this@MainActivity)) }
+
+                PowerMeterScreen(
+                    running = running,
+                    samples = samples,
+                    batteryInfo = batteryInfo,
+                    error = error,
+                    intervalMs = interval,
+                    wakeLock = wakeLock,
+                    importedName = if (viewingImport) importedFileName.ifEmpty { "CSV" } else null,
+                    onStart = { startSampling() },
+                    onStop = { stopSampling() },
+                    onIntervalChange = { value ->
+                        interval = value
+                        Prefs.setIntervalMs(this@MainActivity, value)
+                        SamplingService.setInterval(value)
+                    },
+                    onWakeLockChange = { value ->
+                        wakeLock = value
+                        Prefs.setWakeLock(this@MainActivity, value)
+                    },
+                    onExport = { exportCsv() },
+                    onClear = { SamplingService.clearSamples() },
+                    onExitImport = { ImportedSeries.clear() },
+                )
+            }
+        }
+
+        // 冷启动由「打开方式 / 分享」拉起时，onCreate 收到的就是那个 Intent。
+        // ⚠️ 必须用 savedInstanceState == null 兜住：重建（深浅色切换、字体缩放等未在
+        //    configChanges 里声明的配置变更，以及进程被杀后的恢复）都会让 intent 原样回到
+        //    onCreate —— 不拦一道就会重新解析整个文件、再弹一次 Toast。
+        //    重建时 ImportedSeries 仍在进程内，展示态不受影响，跳过是正确的。
+        if (savedInstanceState == null) handleOpenIntent(intent)
+    }
+
+    /**
+     * 应用已在运行时再从外部打开一个 CSV。
+     *
+     * Manifest 中 MainActivity 声明了 `launchMode="singleTop"`，因此这里会被回调而不是
+     * 在栈顶再叠一个实例（叠实例会导致「返回」时看到两份界面、且共享同一份进程内状态）。
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleOpenIntent(intent)
+    }
+
+    private fun handleOpenIntent(intent: Intent?) {
+        val uri = incomingUri(intent) ?: return
+        loadCsv(uri)
+    }
+
+    /**
+     * 从 Intent 里取出要打开的文件。
+     *
+     * 对外注册了两套通道（见 Manifest 注释），这里一并兼容：
+     * - `ACTION_VIEW` → `data`：「用其它应用打开」、文件管理器点击；
+     * - `ACTION_SEND` → `EXTRA_STREAM`：「分享」。少数 App 只塞 `clipData`（Android 通常
+     *   会把 EXTRA_STREAM 同步进 clipData），故 clipData 作为兜底。
+     */
+    private fun incomingUri(intent: Intent?): Uri? = when (intent?.action) {
+        Intent.ACTION_VIEW -> intent.data
+        Intent.ACTION_SEND -> {
+            val stream = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+            }
+            stream ?: intent.clipData?.getItemAt(0)?.uri
+        }
+        else -> null
+    }
+
+    /**
+     * 读取 content:// 并解析为采样序列，装载到「查看态」数据源。
+     *
+     * 流程分两步，都不能省：
+     * 1. [CsvImporter.quickCheck] —— 因为对外注册很宽（含 content:// 的 MIME 通配兜底，
+     *    通配字面量本身含块注释结束符号，故此处改用文字表述），
+     *    点进来一份图片/视频是常态，必须先用文件名/大小挡掉，避免把整个文件读成字符串；
+     * 2. [CsvImporter.read] —— 按表头做权威校验（快筛只看文件名，不看内容）。
+     *
+     * 任一步不通过都**只提示、不改动当前展示**，用户仍停留在原来的界面上。
+     * 走 lifecycleScope：两步都是 IO，且 Activity 销毁后无需再回调 UI。
+     */
+    private fun loadCsv(uri: Uri) {
+        lifecycleScope.launch {
+            val check = withContext(Dispatchers.IO) { CsvImporter.quickCheck(this@MainActivity, uri) }
+            when (check) {
+                CsvImporter.QuickCheck.TOO_LARGE -> {
+                    toast("文件过大，无法作为采样数据打开")
+                    return@launch
+                }
+                CsvImporter.QuickCheck.NOT_CSV -> {
+                    toast("只能打开 CSV 文件")
+                    return@launch
+                }
+                CsvImporter.QuickCheck.OK -> Unit
+            }
+
+            val result = withContext(Dispatchers.IO) {
+                runCatching { CsvImporter.read(this@MainActivity, uri) }
+            }
+            result
+                .onSuccess { parsed ->
+                    ImportedSeries.set(queryDisplayName(uri), parsed.samples)
+                    val dropped = if (parsed.skippedRows > 0) "，丢弃 ${parsed.skippedRows} 行" else ""
+                    toast("已打开 ${parsed.samples.size} 条采样记录$dropped")
+                }
+                .onFailure { e ->
+                    toast("打开失败：${e.message ?: e.javaClass.simpleName}")
+                }
+        }
+    }
+
+    /** 显示名优先取 provider 的 DISPLAY_NAME，取不到再退回 URI 末段（SAF 末段通常是文档 ID） */
+    private fun queryDisplayName(uri: Uri): String {
+        val fromProvider = runCatching {
+            contentResolver
+                .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+                }
+        }.getOrNull()
+        return fromProvider
+            ?: uri.lastPathSegment?.substringAfterLast('/')
+            ?: "CSV"
+    }
+
+    private fun startSampling() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        launchService()
+    }
+
+    private fun launchService() {
+        val intent = Intent(this, SamplingService::class.java)
+        runCatching {
+            ContextCompat.startForegroundService(this, intent)
+        }.onFailure {
+            Toast.makeText(this, "启动采样服务失败：${it.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun stopSampling() {
+        stopService(Intent(this, SamplingService::class.java))
+    }
+
+    private fun exportCsv() {
+        // 导出「当前正在看的那一份」：查看导入文件时导出的就是该文件的数据，
+        // 与界面所见一致（否则容易导出后才发现拿错了数据）
+        val list = ImportedSeries.samples.value.ifEmpty { SamplingService.samples.value }
+        if (list.isEmpty()) {
+            toast("暂无采样数据")
+            return
+        }
+        val uri = CsvExporter.export(this, list)
+        toast(
+            if (uri != null) "已导出：Download/PowerMeter/${uri.lastPathSegment}" else "导出失败",
+        )
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    // 配置变更（旋转/深浅色切换/180° 翻转）后重放透明系统栏设置
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
+        window.decorView.post {
+            if (!isFinishing && !isDestroyed) {
+                NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
+            }
+        }
+    }
+
+    private fun isNightMode(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+}

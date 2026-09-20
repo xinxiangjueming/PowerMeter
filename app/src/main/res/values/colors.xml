@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        仅用于主题的 android:windowBackground（窗口首帧底色 + MIUI/HyperOS 判窗口明暗），
+        **不是** Compose 页面的实际底色——页面底色由 PowerMeterTheme 的 dynamic color
+        在运行时算出（见 ui/theme/Theme.kt 的 withDeeperBackground）。
+
+        取值对齐 Theme.kt 的推算结果：
+        - 日间 = surfaceContainerHighest 再压暗 8% ≈ #D4CED6
+        - 夜间 = surfaceContainerLowest ≈ #0F0D13（实测截图里应用底色为 #0E0D12，吻合）
+
+        壁纸取色会让实际值略有差异，这里只要求「明暗方向正确、与首帧接近」，
+        避免开屏瞬间出现明显色差。
+    -->
+    <color name="background">#D4CED6</color>
+</resources>

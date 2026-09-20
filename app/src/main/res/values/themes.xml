@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        基类必须随昼夜切换（夜间变体见 values-night/themes.xml）。
+
+        原因：android:windowBackground 由基类提供，MIUI/HyperOS 的系统栏配色跟随机制
+        （日志特征 BarFollowAnimation: pairAppearanceRegionAndWin）按它判定窗口明暗。
+        若白天沿用深色基类 Theme.Material.NoActionBar，窗口会被判为深色窗口，
+        系统栏手势条一侧的配色随之错乱（横屏尤其明显）。
+
+        ⚠️ 注意：「不写 android:windowBackground」并不等于没有深色底 ——
+        基类自带一份（Theme.Material = 深色 #303030，Theme.Material.Light = 浅色 #FAFAFA），
+        必须换基类（或两套 values 各自显式声明）才能真正跟随昼夜。
+        本文件与 values-night 现已各自**显式**声明 windowBackground（引用 @color/background），
+        不再依赖基类默认值。
+    -->
+    <style name="Theme.PowerMeter" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+
+        <!-- 以下三条为显式窗口属性，口径对齐两个正常工作的参照实现
+             （fold app/src/main/res/values/themes.xml:3-6、sportlink app/src/main/res/values/themes.xml:3-16，
+              两者都显式声明了 windowBackground；本项目此前是唯一使用框架老主题
+              android:Theme.Material.* 的工程）。 -->
+
+        <!-- 1) 窗口底色：框架基类自带 #FAFAFA(日)/#303030(夜)，MIUI/HyperOS 的系统栏配色跟随机制
+                （BarFollowAnimation，按 windowBackground 判窗口明暗）会据此把导航栏画成不透明条 -->
+        <item name="android:windowBackground">@color/background</item>
+        <!-- 2) 声明「由本窗口绘制系统栏背景」，否则 setStatusBarColor / setNavigationBarColor 不生效 -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <!-- 3) 允许窗口绘制进挖孔区，避免横屏时挖孔一侧出现黑带
+               （与 enableEdgeToEdge 内部 EdgeToEdgeApi30 的运行时设置同值） -->
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+
+        <!-- 4) Activity 过渡动画：四向水平滑动（进入=右推入+旧页左移，返回=镜像）。
+               口径照搬 SportLink（其 AppTheme 同样挂 ActivitySlideWindowAnimation，
+               见 sportlink app/src/main/res/values/styles.xml:8,14-19）。
+               放在主题里而非代码里：覆盖新旧两种 API（避免 overrideActivityTransition /
+               overridePendingTransition 的双分支），且所有 Activity 自动一致。 -->
+        <item name="android:windowAnimationStyle">@style/ActivitySlideWindowAnimation</item>
+    </style>
+
+    <!--
+        Activity 窗口过渡动画集合。
+
+        ⚠️ 必须同时在 values 与 values-night 两份 Theme.PowerMeter 里挂载（本文件与
+        values-night/themes.xml）：过渡动画可能取自**打开方或被打开方**的主题，
+        只在白天变体上声明的话，夜间模式下就会退回系统默认动画。
+        （SportLink 的 styles.xml 注释里记录了同样的坑。）
+    -->
+    <style name="ActivitySlideWindowAnimation">
+        <item name="android:activityOpenEnterAnimation">@anim/slide_in_right</item>
+        <item name="android:activityOpenExitAnimation">@anim/slide_out_left</item>
+        <item name="android:activityCloseEnterAnimation">@anim/slide_in_left</item>
+        <item name="android:activityCloseExitAnimation">@anim/slide_out_right</item>
+    </style>
+</resources>

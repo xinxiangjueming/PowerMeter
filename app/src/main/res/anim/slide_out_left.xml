@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Activity 过渡（进入方向）：旧页面向左移出。
+
+  与 slide_in_right 配对，构成「前进」的一组：新页推入的同时旧页被顶走（不是原地淡出），
+  两侧同向位移才不会出现「一进一出各走各的」的分裂感。
+  用 accelerate：被顶走的页面加速离场，不抢新页面的注意力。
+
+  口径照搬 SportLink `res/anim/slide_out_left.xml`。
+-->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:anim/accelerate_interpolator">
+    <translate
+        android:fromXDelta="0"
+        android:toXDelta="-100%"
+        android:duration="300" />
+</set>

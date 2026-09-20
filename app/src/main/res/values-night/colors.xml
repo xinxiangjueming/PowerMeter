@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 夜间窗口底色：对应 ui/theme/Theme.kt 的 surfaceContainerLowest 分支。
+         详见 values/colors.xml 的说明。 -->
+    <color name="background">#0F0D13</color>
+</resources>

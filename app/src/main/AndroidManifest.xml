@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 前台服务：锁屏后持续采样 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ 通知权限（常驻通知显示实时读数） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 锁屏后保持 CPU 运行 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@drawable/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PowerMeter">
+
+        <!-- configChanges 与两个参照实现同口径：fold 的 MainActivity（app/src/main/AndroidManifest.xml:82-116）
+             与 sportlink 的 DeviceManageActivity（AndroidManifest.xml:330-332）都保留 orientation|screenSize
+             → 旋转不重建，由 onConfigurationChanged + decorView.post 重放窗口层设置。
+             （参照实现另含 uiMode；本项目有意不含，深浅色切换需重建以重跑 onCreate 里的窗口设置。）
+             ⚠️ 曾试过去掉 orientation|screenSize 改为旋转重建：实测「设备横握冷启动照样不复现修复」，
+             证明与旋转路径无关，已回滚。 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.PowerMeter"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 外部打开 CSV 的注册（口径对齐 SportLink，见其 AndroidManifest.xml:252-307）。
+
+                 核心思路是「**注册得宽、入口校验得严**」：类型猜不准（不同管理器对 csv 可能
+                 报 text/csv / text/comma-separated-values / application/csv / vnd.ms-excel /
+                 application/octet-stream），所以类型全列 + 加兜底；真正的过滤交给
+                 MainActivity → CsvImporter.quickCheck（文件名/大小）+ parse（表头校验），
+                 非 CSV 只提示、不改变当前界面。
+
+                 四段 filter 的分工，合并任意两段都会漏或误伤：
+                 ① 类型段（VIEW）—— 常规命中路径；
+                 ② 路径段（VIEW）—— 不声明 type，专收「无 type 但路径带 .csv」的 Intent；
+                    与 ① 合并会被类型检查一票否决。
+                 ③ content 兜底（VIEW）—— 任何 content:// 文件都进候选。**副作用已知并接受**：
+                    图片/视频等的「打开方式」里也会出现本应用，点进去被 quickCheck 拦下。
+                 ④ 分享段（ACTION_SEND）—— 「分享」列表可选中本应用。
+                    这条**不能声明 scheme**：分享时文件在 EXTRA_STREAM、data URI 通常为空，
+                    一旦声明 scheme 就要求它匹配，反而永远不命中。
+
+                 pathPattern 里的 `\\.` 是**故意写成两个反斜杠**：aapt2 会对 manifest 属性值
+                 做一次 Android 字符串转义，编译进包里的 PatternMatcher 模式因此是 `.*\.csv`
+                 （转义点 = 字面量点）；只写一个反斜杠会被吃掉，退化成 `.*.csv`（任意字符点）。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="text/csv" />
+                <data android:mimeType="text/comma-separated-values" />
+                <data android:mimeType="application/csv" />
+                <data android:mimeType="application/vnd.ms-excel" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data
+                    android:scheme="content"
+                    android:host="*"
+                    android:pathPattern=".*\\.csv" />
+                <data
+                    android:scheme="file"
+                    android:host="*"
+                    android:pathPattern=".*\\.csv" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/csv" />
+                <data android:mimeType="text/comma-separated-values" />
+                <data android:mimeType="application/csv" />
+                <data android:mimeType="application/vnd.ms-excel" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+        </activity>
+
+        <!-- 趋势卡全屏页：真沉浸（隐藏状态栏 + 小白条）+ 避让摄像头。
+             不锁方向 → 跟随传感器，横竖屏都可用；configChanges 与 MainActivity 同口径
+             （旋转不重建，由 onConfigurationChanged 重放沉浸设置） -->
+        <activity
+            android:name=".ui.TrendFullscreenActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PowerMeter"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale" />
+
+        <service
+            android:name=".service.SamplingService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="读取 /sys/class/power_supply 与燃料计底层节点，持续监测充放电功率、电压、电流与温度" />
+        </service>
+    </application>
+
+</manifest>
