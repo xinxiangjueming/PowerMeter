@@ -45,7 +45,8 @@ PowerMeter 把功率当作**被测物理量**来做：以特权身份读取内�
 | 采样间隔 | 0.5s / 1s / 2s / 5s 四档，持久化到 `SharedPreferences` |
 | 息屏降频 | 息屏自动放宽到 5s、亮屏回用户设定值（取 `max`，不会给用户设定"提速"） |
 | 锁屏保持 | 可选 `PARTIAL_WAKE_LOCK`。**默认关闭**；开启后息屏仍按设定间隔出点 |
-| 缓冲上限 | 3600 条环形缓冲，只保留最近 3600 个样本 |
+| 数据落库 | **每 10s 增量写入 Room**（应用私有目录）。进程被杀最多丢 10 秒，不再受内存窗口限制 |
+| 内存窗口 | 环形缓冲 **7200** 条，**只作用于界面曲线的显示窗口**（1s 间隔 ≈ 2 小时，见 [2.8](#28-采样数据落库与会话生命周期)） |
 | 权限 | 首次启动采样时按需申请 `POST_NOTIFICATIONS`（Android 13+），拒绝则提示原因 |
 | 错误反馈 | 取数通道不可用 / 节点读不到 / 解析失败三种情形均在页面顶部以错误卡明示，并附原始输出摘要 |
 
@@ -55,13 +56,13 @@ PowerMeter 把功率当作**被测物理量**来做：以特权身份读取内�
 
 - **主功率卡**：56sp 等宽字体大号功率读数，充电用 `primary`、放电用 `tertiary` 着色；副行显示 `SOC · charge_type · 剩余 mAh`
 - **指标网格**：电压 / 电流 / 电池温度 / 接口温度 / 开路电压 / 充电 IC 温度
-- **趋势卡**：功率、电压、电流、温度四指标可切换；曲线色可自定义；可一键进入全屏
+- **趋势卡**：功率、电压、电流、温度、**PMIC 温度**五指标可切换（PMIC 温度**仅真 root 机器**出现，见 [3.5](#35-各通道字段可用性)）；曲线色可自定义；可一键进入全屏
 - **统计卡**：样本数、时长、平均功率、峰值充电/放电、电压区间、最高温度、累计充入/放出（mAh 与 Wh）
 - **电池卡**：型号、技术、健康度 SOH、循环次数、满充容量、设计容量、最大充电档位
 - **控制条**：开始 / 停止采样、导出 CSV
 - **设置面板**：底部上滑 bottom sheet —— 采样间隔、锁屏保持采样、充电功率监测、串联双电池、数据读取权限、清空采样数据
 
-**统计量口径**（2026-09 起）：峰值 / 电压区间 / 最高温度 / 平均功率 / 累计 mAh·Wh 均为**本次会话累计**，不随 3600 条缓冲滑出而丢失；累计量用梯形积分，且两条通道独立结算 —— `mAh ← currentMa` 积分、`Wh ← powerW` 积分。
+**统计量口径**（2026-09 起）：峰值 / 电压区间 / 最高温度 / 平均功率 / 累计 mAh·Wh 均为**本次会话累计**，不随内存窗口滑出而丢失；累计量用梯形积分，且两条通道独立结算 —— `mAh ← currentMa` 积分、`Wh ← powerW` 积分。
 
 ### 2.3 趋势曲线
 
@@ -76,6 +77,10 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 
 **绘制抽稀**：可见点数超过绘图区像素宽的 2 倍时，按分桶 min/max 抽稀到「约 1 像素 2 点」再建 `Path`。抽稀**只作用于绘制** —— 几何量与读数索引仍按全量样本计算，否则按住气泡取到的值会与手指位置错位。
 
+**指标 tab 集合**：桌面趋势卡与全屏页共用 `rememberAvailableMetrics()` **一处口径** —— 功率 / 电压 / 电流 / 温度恒在，**PMIC 温度仅真 root 机器出现**。判据是 `RootPowerReader.rootAvailable`（su 探测结论），**不是** `accessMode`：root 机器若同时开着 Shizuku，通道会优先走 Shizuku，用「当前通道」判定会把这个 tab 误藏（与电池卡片同一考量）。任何 tab 行都不要另写一份过滤条件。
+
+**断点语义**：某指标在某个采样点无读数时取 `NaN` 而非 `0` —— 曲线建 `Path` 时在该点**断开**，抽稀的分桶极值跳过无读数点，读数气泡与 Y 轴刻度显示「—」（与指标卡片的 `f3OrDash` 同口径）。绝不拿 `0` 兜底：那会被画成一条贴在 0℃ 的假曲线。触发场景是旧版 15 列 CSV（没有 `temp_pmic_c` 列）或本机缺该温感区。
+
 ### 2.4 全屏趋势页
 
 独立 `Activity`，进入即**强制横屏**（`SCREEN_ORIENTATION_SENSOR_LANDSCAPE`，允许 180° 翻转跟随重力）：
@@ -83,6 +88,7 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 - **真沉浸**：隐藏状态栏与手势导航条，从屏幕边缘上滑可瞬时唤出；背景铺满全屏、内容延伸到系统栏之下
 - **避让挖孔**：窗口声明 `LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS`（否则默认模式会在挖孔侧留黑带），再交由 Compose 的 `WindowInsets.displayCutout` 全边避让 —— 竖屏顶部中央、横屏左右侧一次覆盖
 - 指标**多选**叠加对比，胶囊上带色点标识对应曲线色；至少保留一条（不允许清空）
+- tab 集合与主页同源（`rememberAvailableMetrics()`，PMIC 温度仅真 root 机器可选）；选中项与可用集合求交，交集为空则回落功率 —— 兜住「`rememberSaveable` 里存着本机当前不可用的指标」
 - 进入 / 返回走主题声明的四向水平滑动过渡（300ms）；**关闭时序有讲究**，见 [6.4](#64-趋势全屏页的关闭时序)
 
 ### 2.5 充电功率监测（默认关闭）
@@ -112,6 +118,36 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 - **导出**：写入系统 `MediaStore.Downloads`，落在 `Download/PowerMeter/powermeter_yyyyMMdd_HHmmss.csv`（Android 10+ 无需存储权限）。导出的是**「当前所看的那一份」** —— 查看导入文件时导出的是该文件数据，与界面所见一致
 - **导入**：从系统「打开方式」或「分享」打开 CSV，以只读方式装载为「查看态」数据源；页面顶部出现醒目提示条标出来源与条数，附「退出查看」按钮
 - **查看态与实时态互不干扰**：查看历史文件时实时采样照常进行，两者写入不同的 `StateFlow`，UI 统一按 `if (导入非空) 导入 else 实时` 取数。退出查看即自动回到实时曲线
+
+### 2.8 采样数据落库与会话生命周期
+
+2026-09 起，采样数据不再只活在内存里。**每 10 秒**把这一批样本增量写入 Room（`/data/data/<pkg>/databases/powermeter.db`，私有目录，不需要任何存储权限），因此：
+
+- **进程被杀最多丢 10 秒**（上次刷盘到被杀之间的样本），而不是整场数据；
+- **导出不再受内存窗口限制** —— 导的是库里的会话全量，1s 间隔跑一整天也能完整导出；
+- 内存环形缓冲**退化为纯显示窗口**（曲线画最近 7200 点），不再承担"数据唯一副本"的角色。
+
+落库会话 (session) 不是用户资产，而是**自动保存的临时存档**，生命周期规则如下：
+
+| 阶段 | 行为 |
+| --- | --- |
+| 采样中 | 每 10s flush 一批；`(sessionId, timeMillis)` 唯一索引 + REPLACE 让重复 flush 幂等 |
+| 停止采样 | 收尾刷盘、定格结束时间，**会话保留在库里等用户导出** |
+| 点「导出 CSV」 | 从库里分页读全量 → 写 CSV 到 `Download/PowerMeter/` → **删除该会话**（外键级联删样本） |
+| 停止后没点导出 | **保留为「最近一次未导出会话」**，进程被杀也不丢 |
+| 开始新一场采样 | 开新会话前先删掉上一场（同一条规则的另一面：用户不要了） |
+| 冷启动 | 只保留最新一条，更早的删掉 |
+
+**为什么冷启动不干脆全删**：HyperOS 上「停止采样 → 切走 → 进程被回收」发生得很快，用户常常还没来得及导出，全删等于把刚测完的一整场直接丢掉。保留最新一条让「打开应用 → 点导出」这条路始终可用；而这条存档会在用户导出或开始新一场采样时清掉，不会长期堆积。
+
+⇒ **稳态下库里最多只有一行**，即最近一次未导出的那一场。
+
+两个补充规则：
+
+- **采样仍在运行时点导出**：导出并删除后**立刻开一个新会话**，后续样本写进新会话。不这么做的话，样本会继续带着已删除的 `sessionId` 写入，直接撞外键约束。
+- **「充电功率监测」自动保存的场景**：低功率满 5 分钟时从库里导出（`deleteAfter = false` —— 采样没停，会话必须留着继续累积），并打上 `autoSaved` 标记；停止采样时该会话直接删除，因为用户手里已经有 CSV 了。
+
+清空数据（「清空采样数据」按钮）同样走这条链：删会话 + 若采样仍在运行则立刻开一个新的空会话。
 
 ---
 
@@ -207,6 +243,8 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 
 **电池静态信息（型号 / SOH / 循环次数 / 满充容量）仅 root 通道提供** —— 核心字段取自高通私有 `qcom-battery` 节点，shell 身份读不到。故非 root 机器**整张电池卡片不渲染，且不做任何提示、不加占位卡片**（渲染一张全是「—」的空壳卡片反而误导）。
 
+**PMIC 温度同样只在真 root 机器上露面**：芯片温度（温感区 `pm8350c_tz` / `pm8350b_tz`）由图表的 **PMIC 温度 tab** 呈现，该 tab **仅在真 root 机器列出**，Shizuku(shell) 机器不出现（与电池卡片同一判据 `RootPowerReader.rootAvailable`，不做提示、不加占位）。tab 本身的取数与换算不受影响：节点每样本从温感区读取，binder 通道下走 30s 低频缓存。
+
 ---
 
 ## 4. 架构与模块地图
@@ -215,25 +253,31 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 app/src/main/
 ├── aidl/com/chen/powermeter/shizuku/IShellService.aidl    15 行  UserService 的 AIDL 契约
 └── kotlin/com/chen/powermeter/
-    ├── PowerMeterApp.kt                      28 行  Application：Shizuku + BatteryManager 通道初始化
-    ├── MainActivity.kt                      304 行  入口：权限、外部 Intent 分发、导出、配置变更重放
+    ├── PowerMeterApp.kt                      42 行  Application：Shizuku / BatteryManager / 落库初始化 + 冷启动清理
+    ├── MainActivity.kt                      368 行  入口：权限、外部 Intent 分发、导出、配置变更重放
     ├── data/
     │   ├── PowerSample.kt                    70 行  采样快照 PowerSample / 会话统计 SessionStats
-    │   ├── RootPowerReader.kt               796 行  三通道取数 + 单位换算 + 解析（唯一数据来源）
-    │   ├── SampleStore.kt                   178 行  实时采样环形缓冲 + O(1) 增量统计
+    │   ├── RootPowerReader.kt               832 行  三通道取数 + 单位换算 + 解析（唯一数据来源）
+    │   ├── SampleStore.kt                   194 行  实时环形缓冲 + O(1) 增量统计（**退化为显示窗口**）
     │   ├── BatteryManagerSource.kt          158 行  主进程零 fork 通道（getLongProperty + 粘性广播）
     │   ├── SuSession.kt                     168 行  root 常驻 shell 会话（免每次 fork su）
     │   ├── BatteryInfoStore.kt               69 行  电池静态信息仓库（进程级单例）
-    │   └── CsvImporter.kt                   263 行  CSV 解析 + ImportedSeries（导入态单例）
+    │   ├── CsvImporter.kt                   266 行  CSV 解析 + ImportedSeries（导入态单例）
+    │   └── db/
+    │       ├── SessionRecorder.kt           339 行  会话录制器：10s 增量落库 / 导出 / 会话生命周期
+    │       ├── PowerSampleEntity.kt          99 行  样本行（字段同 PowerSample；唯一索引保 flush 幂等）
+    │       ├── SampleDao.kt                  58 行  会话 + 样本 DAO（含导出用分页查询）
+    │       ├── PowerMeterDatabase.kt         34 行  Room 数据库（私有目录 powermeter.db）
+    │       └── PowerSession.kt               25 行  采样会话（自动保存的临时存档，非用户资产）
     ├── service/
-    │   └── SamplingService.kt               629 行  前台服务：采样循环、通知节流、息屏降频、wakelock、充电监测
+    │   └── SamplingService.kt               658 行  前台服务：采样循环、通知节流、息屏降频、wakelock、充电监测
     ├── shizuku/
     │   └── ShellService.kt                   59 行  Shizuku UserService（shell 身份执行命令）
     ├── ui/
-    │   ├── PowerMeterScreen.kt             1120 行  主页面（竖屏单列 / 横屏双列）、Metric 枚举、各卡片
-    │   ├── TrendChartView.kt                899 行  图表组件：多序列 / 填充 / 读数 / 缩放 / 抽稀 / 滑条
-    │   ├── TrendFullscreenActivity.kt       443 行  趋势全屏页（沉浸式 + 挖孔避让 + 关闭时序）
-    │   ├── ColorPickerDialog.kt             301 行  ChartColors 仓库 + 颜色选择面板（miuix ColorPalette）
+    │   ├── PowerMeterScreen.kt             1311 行  主页面（竖屏单列 / 横屏双列）、Metric 枚举与 tab 过滤、各卡片
+    │   ├── TrendChartView.kt                961 行  图表组件：多序列 / 填充 / 读数 / 缩放 / 抽稀 / 滑条 / 断点
+    │   ├── TrendFullscreenActivity.kt       455 行  趋势全屏页（沉浸式 + 挖孔避让 + 关闭时序）
+    │   ├── ColorPickerDialog.kt             306 行  ChartColors 仓库 + 颜色选择面板（miuix ColorPalette）
     │   ├── common/BlurTopBar.kt             115 行  顶栏三档模糊封装
     │   └── theme/
     │       ├── Theme.kt                      87 行  Material 3 Expressive 主题 + 底色压深
@@ -242,11 +286,12 @@ app/src/main/
         ├── ShizukuHelper.kt                 300 行  Shizuku 三态 + UserService 绑定重试
         ├── EdgeToEdge.kt                    162 行  NavigationBarHelper：真沉浸 / 重放链
         ├── ScreenController.kt               76 行  特权通道注入电源键熄屏
-        ├── CsvExporter.kt                    87 行  导出 CSV 到 MediaStore.Downloads
+        ├── CsvExporter.kt                   163 行  导出 CSV 到 MediaStore.Downloads（含分页流式写出）
+        ├── AppStrings.kt                     40 行  object 单例取文案的桥（i18n，由 Application 注入）
         └── Prefs.kt                          88 行  SharedPreferences 封装
 ```
 
-Kotlin 共 **23 个文件、6437 行**；另有 1 个 AIDL 契约与 11 个资源文件。
+Kotlin 共 **29 个文件、7540 行**；另有 1 个 AIDL 契约与 11 个资源文件。
 
 ### 数据流
 
@@ -258,16 +303,22 @@ Kotlin 共 **23 个文件、6437 行**；另有 1 个 AIDL 契约与 11 个资�
                               ▼
                       RootPowerReader.read() ──► PowerSample
                               │
-                              ▼
-                    SampleStore（环形缓冲 3600 + 增量统计）   ImportedSeries（导入态，上限 20000）
-                              └──────────┬──────────────────────────────┘
-                                         ▼  UI: if (导入非空) 导入 else 实时
-                              PowerMeterScreen / TrendFullscreenActivity
-                                         ▼
-                                  TrendChartView (Canvas)
+              ┌───────────────┼───────────────────────────────┐
+              ▼               ▼                               ▼
+   SampleStore（环形 7200    SessionRecorder ──每 10s 批量──► PowerMeterDatabase
+    + 增量统计，只作显示窗口）  （Channel 单消费者，零阻塞入队）   （Room，私有目录）
+              │                       │
+              │                       ▼ 导出时：分页读全量 → CSV → 删会话
+              │               Download/PowerMeter/*.csv
+              │                                               ImportedSeries（导入态，上限 20000）
+              └──────────┬──────────────────────────────────────────────┘
+                         ▼  UI: if (导入非空) 导入 else 实时
+              PowerMeterScreen / TrendFullscreenActivity
+                         ▼
+                  TrendChartView (Canvas)
 ```
 
-两个数据源**并列且互不写入**，因此「查看历史文件」不会覆盖正在进行的实时采样，「清空采样数据」也不会把导入的数据一起清掉。
+三条数据源**并列且互不写入**，因此「查看历史文件」不会覆盖正在进行的实时采样，「清空采样数据」也不会把导入的数据一起清掉。落库链路（SessionRecorder → Room）与显示链路（SampleStore → UI）也是分开的：后者容量只有 7200 条但零 IO，前者不受条数限制但只在导出时被读。
 
 ---
 
@@ -309,10 +360,18 @@ Kotlin 共 **23 个文件、6437 行**；另有 1 个 AIDL 契约与 11 个资�
 
 ### 5.4 内存与重组开销
 
-- 采样序列改为**环形缓冲 + 按需快照**：旧实现每个采样周期都做 `(list + sample).takeLast(3600)`，即每秒新建一个 3600 元素列表（息屏时照做）。现在服务侧只做 O(1) 追加，快照由真正需要的调用方索取。
+- 采样序列改为**环形缓冲 + 按需快照**：旧实现每个采样周期都做 `(list + sample).takeLast(MAX_SAMPLES)`，即每秒新建一个等长列表（息屏时照做）。现在服务侧只做 O(1) 追加，快照由真正需要的调用方索取。
 - UI 侧订阅**版本号**而非列表本身，重装时才取一次快照 —— **息屏无帧即无重组，连快照都不会执行**。
 - 统计量改为**每样本 O(1) 增量更新**，不再挂在重组上做 O(n) 全量重算。
 - `LoadingIndicator` 只在「已启动、尚无首个样本」的真实等待期显示；采样全程挂着它等于让界面每帧都有动画驱动。
+
+### 5.5 落库：绝不在采样点里写盘（2026-09）
+
+每 10s 一次批量 insert 对功耗几乎无影响（WAL + 事务合并），但**写法**有硬性要求：
+
+- **采样点只做一次 `trySend`**（Channel UNLIMITED），全部 DB 写入由 `SessionRecorder` 里唯一的消费协程在 IO 线程完成。采样循环跑在 `Dispatchers.Default`，任何同步 IO 都会把 0.5s 档拖成抖动 —— 抖动直接反映在曲线的时间轴上。
+- **定时 flush 而不是"凑够 N 条就写"**：条数阈值在用户把间隔调到 5s 时会退化成几分钟才落一次盘，丢失窗口不可控；固定 10s 让"最多丢多少"有确定上界。
+- **batch insert 用一次事务**：Room 对 List 参数的 `@Insert` 本身就是单事务，100 条样本一次 `insertSamples` 而不是 100 次。
 
 ---
 
@@ -449,11 +508,11 @@ adb shell cmd package query-activities --brief \
 
 ## 7. CSV 数据格式
 
-### 导出（15 列，UTF-8，LF）
+### 导出（18 列，UTF-8，LF）
 
 ```csv
-timestamp,datetime,voltage_v,voltage_ocv_v,current_ma,fg_current_ma,power_w,temp_battery_c,temp_usb_c,temp_charger_c,soc_pct,status,charge_type,remaining_mah,usb_voltage_v
-1763692800123,2026-09-21 02:40:00.123,4.312,4.355,2841.500,2803.200,12.253,33.4,31.2,38.900,78,Charging,Fast,3455.000,5.102
+timestamp,datetime,voltage_v,voltage_ocv_v,current_ma,fg_current_ma,power_w,temp_battery_c,temp_usb_c,temp_charger_c,soc_pct,status,charge_type,remaining_mah,usb_voltage_v,temp_pmic_c,full_mah,usb_current_limit_ma
+1763692800123,2026-09-21 02:40:00.123,4.312,4.355,2841,2803,12.253,33.4,31,38.900,78,Charging,Fast,3455,5.102,36.200,4500,3000
 ```
 
 | 列 | 单位 | 说明 |
@@ -473,6 +532,9 @@ timestamp,datetime,voltage_v,voltage_ocv_v,current_ma,fg_current_ma,power_w,temp
 | `charge_type` | — | `Fast` / `Trickle` / `None` |
 | `remaining_mah` | mAh | 剩余容量（来自燃料计 `fg1_rm`，权威）；整数 |
 | `usb_voltage_v` | V | USB 输入电压 |
+| `temp_pmic_c` | ℃ | 主 PMIC 温度（`pm8350c_tz` / `pm8350b_tz`）；3 位小数 |
+| `full_mah` | mAh | 当前满充容量（`charge_full`），即电池健康度分母；整数。仅 sysfs 通道有，binder 通道留空 |
+| `usb_current_limit_ma` | mA | USB 输入限流；整数。⚠️ 多数机型上报的是**限流上限而非实测电流**，仅作参考 |
 
 ### 导入的容错范围
 
@@ -561,6 +623,8 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 | `io.github.kyant0:backdrop` | 2.0.1 | API ≥ 33 渐进式 AGSL 模糊（**需 exclude CMP 传递依赖**） |
 | `top.yukonga.miuix.kmp:miuix-ui` | 0.9.2 | 曲线颜色色盘 `ColorPalette` |
 | `dev.rikka.shizuku:api` / `provider` | 13.1.5 | 非 root 机器的 shell 身份取数通道 |
+| `androidx.room:room-runtime` / `room-ktx` | 2.8.4 | 采样会话落库（私有目录），免写 SQL 与 Cursor 映射 |
+| `com.google.devtools.ksp`（插件） | 2.3.9 | Room 注解处理。⚠️ 版本必须与 Kotlin 对齐，改 Kotlin 版本时同步升 |
 
 无网络权限、无数据上报、无第三方统计 SDK。
 
@@ -570,14 +634,18 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 
 - **取数仍需一条特权通道（root 或 Shizuku）才能启动采样**。主进程 `BatteryManager` 兜底通道本身不需要任何权限，但当前它只在特权通道已建立、且 sysfs 不可读时才会被启用；纯无权限设备目前不取数
 - **非 root 机器看不到电池卡片**（SOH / 循环次数 / 满充容量取自高通私有节点，shell 身份读不到）。这是有意为之，不做提示、不加占位卡片
+- **非 root 机器也没有 PMIC 温度 tab**（趋势卡与全屏页同源过滤，判据是 su 探测结论）。root 机器的 tab 上若因旧版 CSV 缺列而整段无读数，曲线显示为空白、读数与刻度显示「—」，不会用 0 值顶替
 - **机型差异**：主要在两台小米真机上标定。其它平台的节点名与单位可能不同，`charge_counter` 量级校准、温感区 `type` 名称、电流符号是最可能出问题的地方
-- **数据不落库**。实时缓冲与导入数据均只存活于进程内（`StateFlow` 单例），进程被杀即丢失；需要留存请先导出 CSV
-- **实时缓冲上限 3600 条**。按 1s 间隔约 1 小时，0.5s 间隔约 30 分钟，更早的数据被环形淘汰（会话统计量不受影响，见 [2.2](#22-状态页竖屏单列--横屏双列)）
+- **导入的数据不落库**。实时采样已每 10s 写入 Room（见 [2.8](#28-采样数据落库与会话生命周期)），但**导入的 CSV 仍只存活于进程内**（`ImportedSeries` 单例），退出查看即丢弃 —— 它本来就来自一个磁盘上的文件，没有二次留存的必要
+- **落库会话是临时存档，不是用户资产**：库里最多只保留「最近一次未导出的会话」，且会在用户导出、或开始新一场采样时被删掉。要长期留存就必须导出成 CSV（见 [2.8](#28-采样数据落库与会话生命周期)）
+- **一场数据只能留一场**：连测两场而都没导出，第一场会在第二场开始的那一刻被删除 —— 这是「临时存档」语义的必然结果
+- **进程被杀最多丢 10 秒采样**（上次 flush 到被杀之间）。再往上加严只能缩短 flush 间隔，代价是写放大
+- **内存显示窗口 7200 条**。按 1s 间隔约 2 小时、0.5s 间隔约 1 小时；更早的点被环形淘汰、**不再画在曲线上**，但它们仍在库里、能完整导出（会话统计量也不受影响，见 [2.2](#22-状态页竖屏单列--横屏双列)）
+- **图表读数只覆盖内存窗口**：曲线上能按住读数的点就是显示窗口内的点。要看更早的数据请导出 CSV 再导入回看
 - **多序列叠加时 Y 轴刻度无统一物理含义**，此时不再画数值刻度，改由图例标量程 + 按住气泡显示真实值 —— 这是量纲不同的必然取舍，不是缺陷
-- **`temp_pmic_c`、`full_mah`、`usb_current_limit_ma` 未纳入 CSV**，导入后对应位置显示 `—`
-- **`usb/current_now` 多为限流上限而非实测电流**，仅作参考
+- **`usb/current_now` 多为限流上限而非实测电流**，仅作参考（已作为 `usb_current_limit_ma` 列导出）
 - **`SuSession`（root 常驻 shell）未真机验证**，逻辑上有多层兜底并会自动回落到一次性 fork 路径
-- **无 i18n**。仅 `values/strings.xml`（应用名），UI 文案硬编码在 Kotlin 中
+- **导出把整场会话写进内存的是"页码"而非全量**：导出走分页（每页 5000 行），但单场会话的**行数**仍然决定耗时；十万行级别的超长会话导出时会有可感知的等待（在 IO 线程，不冻界面）
 
 ---
 

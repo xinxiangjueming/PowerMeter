@@ -170,7 +170,14 @@ fun PowerMeterScreen(
     val corner = LocalCornerRadius.current
     val cardShape = remember(corner) { RoundedCornerShape(corner) }
     var settingsOpen by remember { mutableStateOf(false) }
-    var metric by remember { mutableStateOf(Metric.POWER) }
+    // 本机可切换的指标 tab：PMIC 温度只在真 root 机器上出现（见 rememberAvailableMetrics）
+    val availableMetrics = rememberAvailableMetrics()
+    var selectedMetric by remember { mutableStateOf(Metric.POWER) }
+    // 图表与 tab 行统一读这个**派生值**：root 结论若在会话中变化（RootPowerReader 复位探测
+    // 缓存后重探），当前选中项可能不再可用 —— 此时自动回落到功率，否则会出现"图表画着
+    // PMIC 温度、tab 行里却没有对应胶囊"的错位，用户无法切回去。派生而非副作用改名，
+    // 不会多触发一轮重组。
+    val metric = selectedMetric.takeIf { it in availableMetrics } ?: Metric.POWER
     // 非空 = 颜色面板打开中，值为正在编辑的指标
     var colorTarget by remember { mutableStateOf<Metric?>(null) }
     // 实时态用环形缓冲维护的 O(1) 增量统计（档二-1）；导入态数据是一次性的，沿用全量重算。
@@ -267,8 +274,9 @@ fun PowerMeterScreen(
                         TrendCard(
                             samples = samples,
                             metric = metric,
+                            tabs = availableMetrics,
                             metricColor = metricColor,
-                            onMetricChange = { metric = it },
+                            onMetricChange = { selectedMetric = it },
                             onColorClick = { colorTarget = metric },
                             shape = cardShape,
                             onFullscreenClick = openTrendFullscreen,
@@ -296,8 +304,9 @@ fun PowerMeterScreen(
                     TrendCard(
                         samples = samples,
                         metric = metric,
+                        tabs = availableMetrics,
                         metricColor = metricColor,
-                        onMetricChange = { metric = it },
+                        onMetricChange = { selectedMetric = it },
                         onColorClick = { colorTarget = metric },
                         shape = cardShape,
                         onFullscreenClick = openTrendFullscreen,
@@ -685,6 +694,14 @@ internal enum class Metric(@StringRes val labelRes: Int) {
     VOLTAGE(R.string.metric_voltage),
     CURRENT(R.string.metric_current),
     TEMP(R.string.metric_temp),
+
+    /**
+     * 主 PMIC 温度（温感区 `pm8350c_tz` / `pm8350b_tz`）。
+     *
+     * ⚠️ 该节点由 root 通道稳定取得，UI 侧**仅在真 root 机器**列出本 tab
+     * （见 [rememberAvailableMetrics]），Shizuku(shell) 机器不列出。
+     */
+    PMIC_TEMP(R.string.metric_pmic_temp),
     ;
 
     fun value(s: PowerSample): Double = when (this) {
@@ -692,6 +709,10 @@ internal enum class Metric(@StringRes val labelRes: Int) {
         VOLTAGE -> s.voltageV
         CURRENT -> s.currentMa
         TEMP -> s.tempBatteryC
+        // 无读数（旧版 15 列 CSV 不含该列、或本机缺该温感区）返回 NaN：
+        // 曲线按"断点"处理、读数与刻度显示破折号，绝不回落成 0.0 —— 否则会被画成
+        // 一条贴在 0℃ 的假曲线，与 CSV 导入"留空即 null"的口径（README 3.x）相悖
+        PMIC_TEMP -> s.tempPmicC ?: Double.NaN
     }
 }
 
@@ -705,10 +726,34 @@ internal enum class Metric(@StringRes val labelRes: Int) {
 @Composable
 internal fun Metric.label(): String = stringResource(labelRes)
 
+/**
+ * 本机可切换的指标 tab 列表（趋势卡与全屏趋势页共用，两处口径必须一致）。
+ *
+ * PMIC 温度**仅在真 root 机器**出现（用户拍板 2026-09-21）：该温感区靠 root 通道取数，
+ * Shizuku(shell) 机器上列出该 tab 只会得到一条空曲线，且与电池信息卡"仅 root 显示"相悖。
+ * 判据取 [RootPowerReader.rootAvailable]（su 探测结论），**不是** `accessMode` ——
+ * root 机器若同时开着 Shizuku，通道会优先走 Shizuku，用通道判定会把该 tab 误藏。
+ *
+ * 所有消费「指标全集」的 tab 行都必须走本函数，不要在别处再写一份过滤条件。
+ */
+@Composable
+internal fun rememberAvailableMetrics(): List<Metric> {
+    val rootAvailable by RootPowerReader.rootAvailable.collectAsState()
+    return remember(rootAvailable) {
+        if (rootAvailable) {
+            Metric.entries.toList()
+        } else {
+            Metric.entries.filterNot { it == Metric.PMIC_TEMP }
+        }
+    }
+}
+
 @Composable
 internal fun TrendCard(
     samples: List<PowerSample>,
     metric: Metric,
+    /** 可切换的指标 tab（见 [rememberAvailableMetrics]）：PMIC 温度只在真 root 机器上出现 */
+    tabs: List<Metric>,
     metricColor: Color,
     onMetricChange: (Metric) -> Unit,
     /** 点击标题行右侧的颜色胶囊：打开该指标的颜色选择面板 */
@@ -752,7 +797,7 @@ internal fun TrendCard(
             }
             Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Metric.entries.forEach { m ->
+                tabs.forEach { m ->
                     FilterChip(
                         selected = metric == m,
                         onClick = { onMetricChange(m) },

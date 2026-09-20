@@ -36,6 +36,7 @@
     <string name="metric_ocv">開路電壓</string>
     <string name="metric_usb_temp">接口溫度</string>
     <string name="metric_charger_ic_temp">充電 IC 溫度</string>
+    <string name="metric_pmic_temp">PMIC 溫度</string>
 
     <!-- ==================== 趨勢 ==================== -->
 

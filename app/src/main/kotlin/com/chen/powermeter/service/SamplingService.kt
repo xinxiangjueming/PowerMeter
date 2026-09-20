@@ -13,7 +13,6 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
-import android.provider.OpenableColumns
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -24,6 +23,7 @@ import com.chen.powermeter.data.PowerSample
 import com.chen.powermeter.data.RootPowerReader
 import com.chen.powermeter.data.SampleStore
 import com.chen.powermeter.data.SessionStats
+import com.chen.powermeter.data.db.SessionRecorder
 import com.chen.powermeter.util.CsvExporter
 import com.chen.powermeter.util.Prefs
 import com.chen.powermeter.util.ScreenController
@@ -123,8 +123,8 @@ class SamplingService : Service() {
         /**
          * 采样序列改为**环形缓冲 + 按需快照**（档二-1，见 [SampleStore]）。
          *
-         * 旧实现每次采样都做 `(_samples.value + sample).takeLast(3600)` —— 每秒新建一个
-         * 3600 元素的列表，息屏时照做。现在服务侧只 append（O(1)、零分配），
+         * 旧实现每次采样都做 `(_samples.value + sample).takeLast(MAX_SAMPLES)` —— 每秒新建一个
+         * 等长元素的列表，息屏时照做。现在服务侧只 append（O(1)、零分配），
          * 快照由真正需要的调用方（UI 重组 / 导出落盘）按需索取。
          */
         val sampleVersion: StateFlow<Long> get() = SampleStore.version
@@ -161,8 +161,16 @@ class SamplingService : Service() {
             _intervalMs.value = ms
         }
 
+        /**
+         * 清空采样数据。
+         *
+         * ⚠️ 必须同时处理落库会话：采样仍在运行时不能只把会话行删掉就完事 ——
+         * 后续样本会继续带着那个已删除的 sessionId 写入，撞外键约束。
+         * [SessionRecorder.discardAsync] 的 `restart` 参数正是为此：删旧会话 + 立刻开新会话。
+         */
         fun clearSamples() {
             SampleStore.clear()
+            SessionRecorder.discardAsync(restart = _running.value)
         }
     }
 
@@ -285,6 +293,11 @@ class SamplingService : Service() {
     }
 
     private suspend fun samplingLoop() {
+        // 开场先建会话：样本必须从第一个点起就有归属，否则开头这段只能活在内存缓冲里。
+        // 建会话失败（DB 打不开等）不阻断采样 —— 曲线、统计、通知都在内存里照常工作，
+        // 只是失去「进程被杀后数据仍在」的保障；导出按钮此时会回落到内存快照路径。
+        runCatching { SessionRecorder.start() }
+
         while (true) {
             val raw = withContext(Dispatchers.IO) { RootPowerReader.read() }
             // 串联双电池换算：在**采样入口**统一处理，下游（曲线、统计、常驻通知、手动导出、
@@ -309,6 +322,9 @@ class SamplingService : Service() {
             }
             if (sample != null) {
                 SampleStore.append(sample)
+                // 增量落库：只入队（零阻塞），真正写盘由 SessionRecorder 每 10s 批量做。
+                // 采样循环在 Dispatchers.Default 上，这里绝不能出现同步 IO —— 0.5s 档会被拖成抖动
+                SessionRecorder.onSample(sample)
                 _error.value = null
                 maybeNotify(sample)
                 watchChargePower(sample)
@@ -394,13 +410,27 @@ class SamplingService : Service() {
     }
 
     /**
-     * 导出**本场采样全量快照**（与手动「导出 CSV」同口径：都是从开始采样到此刻的完整
-     * 充电曲线），文件名加 `powermeter_charge_` 前缀以便区分。
+     * 导出**本场采样到目前为止的全量数据**（从开始采样到此刻的完整充电曲线），
+     * 数据源与手动「导出 CSV」同一处 —— 都是库里的会话，因此不受内存窗口限制。
+     * 文件名加 `powermeter_charge_` 前缀以便与手动导出区分。
      *
      * 全程不触碰 [_running] / [samplingJob] —— 只写文件，采样继续。
      */
-    private fun autoSaveCsv() {
-        // 只在真正落盘这一刻取快照：环形缓冲平时不做任何整表拷贝
+    private suspend fun autoSaveCsv() {
+        // 优先从落库的会话里导出：不受内存显示窗口（SampleStore.CAPACITY）限制，长测也能导出全量。
+        // deleteAfter = false —— 采样还在继续，会话必须留着继续累积；
+        // 它的"善后"（停止时删除）由 onDestroy 依据 autoSaved 标记完成。
+        val saved = SessionRecorder.exportCurrent(
+            context = this,
+            prefix = AUTO_SAVE_PREFIX,
+            rotate = false,
+            deleteAfter = false,
+        )
+        if (saved.uri != null) {
+            notifyAutoSaved(saved.uri, saved.sampleCount)
+            return
+        }
+        // 兜底：会话层无数据（落库失败等）时回落到内存快照，行为与引入 Room 之前一致
         val snapshot = SampleStore.snapshot()
         if (snapshot.isEmpty()) return
         val uri = CsvExporter.export(this, snapshot, prefix = AUTO_SAVE_PREFIX)
@@ -411,7 +441,7 @@ class SamplingService : Service() {
     private fun notifyAutoSaved(uri: Uri?, count: Int) {
         val nm = getSystemService(NotificationManager::class.java) ?: return
         val text = if (uri != null) {
-            val name = displayNameOf(uri) ?: "CSV"
+            val name = CsvExporter.displayNameOf(this, uri) ?: "CSV"
             getString(R.string.notify_auto_saved, name, count)
         } else {
             getString(R.string.notify_auto_save_failed)
@@ -428,20 +458,6 @@ class SamplingService : Service() {
                 .build(),
         )
     }
-
-    /**
-     * 取 MediaStore 里那份文件的真实文件名。
-     *
-     * 不能用 `uri.lastPathSegment` —— 对 MediaStore 的 content:// 记录它返回的是数字 ID
-     * 而非 DISPLAY_NAME。
-     */
-    private fun displayNameOf(uri: Uri): String? = runCatching {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { cursor ->
-                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
-            }
-    }.getOrNull()
 
     private fun startForegroundCompat(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -606,6 +622,12 @@ class SamplingService : Service() {
     }
 
     override fun onDestroy() {
+        // 会话收尾（收尾刷盘 + 定格结束时间 + 按需删除）。
+        // ⚠️ 必须在 scopeJob.cancel() **之前**发起，且它跑在 SessionRecorder 自带的 IO scope 上
+        //    —— 挂在本服务的 scope 上会被下面这行取消连坐，收尾批次直接丢失。
+        // 删除策略：本场已被「充电功率监测」自动保存过 ⇒ 用户手里已有 CSV，会话不留；
+        //          否则保留在库里等用户点「导出 CSV」，没点就由下次冷启动的孤儿清理删掉。
+        SessionRecorder.stopAsync(delete = autoSaved)
         // 取消服务级 Job：samplingJob、续期协程与 scheduleScreenOff 的 delay 协程一并结束，
         // 避免服务销毁后仍有协程在跑（见 scopeJob 的注释）
         scopeJob.cancel()

@@ -36,6 +36,7 @@
     <string name="metric_ocv">Open-circuit V</string>
     <string name="metric_usb_temp">Port temp</string>
     <string name="metric_charger_ic_temp">Charger IC temp</string>
+    <string name="metric_pmic_temp">PMIC temp</string>
 
     <!-- ==================== Trend ==================== -->
 

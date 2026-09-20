@@ -6,6 +6,7 @@ import com.chen.powermeter.util.ShizukuHelper
 import com.chen.powermeter.util.appString
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.TimeUnit
 
 /**
@@ -155,8 +156,30 @@ object RootPowerReader {
     @Volatile
     private var suChecked = false
 
-    @Volatile
-    private var suAvailable = false
+    /**
+     * 「这台机器有没有 root」的**独立事实**（[suAvailable] 的唯一存储）。
+     *
+     * 与 [accessMode] 的区别：`accessMode == ROOT` 只说明"当前通道走的是 root"；
+     * Shizuku 可用时 [checkAccess] 会提前返回、压根不探测 su —— root 机器只要同时开着
+     * Shizuku，通道就会优先走 Shizuku，`accessMode` 变成 SHIZUKU。而 UI 要回答的是
+     * "这是不是一台 root 机器"，故与电池信息卡同源，统一取 su 探测结论（[ensureSuChecked]）。
+     *
+     * 用途：趋势图表的 PMIC 温度 tab **仅在真 root 机器上出现**（用户拍板 2026-09-21），
+     * Shizuku(shell) 机器不出现 —— 与 [readBatteryInfo] 的显示条件同一判据，避免两处口径分叉。
+     */
+    private val _rootAvailable = MutableStateFlow(false)
+    val rootAvailable: StateFlow<Boolean> = _rootAvailable.asStateFlow()
+
+    /**
+     * su 是否可用。读写**全部落在 [_rootAvailable] 上**，本属性只是它的字面名别名 ——
+     * 单一存储，不存在"布尔量与 StateFlow 各存一份、哪天漏同步一处"的双状态隐患。
+     * StateFlow.value 自带 volatile 语义，故此处无需再标注线程可见性注解。
+     */
+    private var suAvailable: Boolean
+        get() = _rootAvailable.value
+        set(value) {
+            _rootAvailable.value = value
+        }
 
     @Volatile
     private var hasAccess = false

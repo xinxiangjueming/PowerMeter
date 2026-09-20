@@ -7,24 +7,40 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * 实时采样序列的环形缓冲 + O(1) 增量统计（档二-1，2026-09-21）。
  *
+ * ⚠️ **定位（2026-09-21 落库改造后）**：本缓冲已降级为**界面显示窗口**，不再是数据权威。
+ * 采样数据的持久化由 [com.chen.powermeter.data.db.SessionRecorder] 每 10s 写进 Room 负责；
+ * 这里只回答一个问题 —— 「曲线上还能画出多少个点」。
+ * 因此 [CAPACITY] 是**显示精度**参数，不是"数据会不会丢"的参数。
+ *
  * 取代旧实现 `_samples.value = (_samples.value + sample).takeLast(MAX_SAMPLES)`：
- * 后者每个采样周期都要新建一个 3600 元素的新列表 —— 息屏时也照做，白烧 CPU；
+ * 后者每个采样周期都要新建一个等长元素的新列表 —— 息屏时也照做，白烧 CPU；
  * 同时把 `computeStats` 的 O(n) 重算挂在了每次 UI 重组上。
  *
  * 职责边界：本仓库只负责**写**（[append] / [clear]）与**按需读**（[snapshot]）。
  * 关键在于 [snapshot] 由调用方在真正需要时才调用 —— UI 侧只在重组（= 有帧）时取快照，
- * 息屏无帧即零成本；服务侧（自动保存 / 导出）只在落盘那一刻取一次。
+ * 息屏无帧即零成本；服务侧的兜底导出只在落盘那一刻取一次。
  *
  * ⚠️ 统计量语义与旧的 `computeStats` 有一处**有意调整**：
  * - 峰值 / 电压范围 / 最高温度 / 平均功率 / 累计 mAh、Wh 改为**本次会话累计**，
- *   不再随 3600 窗口滑出而丢失（会话超过 1 小时后，旧实现会把早期峰值悄悄抹掉）；
- * - [SessionStats.sampleCount] 仍是**当前缓冲内**的样本数，与图表、导出的条数一致；
+ *   不再随窗口滑出而丢失（旧实现窗口一满就把早期峰值悄悄抹掉）；
+ * - [SessionStats.sampleCount] 仍是**当前缓冲内**的样本数，与图表一致
+ *   （导出的条数来自库，两者可能不同 —— 导出不受窗口限制）；
  * - [SessionStats.durationMs] 为**会话**首末样本时间差（旧实现是窗口首末之差）。
  */
 object SampleStore {
 
-    /** 缓冲上限，与旧 `SamplingService.MAX_SAMPLES` 保持一致：超出即覆盖最旧的一条 */
-    const val CAPACITY = 3600
+    /**
+     * 缓冲上限（= 界面曲线的可见点数上限），超出即覆盖最旧的一条。
+     *
+     * 2026-09-21 用户拍板从 3600 提到 **7200**：1s 间隔 ≈ 2 小时、0.5s 间隔 ≈ 1 小时。
+     * 之所以敢翻倍 —— 数据权威已在 Room 里（见 [SessionRecorder]），本缓冲只是显示窗口，
+     * 丢的只是「画不出来的旧点」，不影响导出的完整性。
+     *
+     * ⚠️ 代价：每次版本变化后 UI 会取一次快照，分配量随本值线性增长
+     * （7200 × 约 150 B ≈ 1 MB/次，亮屏 1s 档 ≈ 1 MB/s）。若日后要再放大，
+     * 应先考虑把 `snapshot()` 从"整体拷贝"改成"只拷贝新增段"。
+     */
+    const val CAPACITY = 7200
 
     private val lock = Any()
     private val ring = arrayOfNulls<PowerSample>(CAPACITY)

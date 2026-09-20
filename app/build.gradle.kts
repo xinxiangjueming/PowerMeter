@@ -2,6 +2,8 @@ plugins {
     // AGP 9.0 起内置 Kotlin 支持，不再需要 org.jetbrains.kotlin.android 插件
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    // Room 注解处理器走 KSP（比 kapt 全量/增量编译都更快）
+    alias(libs.plugins.ksp)
 }
 
 android {
@@ -83,4 +85,10 @@ dependencies {
     // 自动初始化 binder 连接。UserService（ShellService）由 Shizuku 反射加载，无需在 Manifest 注册。
     implementation(libs.dev.rikka.shizuku.api)
     implementation(libs.dev.rikka.shizuku.provider)
+
+    // Room：采样会话落库（应用私有目录 /data/data/<pkg>/databases/）。
+    // 用途是「每 10s 增量保存，替代 3600 条环形缓冲的硬上限」，导出时从库里读全量。
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
 }

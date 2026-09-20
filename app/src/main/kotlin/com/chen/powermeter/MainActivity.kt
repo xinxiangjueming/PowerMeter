@@ -24,6 +24,8 @@ import com.chen.powermeter.R
 import com.chen.powermeter.data.BatteryInfoStore
 import com.chen.powermeter.data.CsvImporter
 import com.chen.powermeter.data.ImportedSeries
+import com.chen.powermeter.data.PowerSample
+import com.chen.powermeter.data.db.SessionRecorder
 import com.chen.powermeter.service.SamplingService
 import com.chen.powermeter.ui.ChartColors
 import com.chen.powermeter.ui.PowerMeterScreen
@@ -37,6 +39,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        /** 手动导出文件名前缀（自动保存用 `powermeter_charge`，见 SamplingService） */
+        private const val EXPORT_PREFIX = "powermeter"
+    }
 
     private val requestNotificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -274,29 +281,64 @@ class MainActivity : ComponentActivity() {
         stopService(Intent(this, SamplingService::class.java))
     }
 
+    /**
+     * 导出 CSV。三条路径按优先级：
+     * 1. **查看导入文件时** → 导出该文件数据（与界面所见一致，否则容易导出后才发现拿错了数据）；
+     * 2. **有落库会话时** → 从 Room 分页导出会话全量，**导出成功后删除该会话**
+     *    （会话是自动保存的临时存档，不是用户资产 —— 用户点了导出就说明已经拿到想要的东西）；
+     * 3. **库中无会话时** → 回落到内存快照（覆盖「会话落库失败」「刚导出过又点一次」两种情形）。
+     *
+     * ⚠️ 不能在主线程导出：MediaStore insert / 逐行 String.format / update 全部同步，
+     *    长会话（数万行）在主线程执行会冻结界面数百 ms ~ 秒级，有 ANR 风险。
+     */
     private fun exportCsv() {
-        // 导出「当前正在看的那一份」：查看导入文件时导出的就是该文件的数据，
-        // 与界面所见一致（否则容易导出后才发现拿错了数据）
-        val list = ImportedSeries.samples.value.ifEmpty { SamplingService.snapshot() }
-        if (list.isEmpty()) {
-            toast(getString(R.string.toast_no_data))
+        val imported = ImportedSeries.samples.value
+        if (imported.isNotEmpty()) {
+            exportSamples(imported)
             return
         }
-        // ⚠️ 不能在主线程导出：CsvExporter 内含 MediaStore insert / openOutputStream /
-        //    逐行 String.format / update，全部同步。实时态上限 3600 行、导入态上限 20000 行
-        //    （约 20 万次格式化），主线程执行会冻结界面数百 ms ~ 1s+，有 ANR 风险。
         lifecycleScope.launch {
-            val uri = withContext(Dispatchers.IO) { CsvExporter.export(this@MainActivity, list) }
-            // Toast 回到主线程弹（lifecycleScope 默认 Dispatchers.Main）
+            val result = withContext(Dispatchers.IO) {
+                SessionRecorder.exportCurrent(
+                    context = this@MainActivity,
+                    prefix = EXPORT_PREFIX,
+                    // 采样仍在运行时导出 → 导出并删除后立刻开新会话，后续样本写进新会话；
+                    // 不 rotate 的话样本会继续往已删除的 sessionId 写，撞外键约束
+                    rotate = SamplingService.running.value,
+                )
+            }
+            if (result.uri != null) {
+                toast(getString(R.string.toast_export_done, fileNameOf(result.uri)))
+                return@launch
+            }
+            val snapshot = SamplingService.snapshot()
+            if (snapshot.isEmpty()) {
+                toast(getString(R.string.toast_no_data))
+                return@launch
+            }
+            exportSamples(snapshot)
+        }
+    }
+
+    /** 导出给定序列（导入态与内存兜底共用） */
+    private fun exportSamples(samples: List<PowerSample>) {
+        lifecycleScope.launch {
+            val uri = withContext(Dispatchers.IO) {
+                CsvExporter.export(this@MainActivity, samples, EXPORT_PREFIX)
+            }
             toast(
                 if (uri != null) {
-                    getString(R.string.toast_export_done, uri.lastPathSegment)
+                    getString(R.string.toast_export_done, fileNameOf(uri))
                 } else {
                     getString(R.string.toast_export_failed)
                 },
             )
         }
     }
+
+    /** ⚠️ 不能用 uri.lastPathSegment：MediaStore 的 content:// 记录会返回数字 ID 而非文件名 */
+    private fun fileNameOf(uri: Uri): String =
+        CsvExporter.displayNameOf(this, uri) ?: "CSV"
 
     private fun toast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()

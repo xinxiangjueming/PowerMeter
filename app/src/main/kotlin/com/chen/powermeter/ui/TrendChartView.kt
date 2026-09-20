@@ -114,13 +114,20 @@ private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
 
 /**
  * 按指标取小数位（2026-09-21 用户约定）：
- * 电流 → 整数；温度（电池）→ 1 位小数；其余（功率 / 电压 / OCV）→ 3 位。
- * Y 轴刻度、图例量程、读数气泡三处共用，保证同一指标在任何位置口径一致。
+ * 电流 → 整数；温度（电池）→ 1 位小数；其余（功率 / 电压 / OCV / 充电 IC 温度 /
+ * PMIC 温度）→ 3 位。Y 轴刻度、图例量程、读数气泡三处共用，保证同一指标任何位置口径一致。
+ *
+ * [Double.NaN] = 该点无读数（典型：PMIC 温度在旧版 15 列 CSV 里整列为空），统一渲染成
+ * 破折号 —— 与指标卡片的 `f3OrDash` 同口径。不处理的话 `String.format` 会写出 "NaN"，
+ * 摆在读数气泡与量程里比留白更像故障。
  */
-private fun Double.fMetric(metric: Metric?): String = when (metric) {
-    Metric.CURRENT -> f0()
-    Metric.TEMP -> f1()
-    else -> f3()
+private fun Double.fMetric(metric: Metric?): String {
+    if (isNaN()) return "—"
+    return when (metric) {
+        Metric.CURRENT -> f0()
+        Metric.TEMP -> f1()
+        else -> f3()
+    }
 }
 
 /**
@@ -142,7 +149,8 @@ internal fun Metric.unitLabel(): String = when (this) {
     Metric.POWER -> "W"
     Metric.VOLTAGE -> "V"
     Metric.CURRENT -> "mA"
-    Metric.TEMP -> "℃"
+    // 温度类共用量纲：电池温度与 PMIC 温度
+    Metric.TEMP, Metric.PMIC_TEMP -> "℃"
 }
 
 internal fun Metric.toSeries(samples: List<PowerSample>, color: Color, label: String): ChartSeries =
@@ -297,6 +305,15 @@ private fun decimateIndices(
         if (end > to) end = to
         if (start > to) break
 
+        // 桶首点无读数（NaN）时不能拿它当基准：NaN 与任何值比较恒为 false，整个桶的极值
+        // 都会"选不出来"，桶内有效点被静默丢掉。改为从桶内第一个有效点起算；
+        // 整桶都无读数就直接跳过该桶（不出点，交给绘制侧形成断点）。
+        if (values[start].isNaN()) {
+            var j = start
+            while (j <= end && values[j].isNaN()) j++
+            if (j > end) continue
+            start = j
+        }
         var minIndex = start
         var maxIndex = start
         var minValue = values[start]
@@ -380,12 +397,23 @@ private fun computeGeometry(
     val ranges = series.map { sr ->
         var lo = Double.MAX_VALUE
         var hi = -Double.MAX_VALUE
+        var seen = false
         for (i in visStart..visEnd) {
             val v = sr.values[i]
+            // 无读数的点不参与量程：NaN 与任何值比较恒为 false，混进来会让"窗口内到底
+            // 有没有读到数"无法分辨
+            if (v.isNaN()) continue
+            seen = true
             if (v < lo) lo = v
             if (v > hi) hi = v
         }
-        if (lo > hi) axisRange(0.0, 1.0) else axisRange(lo, hi)
+        when {
+            // 窗口内整条曲线都没有读数（老 CSV 缺列 / 本机缺该温感区）→ 量程留 NaN，
+            // Y 轴刻度与图例统一显示破折号，比谎报一个 0~1 的量程诚实
+            !seen -> Double.NaN to Double.NaN
+            lo > hi -> axisRange(0.0, 1.0)
+            else -> axisRange(lo, hi)
+        }
     }
 
     return ChartGeometry(
@@ -628,6 +656,13 @@ private fun ColumnScope.ChartBody(
                             var lastI = geom.from
                             for (k in 0 until count) {
                                 val i = dec?.get(k) ?: (geom.from + k)
+                                // 该点无读数：断开轮廓（下一有效点重新 moveTo 起一段），
+                                // 绝不把 NaN 写进 Path —— 非有限坐标会让整条路径的光栅化
+                                // 直接失效（整条曲线消失），比留一个缺口严重得多
+                                if (sr.values[i].isNaN()) {
+                                    started = false
+                                    continue
+                                }
                                 lastI = i
                                 val px = xAt(i)
                                 val py = yAt(sr.values[i], lo, hi)
@@ -665,6 +700,12 @@ private fun ColumnScope.ChartBody(
                         var started = false
                         for (k in 0 until count) {
                             val i = dec?.get(k) ?: (geom.from + k)
+                            // 无读数的点：断开折线（下一有效点重新 moveTo），
+                            // 不把 NaN 写进 Path（理由同填充路径）
+                            if (sr.values[i].isNaN()) {
+                                started = false
+                                continue
+                            }
                             val px = xAt(i)
                             val py = yAt(sr.values[i], lo, hi)
                             if (!started) {
@@ -699,6 +740,9 @@ private fun ColumnScope.ChartBody(
                         )
                         series.forEachIndexed { index, sr ->
                             val (lo, hi) = geom.ranges[index]
+                            // 该指标此处无读数：不画点（气泡里会显示破折号）。
+                            // 否则 yAt 会算出 NaN 坐标，圆被画到屏幕外甚至整层失效
+                            if (sr.values[idx].isNaN()) return@forEachIndexed
                             val center = Offset(px, yAt(sr.values[idx], lo, hi))
                             drawCircle(Color.White.copy(alpha = 0.9f), radius = 5.dp.toPx(), center = center)
                             drawCircle(sr.color, radius = 4.dp.toPx(), center = center)

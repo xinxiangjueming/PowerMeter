@@ -2,6 +2,7 @@ package com.chen.powermeter
 
 import android.app.Application
 import com.chen.powermeter.data.RootPowerReader
+import com.chen.powermeter.data.db.SessionRecorder
 import com.chen.powermeter.util.AppStrings
 import com.chen.powermeter.util.ShizukuHelper
 
@@ -28,5 +29,14 @@ class PowerMeterApp : Application() {
         AppStrings.init(this)
         ShizukuHelper.init(this)
         RootPowerReader.init(this)
+
+        // 采样会话落库（Room，私有目录）。init 只做两件事：取 DAO、拉起单消费者协程，
+        // 不建库不写盘（Room 是懒打开的），因此对冷启动耗时无实质影响。
+        SessionRecorder.init(this)
+        // 冷启动清理：保留最近一次会话（供「打开应用 → 点导出」这条路径使用），删掉更早的。
+        // 之所以不全删：停止采样后进程被杀很常见，用户往往还没来得及导出，全删等于白测一场。
+        // 放在 Application 里而不是 Activity —— 服务可能在无界面的情况下被拉起，
+        // 届时同样需要把历史存档收敛到一条。
+        SessionRecorder.pruneOldSessionsAsync()
     }
 }

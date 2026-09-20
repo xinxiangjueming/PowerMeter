@@ -270,10 +270,15 @@ private fun TrendFullscreenScreen(
     // 指标多选：横屏叠加对比多条曲线。至少保留一条（点最后一条不可取消），
     // 否则图表会空掉、用户还得自己找回来
     var selected by rememberSaveable { mutableStateOf(listOf(initialMetric.name)) }
+    // 指标 tab 与主页面同一口径（PMIC 温度只在真 root 机器上出现），勿在此另写一份过滤
+    val tabs = rememberAvailableMetrics()
+    // 选中项一律与 tab 集合求交：既兜住"存档里保存了本机当前不可用的指标"（root 结论变化后
+    // 重进本页），也兜住"至少保留一条"—— 交集为空时取第一条（恒为功率）
     val metrics = selected.mapNotNull { name -> runCatching { Metric.valueOf(name) }.getOrNull() }
-        .ifEmpty { listOf(initialMetric) }
+        .filter { it in tabs }
+        .ifEmpty { listOf(tabs.first()) }
 
-    // 曲线序列必须缓存：`toSeries` 是 O(n) 构建（实时态 n 最多 3600，导入态 20000），
+    // 曲线序列必须缓存：`toSeries` 是 O(n) 构建（实时态 n 最多 SampleStore.CAPACITY = 7200，导入态 20000），
     // 而关闭时的淡出动画（animateFloatAsState，120ms）会逐帧驱动重组 —— 不缓存则每帧重建
     // 全部序列。键里的 samples 在同一份数据下是同一实例，List.equals 走引用快路径 O(1)。
     //
@@ -367,7 +372,7 @@ private fun TrendFullscreenScreen(
                     }
                     Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Metric.entries.forEach { m ->
+                        tabs.forEach { m ->
                             val on = m in metrics
                             val chipColor = rememberMetricColor(m)
                             FilterChip(

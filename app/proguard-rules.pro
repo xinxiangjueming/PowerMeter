@@ -1,9 +1,14 @@
 # R8 规则 —— PowerMeter
 #
-# 本项目不使用反射、序列化（kotlinx.serialization / Gson / Moshi）、
-# 注解处理器与 JNI；依赖为 AndroidX Core / Activity / Compose / graphics-shapes，
-# 以及 haze、kyant backdrop（顶栏模糊）与 miuix-ui（曲线颜色色盘）三个 Compose 库；
+# 本项目不使用反射、序列化（kotlinx.serialization / Gson / Moshi）与 JNI；
+# 依赖为 AndroidX Core / Activity / Compose / graphics-shapes，haze、kyant backdrop
+# （顶栏模糊）与 miuix-ui（曲线颜色色盘）三个 Compose 库，以及 Room（采样会话落库）；
 # 各库自带的 consumer-rules.pro 会在构建时自动合并，因此无需额外 -keep 类。
+#
+# Room 只用到 KSP 生成代码（无 kapt），其反射点是按「数据库类名 + _Impl」拼接后
+# Class.forName 查找 —— room-runtime 的 consumer rules 已包含
+# `-keep class * extends androidx.room.RoomDatabase`（含 @Entity 类），
+# 故 PowerMeterDatabase / SampleDao_Impl 不会被混淆，无需在此重复声明。
 # miuix-ui 的 ColorPalette 是纯 Compose 组合函数、不涉及运行时反射查找，同样无需 keep。
 #
 # 唯一的"反射式"调用是 CornerRadius.kt 中通过资源名字符串

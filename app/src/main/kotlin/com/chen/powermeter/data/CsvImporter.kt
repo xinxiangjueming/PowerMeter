@@ -17,11 +17,11 @@ import java.util.Locale
 /**
  * CSV 导入解析器 —— 支持「打开本应用导出的 CSV 查看历史数据」。
  *
- * 口径严格对齐 [com.chen.powermeter.util.CsvExporter] 写出的 15 列表头：
+ * 口径严格对齐 [com.chen.powermeter.util.CsvExporter] 写出的 18 列表头：
  * ```
  * timestamp,datetime,voltage_v,voltage_ocv_v,current_ma,fg_current_ma,power_w,
  * temp_battery_c,temp_usb_c,temp_charger_c,soc_pct,status,charge_type,
- * remaining_mah,usb_voltage_v
+ * remaining_mah,usb_voltage_v,temp_pmic_c,full_mah,usb_current_limit_ma
  * ```
  *
  * 容错点（都是文件经过微信/网盘/Excel 转手后的常见形态）：
@@ -39,7 +39,7 @@ object CsvImporter {
     /**
      * 单文件最大导入行数。
      *
-     * 实时缓冲上限 3600（[com.chen.powermeter.data.SampleStore.CAPACITY]），此处放宽 5 倍给长历史文件留余量，
+     * 实时显示窗口上限 7200（[com.chen.powermeter.data.SampleStore.CAPACITY]），此处再放宽给长历史文件留余量，
      * 同时挡住「误选了几十万行的表格」把绘制拖垮。
      */
     private const val MAX_ROWS = 20_000
@@ -178,15 +178,14 @@ object CsvImporter {
                 tempBatteryC = num(cells, at, "temp_battery_c") ?: 0.0,
                 tempUsbC = num(cells, at, "temp_usb_c"),
                 tempChargerC = num(cells, at, "temp_charger_c"),
-                // 以下三列导出格式中不存在 → 固定 null，UI 侧 f3OrDash() 会显示 "—"
-                tempPmicC = null,
+                tempPmicC = num(cells, at, "temp_pmic_c"),
                 socPct = num(cells, at, "soc_pct")?.toInt() ?: 0,
                 status = str(cells, at, "status") ?: "Unknown",
                 chargeType = str(cells, at, "charge_type") ?: "",
                 remainingMah = num(cells, at, "remaining_mah"),
-                fullMah = null,
+                fullMah = num(cells, at, "full_mah"),
                 usbVoltageV = num(cells, at, "usb_voltage_v"),
-                usbCurrentLimitMa = null,
+                usbCurrentLimitMa = num(cells, at, "usb_current_limit_ma"),
             )
         }
 

@@ -116,6 +116,9 @@ internal fun Metric.seriesColor(custom: Map<String, Int>, primary: Color): Color
         Metric.VOLTAGE -> Color(0xFF2979FF)
         Metric.CURRENT -> Color(0xFF00E676)
         Metric.TEMP -> Color(0xFFFF9100)
+        // PMIC 温度（仅真 root 机器出现）：紫，与电池温度的橙同属"读温度"但一眼可区分；
+        // 取预置色板内的值，用户打开颜色面板时当前色会被直接高亮
+        Metric.PMIC_TEMP -> Color(0xFF9C27B0)
     }
 }
 
