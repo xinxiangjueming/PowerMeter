@@ -111,8 +111,6 @@
     <string name="notify_auto_saved">已自動儲存 %1$s（%2$d 筆記錄，取樣繼續）</string>
     <string name="notify_auto_save_failed">自動儲存失敗，取樣繼續</string>
 
-    <string name="fgs_special_use_subtype">讀取 /sys/class/power_supply 與電量計底層節點，持續監測充放電功率、電壓、電流與溫度</string>
-
     <!-- ==================== Toast / 錯誤提示 ==================== -->
 
     <string name="toast_notification_permission_required">需要通知權限才能在鎖屏後常駐取樣</string>

@@ -129,9 +129,15 @@
             android:name=".service.SamplingService"
             android:exported="false"
             android:foregroundServiceType="specialUse">
+            <!-- ⚠️ android:value 必须写字面量，不能引用 @string —— Manifest 引用的资源
+                 **不允许随配置变化**（lint 规则 ManifestResource，fatal 级，仅允许 -v21 这类
+                 版本限定符）。一旦该字符串有 en / zh-rTW 变体，lintVitalRelease 直接报错：
+                 "Resources referenced from the manifest cannot vary by configuration"。
+                 本值是给系统「正在运行的服务」页与 Play 政策审阅看的声明，不是应用内 UI，
+                 故保持单一语言字面量是正确的做法；改这里前先想清楚 lint 会不会再咬一口。 -->
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="@string/fgs_special_use_subtype" />
+                android:value="读取 /sys/class/power_supply 与燃料计底层节点，持续监测充放电功率、电压、电流与温度" />
         </service>
     </application>
 

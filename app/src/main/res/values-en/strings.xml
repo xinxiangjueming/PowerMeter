@@ -111,8 +111,6 @@
     <string name="notify_auto_saved">Auto-saved %1$s (%2$d records, sampling continues)</string>
     <string name="notify_auto_save_failed">Auto-save failed, sampling continues</string>
 
-    <string name="fgs_special_use_subtype">Reads /sys/class/power_supply and fuel-gauge nodes to continuously monitor charge and discharge power, voltage, current and temperature</string>
-
     <!-- ==================== Toasts / errors ==================== -->
 
     <string name="toast_notification_permission_required">Notification permission is required to keep sampling after the screen locks</string>
