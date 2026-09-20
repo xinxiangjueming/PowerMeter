@@ -37,7 +37,7 @@ object CsvImporter {
     /**
      * 单文件最大导入行数。
      *
-     * 实时缓冲上限 3600（SamplingService.MAX_SAMPLES），此处放宽 5 倍给长历史文件留余量，
+     * 实时缓冲上限 3600（[com.chen.powermeter.data.SampleStore.CAPACITY]），此处放宽 5 倍给长历史文件留余量，
      * 同时挡住「误选了几十万行的表格」把绘制拖垮。
      */
     private const val MAX_ROWS = 20_000
@@ -236,7 +236,7 @@ object CsvImporter {
 /**
  * 「查看中」的导入序列（进程内单例）。
  *
- * 与 [com.chen.powermeter.service.SamplingService.samples]（实时缓冲）**并列且互不写入**：
+ * 与 [com.chen.powermeter.data.SampleStore]（实时环形缓冲）**并列且互不写入**：
  * UI 统一按 `if (imported 非空) imported else live` 取数源，因此
  * ① 查看历史文件时实时采样照常进行、不被覆盖；
  * ② [clear] 之后自动回到实时曲线，无需任何额外状态同步。

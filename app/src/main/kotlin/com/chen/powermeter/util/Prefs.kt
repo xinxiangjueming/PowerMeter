@@ -22,9 +22,19 @@ object Prefs {
             .edit().putLong(KEY_INTERVAL, value).apply()
     }
 
+    /**
+     * 锁屏保持采样：持 PARTIAL_WAKE_LOCK，阻止 CPU 在息屏后休眠，保证息屏段仍按设定间隔出点。
+     *
+     * **默认关闭**（2026-09-21 改动，原为 true）：持锁让 CPU 全程不睡，是息屏功耗最大的一项开销；
+     * 而绝大多数场景下「息屏后采样稀疏一点」完全可以接受 —— 息屏期间采样间隔本身已自适应放宽到 5s，
+     * 系统 suspend 造成的间隙对曲线形态影响有限。需要严格连续曲线（如测涓流）时再手动打开。
+     *
+     * ⚠️ 「充电功率监测」开启时无论本开关如何都**不持锁**：此时 CPU 不睡造成的自身耗电会
+     * 直接抬高电池端读数，污染涓流段测量 —— 那是测量精度问题，不只是耗电问题。
+     */
     fun getWakeLock(context: Context): Boolean =
         context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_WAKELOCK, true)
+            .getBoolean(KEY_WAKELOCK, false)
 
     fun setWakeLock(context: Context, value: Boolean) {
         context.getSharedPreferences(NAME, Context.MODE_PRIVATE)

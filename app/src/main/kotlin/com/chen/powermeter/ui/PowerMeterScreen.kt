@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.sp
 import com.chen.powermeter.data.BatteryInfo
 import com.chen.powermeter.data.PowerSample
 import com.chen.powermeter.data.RootPowerReader
+import com.chen.powermeter.data.SampleStore
 import com.chen.powermeter.data.SessionStats
 import com.chen.powermeter.ui.common.BlurTopBar
 import com.chen.powermeter.ui.theme.LocalCornerRadius
@@ -142,14 +143,21 @@ fun PowerMeterScreen(
     var metric by remember { mutableStateOf(Metric.POWER) }
     // 非空 = 颜色面板打开中，值为正在编辑的指标
     var colorTarget by remember { mutableStateOf<Metric?>(null) }
-    val stats = remember(samples) { computeStats(samples) }
+    // 实时态用环形缓冲维护的 O(1) 增量统计（档二-1）；导入态数据是一次性的，沿用全量重算。
+    // 两者公式一致（梯形积分），差别只在实时侧改成了「会话累计」语义 —— 详见 SampleStore 的说明。
+    val liveStats by SampleStore.stats.collectAsState()
+    val stats = if (importedName != null) {
+        remember(samples) { computeStats(samples) }
+    } else {
+        liveStats
+    }
     val latest = samples.lastOrNull()
     val bg = MaterialTheme.colorScheme.background
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val context = LocalContext.current
     val metricColor = rememberMetricColor(metric)
     // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + 缩放淡入过渡）。
-    // 采样数据无需跨页传递：全屏页直接读 SamplingService.samples / ImportedSeries 两个单例 StateFlow。
+    // 采样数据无需跨页传递：全屏页直接读 SampleStore（实时环形缓冲）/ ImportedSeries 两个单例。
     val openTrendFullscreen = { TrendFullscreenActivity.launch(context, metric) }
 
     // 内容区水平 insets：**只避挖孔，不避导航栏**
@@ -462,7 +470,10 @@ private fun HeroPowerCard(
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                if (running) {
+                // 只在「已启动、还没有首个样本」这段真实等待期转一下（档二-3）。
+                // 采样全程挂着它等于让界面每帧都有动画驱动 —— 亮屏时白耗电、白掉帧，
+                // 而它对"采样正在进行"的表达并不比旁边的实时读数更强。
+                if (running && sample == null) {
                     Spacer(Modifier.size(10.dp))
                     LoadingIndicator(modifier = Modifier.size(16.dp))
                 }
@@ -1017,7 +1028,7 @@ private fun SettingsSheet(
                 Column(Modifier.weight(1f)) {
                     Text("锁屏保持采样", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "使用 CPU 唤醒锁，息屏后采样更连续，耗电略增",
+                        "用 CPU 唤醒锁换取息屏后采样连续；关闭时息屏间隔放宽到 5s，更省电",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

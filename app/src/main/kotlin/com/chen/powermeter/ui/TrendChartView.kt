@@ -251,6 +251,61 @@ private fun axisRange(min: Double, max: Double): Pair<Double, Double> {
     return lo to hi
 }
 
+/**
+ * 按 min/max 分桶抽稀（档二-2）。
+ *
+ * 把 `[from, to]` 均分成 [buckets] 个桶，每桶只保留**最小值**与**最大值**两个点的下标，
+ * 并按时间顺序输出。这样折线轮廓（尖峰、谷底）与全部点参与绘制时视觉等价，
+ * 而点数从 O(样本数) 降到 O(像素宽)，Path 的构建与光栅化成本大幅下降。
+ *
+ * @return 升序下标数组；`null` = 无需抽稀（点数未超过 `buckets × 2`，调用方走全量区间）
+ */
+private fun decimateIndices(
+    values: List<Double>,
+    from: Int,
+    to: Int,
+    buckets: Int,
+): IntArray? {
+    val n = to - from + 1
+    if (buckets < 2 || n <= buckets * 2) return null
+
+    val out = IntArray(buckets * 2)
+    var written = 0
+    val step = n.toDouble() / buckets
+    for (b in 0 until buckets) {
+        var start = from + (b * step).toInt()
+        var end = from + ((b + 1) * step).toInt() - 1
+        if (end < start) end = start
+        if (end > to) end = to
+        if (start > to) break
+
+        var minIndex = start
+        var maxIndex = start
+        var minValue = values[start]
+        var maxValue = values[start]
+        for (i in start..end) {
+            val v = values[i]
+            if (v < minValue) {
+                minValue = v
+                minIndex = i
+            }
+            if (v > maxValue) {
+                maxValue = v
+                maxIndex = i
+            }
+        }
+        // 按时间顺序压入，保证折线不出现回折
+        if (minIndex <= maxIndex) {
+            out[written++] = minIndex
+            if (maxIndex != minIndex) out[written++] = maxIndex
+        } else {
+            out[written++] = maxIndex
+            out[written++] = minIndex
+        }
+    }
+    return if (written == 0) null else out.copyOf(written)
+}
+
 /** 第一个 timeMillis >= [t] 的下标（可能等于 size） */
 private fun lowerBound(samples: List<PowerSample>, t: Long): Int {
     var lo = 0
@@ -429,6 +484,20 @@ private fun ColumnScope.ChartBody(
     var yAxisWidthPx by remember { mutableIntStateOf(0) }
     var bubbleWidthPx by remember { mutableIntStateOf(0) }
 
+    // 抽稀（档二-2）：可见点数超过绘图区像素宽的 2 倍时，按分桶 min/max 抽到「约 1 像素 2 点」。
+    // 只作用于**绘制** —— 几何量（xFractions / visStart..visEnd）仍按全量样本计算，
+    // 否则读数气泡按 x 反查出的下标会与真实样本错位。
+    // 键用 geom 而非 samples：values 只由「样本 + 指标」决定，而 geom 已完整覆盖这两项，
+    // 拿 samples 当键会退化成每次重组做一次 O(n) 的 List.equals。
+    val decimated: List<IntArray?> = remember(geom, plotWidthPx) {
+        if (plotWidthPx <= 0) {
+            List(series.size) { null }
+        } else {
+            val buckets = plotWidthPx / 2
+            series.map { sr -> decimateIndices(sr.values, geom.from, geom.to, buckets) }
+        }
+    }
+
     val gestureModifier = if (state != null) {
         Modifier.pointerInput(Unit) {
             awaitEachGesture {
@@ -534,9 +603,14 @@ private fun ColumnScope.ChartBody(
                     if (fillTopAlpha > 0.002f) {
                         series.forEachIndexed { index, sr ->
                             val (lo, hi) = geom.ranges[index]
+                            val dec = decimated[index]
+                            val count = dec?.size ?: (geom.to - geom.from + 1)
                             val fill = Path()
                             var started = false
-                            for (i in geom.from..geom.to) {
+                            var lastI = geom.from
+                            for (k in 0 until count) {
+                                val i = dec?.get(k) ?: (geom.from + k)
+                                lastI = i
                                 val px = xAt(i)
                                 val py = yAt(sr.values[i], lo, hi)
                                 if (!started) {
@@ -548,7 +622,7 @@ private fun ColumnScope.ChartBody(
                                 }
                             }
                             if (started) {
-                                fill.lineTo(xAt(geom.to), plotBottom)
+                                fill.lineTo(xAt(lastI), plotBottom)
                                 fill.close()
                                 drawPath(
                                     fill,
@@ -567,9 +641,12 @@ private fun ColumnScope.ChartBody(
 
                     series.forEachIndexed { index, sr ->
                         val (lo, hi) = geom.ranges[index]
+                        val dec = decimated[index]
+                        val count = dec?.size ?: (geom.to - geom.from + 1)
                         val line = Path()
                         var started = false
-                        for (i in geom.from..geom.to) {
+                        for (k in 0 until count) {
+                            val i = dec?.get(k) ?: (geom.from + k)
                             val px = xAt(i)
                             val py = yAt(sr.values[i], lo, hi)
                             if (!started) {

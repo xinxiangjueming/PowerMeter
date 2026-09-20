@@ -55,7 +55,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             PowerMeterTheme {
                 val running by SamplingService.running.collectAsState()
-                val liveSamples by SamplingService.samples.collectAsState()
+                // 实时序列走环形缓冲（档二-1）：订阅**版本号**触发重组，再按需取一次快照。
+                // ⚠️ 刻意不订阅 List 类型的 StateFlow —— 那等价于每秒做一次整表分配。
+                //    息屏无帧时不发生重组，连 snapshot 都不会执行。
+                val liveVersion by SamplingService.sampleVersion.collectAsState()
+                val liveSamples = remember(liveVersion) { SamplingService.snapshot() }
                 val importedSamples by ImportedSeries.samples.collectAsState()
                 val importedFileName by ImportedSeries.fileName.collectAsState()
                 val batteryInfo by BatteryInfoStore.info.collectAsState()
@@ -102,10 +106,14 @@ class MainActivity : ComponentActivity() {
                     onWakeLockChange = { value ->
                         wakeLock = value
                         Prefs.setWakeLock(this@MainActivity, value)
+                        // 立即同步持锁策略，不必等下一次采样循环或息屏广播
+                        SamplingService.onPrefsChanged()
                     },
                     onChargeMonitorChange = { value ->
                         chargeMonitor = value
                         Prefs.setChargeMonitor(this@MainActivity, value)
+                        // 充电监测开启 → 强制释放 wakelock（测量精度要求 CPU 不参与负载）
+                        SamplingService.onPrefsChanged()
                     },
                     onSeriesDualBatteryChange = { value ->
                         seriesDualBattery = value
@@ -251,7 +259,7 @@ class MainActivity : ComponentActivity() {
     private fun exportCsv() {
         // 导出「当前正在看的那一份」：查看导入文件时导出的就是该文件的数据，
         // 与界面所见一致（否则容易导出后才发现拿错了数据）
-        val list = ImportedSeries.samples.value.ifEmpty { SamplingService.samples.value }
+        val list = ImportedSeries.samples.value.ifEmpty { SamplingService.snapshot() }
         if (list.isEmpty()) {
             toast("暂无采样数据")
             return

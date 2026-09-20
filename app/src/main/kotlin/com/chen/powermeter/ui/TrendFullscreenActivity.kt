@@ -258,7 +258,9 @@ private fun TrendFullscreenScreen(
     val cardShape = remember(corner) { RoundedCornerShape(corner) }
     // 数据源：导入态优先。与主页面同一判断口径，保证从卡片进全屏看到的是同一份数据
     val imported by ImportedSeries.samples.collectAsState()
-    val live by SamplingService.samples.collectAsState()
+    // 实时序列与主页面同口径：订阅版本号 → 按需取一次环形缓冲快照（档二-1）
+    val liveVersion by SamplingService.sampleVersion.collectAsState()
+    val live = remember(liveVersion) { SamplingService.snapshot() }
     val samples = if (imported.isNotEmpty()) imported else live
     val context = androidx.compose.ui.platform.LocalContext.current
 

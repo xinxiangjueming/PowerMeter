@@ -1,5 +1,6 @@
 package com.chen.powermeter.data
 
+import android.content.Context
 import com.chen.powermeter.util.ShizukuHelper
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,8 +18,13 @@ import java.util.concurrent.TimeUnit
  *
  * 注意 Shizuku **不是 root**：adb 模式下身份是 shell，能读到哪些节点完全取决于 ROM 的
  * SELinux 策略（本机连标准 battery 节点都拦，远不止 qcom 私有节点）。
- * 故 [read] 带 **binder 兜底**：sysfs 读不到时改走 `cmd battery get -f current_now` +
- * `dumpsys battery`（BatteryService/health HAL，shell 身份实测 0.07s，详见 [readViaBinder]）。
+ *
+ * 故 [read] 带**两级兜底**（2026-09-21 起）：
+ * 1. 首选 [BatteryManagerSource] —— 主进程走 SDK 公共 API（`getLongProperty` + 粘性广播），
+ *    **零进程创建**、无需 root / Shizuku，是息屏功耗的根治方案；
+ * 2. 仅当该 ROM 不支持上述属性时，才退回 `cmd battery get -f current_now` + `dumpsys battery`
+ *    （每次 3~4 次进程创建）—— 见 [readViaShellBinder]。
+ *
  * 若 Shizuku 以 root 模式启动（uid 0），则等价于 root 通道。
  *
  * ⚠️ 另一处身份差异：**电池静态信息（[readBatteryInfo]）仅 root 通道提供**，Shizuku 模式下
@@ -43,6 +49,19 @@ object RootPowerReader {
 
     /** 当前取数通道 */
     enum class AccessMode { NONE, SHIZUKU, ROOT }
+
+    /**
+     * Application Context —— 供 [BatteryManagerSource] 注册 `ACTION_BATTERY_CHANGED`
+     * 粘性广播使用。由 `PowerMeterApp.onCreate` 调用一次 [init]。
+     */
+    @Volatile
+    private var appContext: Context? = null
+
+    /** 在 Application.onCreate 调用一次（幂等） */
+    fun init(context: Context) {
+        appContext = context.applicationContext
+        BatteryManagerSource.ensureRegistered(context)
+    }
 
     private const val PS_BATTERY = "/sys/class/power_supply/battery"
     private const val PS_BMS = "/sys/class/power_supply/bms"
@@ -85,13 +104,47 @@ object RootPowerReader {
     @Volatile
     private var batteryDir: String = PS_BATTERY
 
-    /** 是否已得出过确定结论（通道不可用时不置位，留给下次重探） */
+    /**
+     * 是否已得出**确定**结论（命令本身失败 / 通道不可用时不置位，留给下次重探）。
+     *
+     * ⚠️ **「不可读」也是结论，必须缓存**（2026-09-21 修）：探测命令 `for d in ...; do [ -r ... ]`
+     * 在 SELinux 拦截的 ROM 上是 **rc=0 但 stdout 为空**（命令成功了，只是没有可读目录）。
+     * 旧实现用 `exec(cmd) ?: return false` 取结果，而 `exec` 把空输出当失败 → 不置位本标志
+     * → 于是**每个采样周期都要重跑一次探测**（1 次 binder 往返 + 1 次 fork），
+     * 这才是本机「每秒都在白花进程创建」的真实来源。
+     * 现在改用 `exec(..., allowBlank = true)` 区分「命令失败」（不缓存）与「命令成功但没结果」（缓存）。
+     */
     @Volatile
     private var batteryDirChecked = false
+
+    /** 上次探测时的通道身份：Shizuku(shell) 与 root 的可读节点可能不同，换通道必须重探 */
+    @Volatile
+    private var batteryDirProbedMode: AccessMode = AccessMode.NONE
 
     /** 上一次探测的结论：voltage_now 是否真的可读 */
     @Volatile
     private var batteryReadable = false
+
+    /**
+     * [BatteryManagerSource] 通道是否可用。
+     * null = 尚未判定；false = 本 ROM 上 `getLongProperty` 不可用，**永久回退**命令通道
+     * （避免每个采样点都去试一次注定失败的那条路）。
+     */
+    @Volatile
+    private var batteryManagerUsable: Boolean? = null
+
+    // ---- 温感区温度缓存（command 兜底通道专用）----
+    // 接口温度 / 充电 IC 温度 / PMIC 温度变化极慢，没必要跟着 1s 的采样节奏去 fork 读。
+    /** 最近一次取到的温感区读数 */
+    @Volatile
+    private var thermalTemps: Map<String, Double> = emptyMap()
+
+    /** 上次刷新时间；失败也会推进它，避免每样本重试 */
+    @Volatile
+    private var thermalTempsAt = 0L
+
+    /** 温感区温度刷新周期：每次刷新是 1 次 shell awk，30s 一次即可 */
+    private const val THERMAL_REFRESH_INTERVAL_MS = 30_000L
 
     // ---- 权限探测缓存 ----
     // su 探测只做一次（fork su 有成本）；Shizuku 状态改为**每次**读 StateFlow（很廉价），
@@ -180,7 +233,11 @@ object RootPowerReader {
         thermalIndex = emptyMap()
         batteryDir = PS_BATTERY
         batteryDirChecked = false
+        batteryDirProbedMode = AccessMode.NONE
         batteryReadable = false
+        batteryManagerUsable = null
+        thermalTemps = emptyMap()
+        thermalTempsAt = 0L
         _binderFallback.value = false
     }
 
@@ -197,17 +254,22 @@ object RootPowerReader {
      * @return true = voltage_now 可读
      */
     private fun detectBatteryDir(): Boolean {
-        if (batteryDirChecked) return batteryReadable
-        if (accessMode == AccessMode.NONE) return false // 通道不可用，结论无意义
+        val mode = accessMode
+        if (mode == AccessMode.NONE) return false // 通道不可用，结论无意义
+        // 同一通道身份下结论稳定，直接复用（含「不可读」这一结论，见 batteryDirChecked 的说明）
+        if (batteryDirChecked && batteryDirProbedMode == mode) return batteryReadable
 
         val cmd = "for d in $PS_BATTERY $PS_BMS; do " +
             "if [ -r \"${'$'}d/voltage_now\" ]; then echo \"${'$'}d\"; break; fi; done"
-        val out = exec(cmd) ?: return false // 命令本身失败：不算探测过，下次重试
+        // allowBlank：本机 SELinux 拦截时该命令 **rc=0 但无输出**，那是「探测成功、结论=都不可读」，
+        // 不是「命令失败」。只有真失败（null）才不缓存、留待下次重探。
+        val out = exec(cmd, allowBlank = true) ?: return false
 
         val dir = out.lineSequence()
             .map { it.trim() }
             .firstOrNull { it == PS_BATTERY || it == PS_BMS }
         batteryDirChecked = true
+        batteryDirProbedMode = mode
         batteryReadable = dir != null
         if (dir != null) batteryDir = dir
         return batteryReadable
@@ -303,11 +365,12 @@ object RootPowerReader {
     }
 
     /**
-     * binder 兜底通道（2026-09-21 用户拍板）：sysfs 被 SELinux 拦截时的非 root 出数路径。
+     * sysfs 不可用时的出数入口（SELinux 拦截 / 节点缺失）。
      *
-     * 数据源 = `cmd battery get -f current_now`（BATTERY_PROPERTY_CURRENT_NOW，经 health HAL）
-     * + `dumpsys battery`（BatteryService 快照：电压 mV / 温度 0.1°C / 电量 % / 状态 / 剩余容量 µAh）
-     * + 温感区仍走 sysfs awk（本机 SELinux 不拦 thermal_zone，见文件头实测记录）。
+     * 两级实现，优先零成本的那条：
+     * 1. [BatteryManagerSource] —— 主进程 SDK 公共 API，**零进程创建**。本机（24031PN0DC /
+     *    HyperOS V816）实测可用，故息屏时每秒不再起任何进程；
+     * 2. [readViaShellBinder] —— 仅当该 ROM 的 `getLongProperty` 不可用时才走。
      *
      * ⚠️ 电流符号：Android 文档称 BATTERY_PROPERTY_CURRENT_NOW 正=充电，但本机实测
      * （24031PN0DC / HyperOS V816）status=Charging 时恒为负 —— 该属性是 HAL 原始值透传，
@@ -315,35 +378,88 @@ object RootPowerReader {
      * 换 ROM 若发现「充电时功率为负」，即该 ROM 按文档取号，届时再适配。
      */
     private fun readViaBinder(): PowerSample? {
+        // ---- 首选：主进程 BatteryManager（零进程创建、事件驱动）----
+        // 用 ready 区分「粘性广播尚未就绪」与「本 ROM 真不支持」：只有后者才置 false 永久回退，
+        // 否则一次偶发未就绪就会把整场会话按到命令通道上。
+        if (batteryManagerUsable != false && BatteryManagerSource.ready) {
+            val sample = BatteryManagerSource.read(thermalTempsForBinder())
+            if (sample != null) {
+                batteryManagerUsable = true
+                return sample
+            }
+            // 自检失败（典型：该属性的 getLongProperty 返回 Long.MIN_VALUE）→ 本进程内不再尝试
+            batteryManagerUsable = false
+        }
+        return readViaShellBinder()
+    }
+
+    /**
+     * 旧命令通道（回退路径）：`cmd battery get` + `dumpsys battery`，每次 3~4 次进程创建。
+     *
+     * 仅在 [BatteryManagerSource] 不可用（本 ROM 不支持该属性）时才会走到这里。
+     */
+    private fun readViaShellBinder(): PowerSample? {
         val sysfsError = lastError
         val out = exec(binderDump()) ?: run {
             lastError = "$sysfsError；binder 兜底命令未返回输出"
             return null
         }
-        val sample = parseBinder(out, thermalIndex)
-        if (sample == null) {
+        val sample = parseBinder(out, thermalIndex) ?: run {
             lastError = "$sysfsError；binder 兜底输出缺少电压字段。原始输出：${out.asSummary()}"
+            return null
         }
-        return sample
+        // 温感区温度不再跟着本命令每样本 fork，改由低频缓存补齐（见 thermalTempsForBinder）
+        val thermal = thermalTempsForBinder()
+        if (thermal.isEmpty()) return sample
+        return sample.copy(
+            tempUsbC = thermal["usb"] ?: sample.tempUsbC,
+            tempChargerC = thermal["charger_therm0"] ?: sample.tempChargerC,
+            tempPmicC = (thermal["pm8350c_tz"] ?: thermal["pm8350b_tz"]) ?: sample.tempPmicC,
+        )
     }
 
     /**
-     * binder 兜底的一次性读取命令（单次 exec ≈ 0.07s，真机实测）。
+     * 低频刷新温感区温度（接口 / 充电 IC / PMIC），带 [THERMAL_REFRESH_INTERVAL_MS] 缓存。
+     *
+     * 这三个温度变化极慢，没必要跟着 1s 采样节奏 fork 一条 awk —— 把每样本 1 次进程创建
+     * 降到每 30s 一次。失败也推进时间戳，避免在取不到温度时每样本重试。
+     */
+    private fun thermalTempsForBinder(): Map<String, Double> {
+        val now = System.currentTimeMillis()
+        val cached = thermalTemps
+        if (now - thermalTempsAt < THERMAL_REFRESH_INTERVAL_MS) return cached
+        val tz = thermalIndex
+        if (tz.isEmpty()) return cached // 温感区映射探测失败：保持空，等下次 reset 后重探
+
+        val entries = tz.values.map { "tz$it" to "$THERMAL_DIR/thermal_zone$it/temp" }
+        val fresh = exec(awkDump(entries))?.let { out ->
+            val raw = HashMap<String, String>()
+            out.lineSequence().forEach { line ->
+                val i = line.indexOf('=')
+                if (i > 0) raw[line.substring(0, i).trim()] = line.substring(i + 1).trim()
+            }
+            tempsFrom(raw, tz)
+        }
+        thermalTempsAt = now
+        if (!fresh.isNullOrEmpty()) thermalTemps = fresh
+        return thermalTemps
+    }
+
+    /**
+     * command 兜底通道的一次性读取命令（单次 exec ≈ 0.07s，真机实测）。
      *
      * - `-f` 强制刷新 health HAL 快照（本机支持）；旧 ROM 不认 `-f` 时 `||` 回退不带 `-f`；
      * - 各段 `2>/dev/null` 吞掉不支持 ROM 的报错；
      * - 尾部 `; true` 兜底退出码：[ShellService] 契约是非 0 = 失败（返回 `ERROR:` 前缀字符串），
-     *   不能让 thermal awk 段（awk 缺失时 rc=127）污染整条命令的结果。
+     *   不能让任一段的失败退出码污染整条命令的结果。
+     *
+     * ⚠️ 2026-09-21 起**不再包含 thermal awk 段**：温感区温度改由 [thermalTempsForBinder]
+     * 低频（30s）刷新，与 [BatteryManagerSource] 共用同一份缓存 —— 每样本少 1 次进程创建。
      */
     private fun binderDump(): String {
-        val tzEntries = thermalIndex.values.map { "tz$it" to "$THERMAL_DIR/thermal_zone$it/temp" }
         return buildString {
             append("cmd battery get -f current_now 2>/dev/null || cmd battery get current_now 2>/dev/null")
             append("; dumpsys battery 2>/dev/null")
-            if (tzEntries.isNotEmpty()) {
-                append("; ")
-                append(awkDump(tzEntries))
-            }
             append("; true")
         }
     }
@@ -602,19 +718,37 @@ object RootPowerReader {
      *
      * - Shizuku 已绑定 → 走 shell 身份；返回空（非 0 退出码）时继续尝试 su；
      * - 已知无 root（su 探测过且不可用）→ 直接返回 null，不再 fork su（避免每次采样白花 4 次进程创建）；
-     * - 其余情况走 su。
+     * - 其余情况走 su（优先复用 [SuSession] 常驻 shell）。
+     *
+     * @param allowBlank true = 把**空输出**也当作有效结果返回（不视为失败、不回退下一通道）。
+     *                   仅 [detectBatteryDir] 需要 —— 那条探测命令在 SELinux 拦截的 ROM 上
+     *                   「rc=0 但无输出」，语义是「探测完成，结论=都不可读」。
      */
-    private fun exec(cmd: String, timeoutMs: Long = 5_000L): String? {
+    private fun exec(cmd: String, timeoutMs: Long = 5_000L, allowBlank: Boolean = false): String? {
         if (ShizukuHelper.serviceBound.value) {
             val out = ShizukuHelper.execSync(cmd)
-            if (!out.isNullOrBlank()) return out
+            // allowBlank：契约上「空输出」既可能是失败也可能是有效结论（见 detectBatteryDir），
+            // 需要区分时由调用方显式声明 —— 此时空串直接返回，不再回退 su
+            if (out != null && (allowBlank || out.isNotBlank())) return out
         }
         if (suChecked && !suAvailable) return null
-        return execRaw(cmd, timeoutMs)
+        return execRaw(cmd, timeoutMs, allowBlank)
     }
 
-    /** 仅走 su 通道（root 探测，以及 Shizuku 不可用时的兜底） */
-    private fun execRaw(cmd: String, timeoutMs: Long = 5_000L): String? {
+    /**
+     * 仅走 su 通道（root 探测，以及 Shizuku 不可用时的兜底）。
+     *
+     * 优先复用 [SuSession] 的**常驻 root shell**（档二-4）：一次起会话、后续命令零进程创建。
+     * 会话不可用（无 su / 自检失败 / 崩溃）时自动回落到下面的一次性 fork 路径，
+     * 行为与改造前完全一致。复用 [SuSession] 的收益只体现在 root 机器上 ——
+     * 那正是 sysfs 通道可用、每样本唯一要 fork 一次 awk 的场景。
+     */
+    private fun execRaw(cmd: String, timeoutMs: Long = 5_000L, allowBlank: Boolean = false): String? {
+        if (!SuSession.disabledForProcess) {
+            SuSession.exec(cmd, timeoutMs, SU_CANDIDATES)?.let { out ->
+                return if (allowBlank || out.isNotBlank()) out else null
+            }
+        }
         for (su in SU_CANDIDATES) {
             var process: Process? = null
             try {
@@ -635,7 +769,7 @@ object RootPowerReader {
                     continue
                 }
                 val out = synchronized(buffer) { buffer.toString() }
-                if (out.isNotBlank()) return out
+                if (allowBlank || out.isNotBlank()) return out
             } catch (_: Exception) {
                 process?.destroyForcibly()
             }

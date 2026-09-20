@@ -1,10 +1,11 @@
 package com.chen.powermeter
 
 import android.app.Application
+import com.chen.powermeter.data.RootPowerReader
 import com.chen.powermeter.util.ShizukuHelper
 
 /**
- * Application：唯一的职责是尽早初始化 [ShizukuHelper]。
+ * Application：尽早初始化 [ShizukuHelper] 与 [RootPowerReader]。
  *
  * 为什么放在 Application.onCreate 而不是 MainActivity：
  * - Shizuku 的 binder 到达 / 死亡 / 授权结果三个回调必须**常驻监听**。若挂在 Activity 上，
@@ -13,10 +14,15 @@ import com.chen.powermeter.util.ShizukuHelper
  * - 绑定 UserService 是异步的（binder 到达 → 授权检查 → bind → onServiceConnected），
  *   越早发起越可能在用户点「开始采样」之前就绪。
  * 口径对齐 fold FoldApp.kt:14-21。
+ *
+ * [RootPowerReader.init] 只做一件事：让主进程注册 `ACTION_BATTERY_CHANGED` 粘性广播
+ * （档三的零 fork 取数通道）。越早注册越可能在首个采样点之前就拿到快照 —— 否则首次
+ * [RootPowerReader.read] 会因为通道未就绪而退回命令通道，白起一次进程。
  */
 class PowerMeterApp : Application() {
     override fun onCreate() {
         super.onCreate()
         ShizukuHelper.init(this)
+        RootPowerReader.init(this)
     }
 }

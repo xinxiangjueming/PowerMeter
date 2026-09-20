@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
@@ -14,11 +16,14 @@ import android.os.PowerManager
 import android.provider.OpenableColumns
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.chen.powermeter.MainActivity
 import com.chen.powermeter.R
 import com.chen.powermeter.data.BatteryInfoStore
 import com.chen.powermeter.data.PowerSample
 import com.chen.powermeter.data.RootPowerReader
+import com.chen.powermeter.data.SampleStore
+import com.chen.powermeter.data.SessionStats
 import com.chen.powermeter.util.CsvExporter
 import com.chen.powermeter.util.Prefs
 import com.chen.powermeter.util.ScreenController
@@ -34,12 +39,15 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
+import kotlin.math.abs
 
 /**
  * 前台采样服务：
- * - 锁屏后持续读取底层电量节点（Shizuku 优先、root 兜底，见 [RootPowerReader]）
- * - 常驻通知实时显示功率/电压/电流/温度
- * - 可选 PARTIAL_WAKE_LOCK 保证息屏后采样连续
+ * - 锁屏后持续读取电量数据（Shizuku / root / 主进程 BatteryManager 三通道，见 [RootPowerReader]）
+ * - 常驻通知显示功率 / 电压 / 电流 / 温度，按亮息屏分档节流（见 [maybeNotify]）
+ * - 息屏自适应降频：息屏切 5s、亮屏回用户设定值（见 [effectiveIntervalMs]）
+ * - 可选 PARTIAL_WAKE_LOCK 保证息屏后采样连续；带 30min 超时 + 续期防泄漏，
+ *   且「充电功率监测」开启时强制不持锁（见 [shouldHoldWakeLock]）
  */
 class SamplingService : Service() {
 
@@ -51,8 +59,44 @@ class SamplingService : Service() {
         /** 自动保存完成的一次性提示通知 */
         private const val NOTIF_ID_AUTO_SAVE = 2002
         private const val CHANNEL_ID = "powermeter_sampling"
-        private const val MAX_SAMPLES = 3600
-        private const val NOTIFY_MIN_INTERVAL_MS = 800L
+
+        /**
+         * 常驻通知的刷新节流下限（档一-2，2026-09-21）。
+         *
+         * 常驻通知的价值在**亮屏瞥一眼**，息屏时每秒刷一次纯亏（Builder 构建 + notify 跨进程调用）。
+         * 故按亮/息屏分档，再叠加「读数是否显著变化」与 60s 保底 —— 详见 [maybeNotify]。
+         */
+        private const val NOTIFY_MIN_INTERVAL_AWAKE_MS = 5_000L
+        private const val NOTIFY_MIN_INTERVAL_SCREEN_OFF_MS = 10_000L
+
+        /** 保底刷新间隔：功率长时间平稳时，「充电中 · 80%」这类信息也要能动一下 */
+        private const val NOTIFY_MAX_INTERVAL_MS = 60_000L
+
+        /** 「显著变化」的绝对阈值 W */
+        private const val NOTIFY_DELTA_W = 0.5
+
+        /** 「显著变化」的相对阈值（相对上一次已通知的功率） */
+        private const val NOTIFY_DELTA_RATIO = 0.10
+
+        /**
+         * 息屏后的采样间隔（档一-4）。
+         *
+         * 屏幕灭了以后 1s 密度的边际价值很低，而每个采样点都是一次取数开销。
+         * 与用户设定值取 max：用户自己设了更慢的间隔就尊重用户，不会被这里"提速"。
+         */
+        private const val SCREEN_OFF_INTERVAL_MS = 5_000L
+
+        /** PARTIAL_WAKE_LOCK 的持有名（便于 dumpsys power 里定位） */
+        private const val WAKE_LOCK_TAG = "PowerMeter:Sampling"
+
+        /**
+         * wakelock 单次持有时长。**必须带超时** —— 裸 acquire() 一旦漏掉 release 就是永久泄漏。
+         * 到期前由续期协程续期，服务停止时释放方法兜底。
+         */
+        private const val WAKE_LOCK_TIMEOUT_MS = 30 * 60 * 1000L
+
+        /** 续期周期：略早于超时，避免在边界上被系统回收 */
+        private const val WAKE_LOCK_RENEW_INTERVAL_MS = 25 * 60 * 1000L
 
         /** 充电功率监测：开始采样后多久自动熄屏 */
         private const val SCREEN_OFF_DELAY_MS = 5_000L
@@ -76,8 +120,33 @@ class SamplingService : Service() {
          */
         private const val SERIES_DUAL_FACTOR = 2.0
 
-        private val _samples = MutableStateFlow<List<PowerSample>>(emptyList())
-        val samples: StateFlow<List<PowerSample>> = _samples.asStateFlow()
+        /**
+         * 采样序列改为**环形缓冲 + 按需快照**（档二-1，见 [SampleStore]）。
+         *
+         * 旧实现每次采样都做 `(_samples.value + sample).takeLast(3600)` —— 每秒新建一个
+         * 3600 元素的列表，息屏时照做。现在服务侧只 append（O(1)、零分配），
+         * 快照由真正需要的调用方（UI 重组 / 导出落盘）按需索取。
+         */
+        val sampleVersion: StateFlow<Long> get() = SampleStore.version
+
+        /** 会话统计量：每样本 O(1) 增量更新，取代原先挂在重组上的 O(n) 全量重算 */
+        val stats: StateFlow<SessionStats> get() = SampleStore.stats
+
+        fun snapshot(): List<PowerSample> = SampleStore.snapshot()
+
+        val sampleCount: Int get() = SampleStore.sampleCount
+
+        /**
+         * 当前运行中的服务实例（弱引用语义：只在运行时非空）。
+         * 供 UI 在开关变更后立即同步持锁策略，不必等下一次采样循环。
+         */
+        @Volatile
+        private var instance: SamplingService? = null
+
+        /** 设置项变更后同步持锁策略（服务未运行时为空操作） */
+        fun onPrefsChanged() {
+            instance?.syncWakeLock()
+        }
 
         private val _running = MutableStateFlow(false)
         val running: StateFlow<Boolean> = _running.asStateFlow()
@@ -93,7 +162,7 @@ class SamplingService : Service() {
         }
 
         fun clearSamples() {
-            _samples.value = emptyList()
+            SampleStore.clear()
         }
     }
 
@@ -109,8 +178,41 @@ class SamplingService : Service() {
     private val scopeJob = SupervisorJob()
     private val scope = CoroutineScope(scopeJob + Dispatchers.Default)
     private var samplingJob: Job? = null
+    private var wakeLockJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // ---- 常驻通知节流状态 ----
     private var lastNotifyAt = 0L
+    private var lastNotifiedPowerW = Double.NaN
+    private var lastNotifiedSoc = -1
+    private var lastNotifiedCharging: Boolean? = null
+
+    /**
+     * 屏幕是否点亮（由 ACTION_SCREEN_ON / OFF 广播维护，服务启动时按 [PowerManager.isInteractive] 取初值）。
+     * 同时驱动两件事：采样间隔（[effectiveIntervalMs]）与通知节流档位（[maybeNotify]）。
+     */
+    @Volatile
+    private var screenOn = true
+
+    /** 息屏 / 亮屏广播接收器（运行时代码注册，见 [onCreate]） */
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    screenOn = false
+                    // 息屏后是否继续持锁由 syncWakeLock 内的策略决定（充电监测期间强制不持锁）
+                    syncWakeLock()
+                    // 通知立即改用息屏档位，不再等下一次采样
+                    lastNotifyAt = 0L
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    screenOn = true
+                    syncWakeLock()
+                    lastNotifyAt = 0L
+                }
+            }
+        }
+    }
 
     // ---- 充电功率监测状态（每场采样会话复位一次）----
 
@@ -125,8 +227,34 @@ class SamplingService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         createChannel()
         _intervalMs.value = Prefs.getIntervalMs(this)
+        // 初值不能假定"亮着"：服务可能在息屏状态下被拉起（进程重建）
+        screenOn = (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: true
+        registerScreenReceiver()
+    }
+
+    /**
+     * 注册息屏 / 亮屏广播。
+     *
+     * ⚠️ 必须**运行时代码注册**：`ACTION_SCREEN_ON/OFF` 自 Android 8 起禁止在 Manifest 里
+     * 静态注册（隐式广播限制），代码注册不受此限。
+     * ⚠️ `RECEIVER_NOT_EXPORTED` 只挡其它应用发来的广播，系统广播照收 —— 且 targetSdk 34+
+     * 注册非系统专属广播时必须显式指定导出标志，否则直接抛异常。
+     */
+    private fun registerScreenReceiver() {
+        runCatching {
+            ContextCompat.registerReceiver(
+                this,
+                screenReceiver,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                },
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -139,8 +267,13 @@ class SamplingService : Service() {
         _running.value = true
         _error.value = null
         resetChargeWatch()
+        // 通知节流状态复位：新会话的首个样本必须立刻刷新一次（否则会沿用上一场的比较基准）
+        lastNotifyAt = 0L
+        lastNotifiedPowerW = Double.NaN
+        lastNotifiedSoc = -1
+        lastNotifiedCharging = null
         startForegroundCompat(buildNotification(null))
-        acquireWakeLock()
+        startWakeLockJob()
 
         // 电池静态信息已迁到进程级仓库（冷启动时 MainActivity 已预读过）；此处强制刷新一次，
         // 拿到最新的循环次数 / 健康度。仓库自带 IO 作用域，无需再包 launch，
@@ -175,15 +308,26 @@ class SamplingService : Service() {
                 raw
             }
             if (sample != null) {
-                _samples.value = (_samples.value + sample).takeLast(MAX_SAMPLES)
+                SampleStore.append(sample)
                 _error.value = null
                 maybeNotify(sample)
                 watchChargePower(sample)
             } else {
                 _error.value = RootPowerReader.lastError ?: "读取失败"
             }
-            delay(_intervalMs.value.coerceAtLeast(200L))
+            delay(effectiveIntervalMs())
         }
+    }
+
+    /**
+     * 当前生效的采样间隔：息屏时放宽到 [SCREEN_OFF_INTERVAL_MS]，亮屏时用用户设定值。
+     *
+     * 取 `max` 而非直接替换：用户自己设了比 5s 更慢的间隔时尊重用户，不被这里"提速"。
+     * 200ms 下限沿用旧逻辑，防止极端配置把采样循环打死。
+     */
+    private fun effectiveIntervalMs(): Long {
+        val user = _intervalMs.value.coerceAtLeast(200L)
+        return if (screenOn) user else maxOf(user, SCREEN_OFF_INTERVAL_MS)
     }
 
     // ---------- 充电功率监测 ----------
@@ -256,7 +400,8 @@ class SamplingService : Service() {
      * 全程不触碰 [_running] / [samplingJob] —— 只写文件，采样继续。
      */
     private fun autoSaveCsv() {
-        val snapshot = _samples.value
+        // 只在真正落盘这一刻取快照：环形缓冲平时不做任何整表拷贝
+        val snapshot = SampleStore.snapshot()
         if (snapshot.isEmpty()) return
         val uri = CsvExporter.export(this, snapshot, prefix = AUTO_SAVE_PREFIX)
         notifyAutoSaved(uri, snapshot.size)
@@ -311,12 +456,45 @@ class SamplingService : Service() {
         }
     }
 
+    /**
+     * 常驻通知刷新（档一-2）。
+     *
+     * 两道闸 + 一道保底：
+     * 1. **时间闸** —— 亮屏 `NOTIFY_MIN_INTERVAL_AWAKE_MS`（5s）、息屏
+     *    `NOTIFY_MIN_INTERVAL_SCREEN_OFF_MS`（10s）之内一律不刷；
+     * 2. **变化闸** —— 时间窗到了还要看值是否值得刷：SOC 与充电状态都没变、功率变化
+     *    既不到 0.5W 也不到 10% 就跳过，免得通知栏每秒抖一次同样的小数；
+     * 3. **保底** —— 距上次刷新超过 [NOTIFY_MAX_INTERVAL_MS] 时无条件刷一次，
+     *    否则读数长期平稳（恒温涓流）会让通知看起来像卡死了。
+     */
     private fun maybeNotify(sample: PowerSample) {
         val now = System.currentTimeMillis()
-        if (now - lastNotifyAt < NOTIFY_MIN_INTERVAL_MS) return
+        val elapsed = now - lastNotifyAt
+        val minInterval = if (screenOn) {
+            NOTIFY_MIN_INTERVAL_AWAKE_MS
+        } else {
+            NOTIFY_MIN_INTERVAL_SCREEN_OFF_MS
+        }
+        if (elapsed < minInterval) return
+        if (elapsed < NOTIFY_MAX_INTERVAL_MS && !isNoteworthy(sample)) return
+
         lastNotifyAt = now
+        lastNotifiedPowerW = sample.powerW
+        lastNotifiedSoc = sample.socPct
+        lastNotifiedCharging = sample.isCharging
         val nm = getSystemService(NotificationManager::class.java) ?: return
         nm.notify(NOTIF_ID, buildNotification(sample))
+    }
+
+    /** 本样本相比「上一次已通知的内容」是否值得打扰用户 */
+    private fun isNoteworthy(sample: PowerSample): Boolean {
+        if (sample.socPct != lastNotifiedSoc) return true
+        if (sample.isCharging != lastNotifiedCharging) return true
+        val prev = lastNotifiedPowerW
+        if (prev.isNaN()) return true
+        val delta = abs(sample.powerW - prev)
+        if (delta >= NOTIFY_DELTA_W) return true
+        return delta / abs(prev).coerceAtLeast(1e-6) >= NOTIFY_DELTA_RATIO
     }
 
     /** 点通知回到主界面。常驻通知与自动保存提示共用，避免两处 requestCode / flags 分叉 */
@@ -365,12 +543,57 @@ class SamplingService : Service() {
         }
     }
 
-    private fun acquireWakeLock() {
-        if (!Prefs.getWakeLock(this)) return
-        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PowerMeter:Sampling").apply {
-            runCatching { acquire() }
+    // ---------- wakelock（档一-1）----------
+
+    /**
+     * 是否应当持有 wakelock。三条判据，任一不满足即释放：
+     * 1. **充电功率监测开启时绝不持锁** —— 该场景要测的是"电池真实在被充多少瓦"，
+     *    而 CPU 不睡本身就是一笔负载，会直接抬高电池端读数、污染涓流段。
+     *    这是**测量精度**问题，不只是耗电问题；顺便此场景本来就会自动熄屏，
+     *    息屏后采样间隔已放宽到 5s，靠系统 suspend 省电正是想要的。
+     * 2. 用户关掉「锁屏保持采样」→ 不持锁（息屏后允许系统休眠，采样出现间隙无害）。
+     * 3. 其余情况（用户开关开启且非充电监测）→ 持锁，保证息屏后仍按设定间隔出点。
+     *
+     * ⚠️ 注意第 2 条与「息屏自适应降频」的关系：本开关是**唯一**决定息屏后是否持续
+     * 唤醒 CPU 的地方。若把它理解成"息屏一律释放"，这个开关就彻底失去意义了
+     * —— 开与关的行为将完全相同。
+     */
+    private fun shouldHoldWakeLock(): Boolean =
+        !Prefs.getChargeMonitor(this) && Prefs.getWakeLock(this)
+
+    /**
+     * 启动续期协程：既负责首次获取，也负责在 `WAKE_LOCK_TIMEOUT_MS`（30min）超时前续上。
+     *
+     * 用协程而不是在采样循环里顺手续期，是因为采样循环在息屏 + 不持锁时会被系统拖慢，
+     * 反过来影响续期时机；独立协程在持锁状态下能稳定醒来。
+     */
+    private fun startWakeLockJob() {
+        if (wakeLockJob?.isActive == true) return
+        wakeLockJob = scope.launch {
+            while (true) {
+                syncWakeLock()
+                delay(WAKE_LOCK_RENEW_INTERVAL_MS)
+            }
         }
+    }
+
+    /**
+     * 按当前策略获取 / 续期 / 释放 wakelock。
+     *
+     * 非引用计数的锁（`setReferenceCounted(false)`）在已持有时再次 `acquire(timeout)`
+     * 只是把到期时间往后推 —— 这正是续期要的语义，因此这里可以无脑无条件 acquire。
+     */
+    private fun syncWakeLock() {
+        if (!shouldHoldWakeLock()) {
+            releaseWakeLock()
+            return
+        }
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+        val lock = wakeLock ?: pm
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+            .apply { setReferenceCounted(false) }
+            .also { wakeLock = it }
+        runCatching { lock.acquire(WAKE_LOCK_TIMEOUT_MS) }
     }
 
     private fun releaseWakeLock() {
@@ -379,11 +602,14 @@ class SamplingService : Service() {
     }
 
     override fun onDestroy() {
-        // 取消服务级 Job：samplingJob 与 scheduleScreenOff 的 delay 协程一并结束，
+        // 取消服务级 Job：samplingJob、续期协程与 scheduleScreenOff 的 delay 协程一并结束，
         // 避免服务销毁后仍有协程在跑（见 scopeJob 的注释）
         scopeJob.cancel()
         samplingJob = null
+        wakeLockJob = null
         releaseWakeLock()
+        runCatching { unregisterReceiver(screenReceiver) }
+        instance = null
         _running.value = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
