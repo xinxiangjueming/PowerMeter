@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- ==================== Common ==================== -->
+
+    <string name="app_name">Power Meter</string>
+    <string name="sep_dot">" · "</string>
+
+    <string name="action_settings">Settings</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_confirm">Confirm</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_authorize">Authorize</string>
+    <string name="empty_no_samples">No samples yet</string>
+
+    <!-- ==================== Top bar / home status ==================== -->
+
+    <string name="status_sampling">Sampling · every %1$dms</string>
+    <string name="status_stopped">Stopped</string>
+
+    <!-- ==================== Hero power card ==================== -->
+
+    <string name="hero_waiting">Waiting for samples</string>
+    <string name="hero_charging">Charging</string>
+    <string name="hero_discharging">Discharging</string>
+    <string name="hero_soc">SOC %1$d%%</string>
+    <string name="hero_remaining">%1$s mAh remaining</string>
+
+    <!-- ==================== Metrics ==================== -->
+
+    <string name="metric_power">Power</string>
+    <string name="metric_voltage">Voltage</string>
+    <string name="metric_current">Current</string>
+    <string name="metric_temp">Temperature</string>
+    <string name="metric_battery_temp">Battery temp</string>
+    <string name="metric_ocv">Open-circuit V</string>
+    <string name="metric_usb_temp">Port temp</string>
+    <string name="metric_charger_ic_temp">Charger IC temp</string>
+
+    <!-- ==================== Trend ==================== -->
+
+    <string name="title_trend">Trend</string>
+    <string name="action_color">Color</string>
+    <string name="color_sheet_title">%1$s curve color</string>
+    <string name="label_quick_pick">Quick pick</string>
+
+    <!-- ==================== Import banner ==================== -->
+
+    <string name="import_banner_title">Viewing imported CSV</string>
+    <string name="import_banner_count">%1$s · %2$d rows</string>
+    <string name="action_exit_import">Exit view</string>
+
+    <!-- ==================== Stats card ==================== -->
+
+    <string name="title_stats">Statistics</string>
+    <string name="stat_sample_count">Samples</string>
+    <string name="stat_duration">Duration</string>
+    <string name="stat_avg_power">Avg power</string>
+    <string name="stat_peak_charge">Peak charge</string>
+    <string name="stat_peak_discharge">Peak discharge</string>
+    <string name="stat_voltage_range">Voltage range</string>
+    <string name="stat_max_temp">Max temp</string>
+    <string name="stat_charged_total">Total charged</string>
+    <string name="stat_discharged_total">Total discharged</string>
+
+    <!-- ==================== Battery info card ==================== -->
+
+    <string name="title_battery">Battery</string>
+    <string name="battery_type">Type</string>
+    <string name="battery_soh">SOH</string>
+    <string name="battery_cycle_count">Cycles</string>
+    <string name="value_times">%1$d times</string>
+    <string name="battery_full_capacity">Full capacity</string>
+    <string name="battery_design_capacity">Design capacity</string>
+    <string name="battery_max_charge_level">Max charge level</string>
+
+    <!-- ==================== Control row ==================== -->
+
+    <string name="action_start_sampling">Start sampling</string>
+    <string name="action_stop_sampling">Stop sampling</string>
+    <string name="action_export_csv">Export CSV</string>
+    <string name="action_clear_samples">Clear samples</string>
+
+    <!-- ==================== Sampling settings ==================== -->
+
+    <string name="title_settings">Sampling settings</string>
+    <string name="label_sampling_interval">Sampling interval</string>
+
+    <string name="option_keep_sampling_on_lock">Keep sampling when locked</string>
+    <string name="option_keep_sampling_on_lock_desc">Hold a CPU wake lock so sampling continues after the screen turns off; when disabled the screen-off interval widens to 5s for better battery life</string>
+
+    <string name="option_charge_monitor">Charge power monitor</string>
+    <string name="option_charge_monitor_desc">Turns the screen off 5s after sampling starts; when charge power stays below 1W for more than 5min a CSV is saved automatically (sampling keeps running)</string>
+
+    <string name="option_series_dual_battery">Series dual battery</string>
+    <string name="option_series_dual_battery_desc">The kernel reports single-cell voltage; on series packs the whole-pack voltage is ×2 and power follows ×2 (not needed on Xiaomi devices)</string>
+
+    <string name="title_data_access_permission">Data read permission</string>
+    <string name="shizuku_ready">Ready · reading low-level nodes as shell</string>
+    <string name="shizuku_connecting">Authorized · connecting to Shizuku…</string>
+    <string name="shizuku_not_granted">Shizuku is running · this app is not authorized</string>
+    <string name="shizuku_not_found">Shizuku not detected (can be ignored on rooted devices)</string>
+
+    <!-- ==================== Foreground service: notifications ==================== -->
+
+    <string name="channel_name_sampling">Live power sampling</string>
+    <string name="channel_desc_sampling">Keeps reading low-level battery nodes while the screen is off</string>
+    <string name="notify_starting">Starting sampling…</string>
+    <string name="notify_title_charging">Charging · %1$d%%</string>
+    <string name="notify_title_discharging">Discharging · %1$d%%</string>
+    <string name="notify_auto_saved">Auto-saved %1$s (%2$d records, sampling continues)</string>
+    <string name="notify_auto_save_failed">Auto-save failed, sampling continues</string>
+
+    <string name="fgs_special_use_subtype">Reads /sys/class/power_supply and fuel-gauge nodes to continuously monitor charge and discharge power, voltage, current and temperature</string>
+
+    <!-- ==================== Toasts / errors ==================== -->
+
+    <string name="toast_notification_permission_required">Notification permission is required to keep sampling after the screen locks</string>
+    <string name="toast_start_service_failed">Failed to start sampling service: %1$s</string>
+    <string name="toast_no_data">No samples yet</string>
+    <string name="toast_export_done">Exported: Download/PowerMeter/%1$s</string>
+    <string name="toast_export_failed">Export failed</string>
+
+    <string name="toast_file_too_large">File is too large to open as sample data</string>
+    <string name="toast_not_csv">Only CSV files can be opened</string>
+    <string name="import_dropped_rows">, %1$d rows dropped</string>
+    <string name="toast_import_done">Opened %1$d sample records%2$s</string>
+    <string name="toast_open_failed">Failed to open: %1$s</string>
+
+    <string name="error_read_failed">Read failed</string>
+
+    <!-- ==================== Sampling channel errors ==================== -->
+
+    <string name="error_no_access">No root access and Shizuku is not installed or running — cannot read low-level battery nodes</string>
+    <string name="error_shizuku_service_not_ready">Shizuku is authorized but the service is not ready (retrying bind automatically)</string>
+    <string name="error_shizuku_not_granted">Shizuku is running but this app is not authorized — grant it in Sampling settings</string>
+    <string name="error_voltage_node_unreadable">Cannot read %1$s/voltage_now — the %2$s identity cannot open that node (node path differs by device, or SELinux blocks it)</string>
+    <string name="error_parse_failed">Parse failed: %1$s/voltage_now is empty or not a number (channel: %2$s). Raw output: %3$s</string>
+    <string name="error_no_command_output">command returned nothing</string>
+    <string name="error_binder_no_output">%1$s; binder fallback command returned no output</string>
+    <string name="error_binder_missing_voltage">%1$s; binder fallback output lacks a voltage field. Raw output: %2$s</string>
+
+    <string name="access_mode_shizuku">Shizuku(shell)</string>
+    <string name="access_mode_root">root</string>
+    <string name="access_mode_none">No permission</string>
+    <string name="channel_awk">awk</string>
+    <string name="channel_shell_loop">shell loop</string>
+
+    <!-- ==================== CSV parse errors ==================== -->
+
+    <string name="error_csv_unreadable">Cannot read that file</string>
+    <string name="error_csv_empty">File is empty</string>
+    <string name="error_csv_missing_time_column">Not a CSV exported by this app: missing time column (timestamp / datetime)</string>
+    <string name="error_csv_missing_data_column">Not a CSV exported by this app: missing data column (voltage_v / current_ma / power_w)</string>
+    <string name="error_csv_no_valid_rows">No valid sample rows parsed (%1$d rows dropped)</string>
+
+</resources>

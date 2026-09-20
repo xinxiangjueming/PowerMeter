@@ -313,7 +313,7 @@ class SamplingService : Service() {
                 maybeNotify(sample)
                 watchChargePower(sample)
             } else {
-                _error.value = RootPowerReader.lastError ?: "读取失败"
+                _error.value = RootPowerReader.lastError ?: getString(R.string.error_read_failed)
             }
             delay(effectiveIntervalMs())
         }
@@ -412,15 +412,15 @@ class SamplingService : Service() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
         val text = if (uri != null) {
             val name = displayNameOf(uri) ?: "CSV"
-            "已自动保存 $name（$count 条记录，采样继续）"
+            getString(R.string.notify_auto_saved, name, count)
         } else {
-            "自动保存失败，采样继续"
+            getString(R.string.notify_auto_save_failed)
         }
         nm.notify(
             NOTIF_ID_AUTO_SAVE,
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_stat_bolt)
-                .setContentTitle("充电功率监测")
+                .setContentTitle(getString(R.string.option_charge_monitor))
                 .setContentText(text)
                 .setAutoCancel(true)
                 .setContentIntent(contentIntent())
@@ -509,15 +509,15 @@ class SamplingService : Service() {
 
     private fun buildNotification(sample: PowerSample?): Notification {
         val text = if (sample == null) {
-            "正在启动采样…"
+            getString(R.string.notify_starting)
         } else {
             "${sample.powerW.f3()} W · ${sample.voltageV.f3()} V · " +
-                "${sample.currentMa.f3()} mA · ${sample.tempBatteryC.f1()} ℃"
+                "${sample.currentMa.f0()} mA · ${sample.tempBatteryC.f1()} ℃"
         }
         val title = when {
-            sample == null -> "功率监测"
-            sample.isCharging -> "充电中 · ${sample.socPct}%"
-            else -> "放电中 · ${sample.socPct}%"
+            sample == null -> getString(R.string.app_name)
+            sample.isCharging -> getString(R.string.notify_title_charging, sample.socPct)
+            else -> getString(R.string.notify_title_discharging, sample.socPct)
         }
         val pi = contentIntent()
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -535,8 +535,12 @@ class SamplingService : Service() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
         if (nm.getNotificationChannel(CHANNEL_ID) == null) {
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "实时功率采样", NotificationManager.IMPORTANCE_LOW).apply {
-                    description = "锁屏后持续读取底层电量节点"
+                NotificationChannel(
+                    CHANNEL_ID,
+                    getString(R.string.channel_name_sampling),
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    description = getString(R.string.channel_desc_sampling)
                     setShowBadge(false)
                 }
             )
@@ -626,4 +630,7 @@ class SamplingService : Service() {
 
     /** 常驻通知里的电池温度按用户约定取 1 位小数（2026-09-21） */
     private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
+
+    /** 电流 mA 整数档（2026-09-21 用户约定）：内核只上报 mA 整数，显示与 CSV 记录同口径 */
+    private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
 }

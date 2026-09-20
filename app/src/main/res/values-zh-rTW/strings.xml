@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- ==================== 通用 ==================== -->
+
+    <string name="app_name">功率監測</string>
+    <string name="sep_dot">" · "</string>
+
+    <string name="action_settings">設定</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_confirm">確定</string>
+    <string name="action_retry">重試</string>
+    <string name="action_authorize">授權</string>
+    <string name="empty_no_samples">暫無取樣資料</string>
+
+    <!-- ==================== 頂欄 / 主介面狀態 ==================== -->
+
+    <string name="status_sampling">取樣中 · 每 %1$dms</string>
+    <string name="status_stopped">已停止</string>
+
+    <!-- ==================== 主功率卡 ==================== -->
+
+    <string name="hero_waiting">等待取樣</string>
+    <string name="hero_charging">充電中</string>
+    <string name="hero_discharging">放電中</string>
+    <string name="hero_soc">SOC %1$d%%</string>
+    <string name="hero_remaining">剩餘 %1$s mAh</string>
+
+    <!-- ==================== 指標 ==================== -->
+
+    <string name="metric_power">功率</string>
+    <string name="metric_voltage">電壓</string>
+    <string name="metric_current">電流</string>
+    <string name="metric_temp">溫度</string>
+    <string name="metric_battery_temp">電池溫度</string>
+    <string name="metric_ocv">開路電壓</string>
+    <string name="metric_usb_temp">接口溫度</string>
+    <string name="metric_charger_ic_temp">充電 IC 溫度</string>
+
+    <!-- ==================== 趨勢 ==================== -->
+
+    <string name="title_trend">趨勢</string>
+    <string name="action_color">顏色</string>
+    <string name="color_sheet_title">%1$s曲線顏色</string>
+    <string name="label_quick_pick">快速選擇</string>
+
+    <!-- ==================== 匯入提示條 ==================== -->
+
+    <string name="import_banner_title">檢視匯入的 CSV</string>
+    <string name="import_banner_count">%1$s · %2$d 筆</string>
+    <string name="action_exit_import">結束檢視</string>
+
+    <!-- ==================== 統計卡 ==================== -->
+
+    <string name="title_stats">統計</string>
+    <string name="stat_sample_count">取樣數</string>
+    <string name="stat_duration">時長</string>
+    <string name="stat_avg_power">平均功率</string>
+    <string name="stat_peak_charge">峰值充電</string>
+    <string name="stat_peak_discharge">峰值放電</string>
+    <string name="stat_voltage_range">電壓範圍</string>
+    <string name="stat_max_temp">最高溫度</string>
+    <string name="stat_charged_total">累計充入</string>
+    <string name="stat_discharged_total">累計放出</string>
+
+    <!-- ==================== 電池資訊卡 ==================== -->
+
+    <string name="title_battery">電池</string>
+    <string name="battery_type">類型</string>
+    <string name="battery_soh">健康度 SOH</string>
+    <string name="battery_cycle_count">循環次數</string>
+    <string name="value_times">%1$d 次</string>
+    <string name="battery_full_capacity">滿充容量</string>
+    <string name="battery_design_capacity">設計容量</string>
+    <string name="battery_max_charge_level">最大充電檔位</string>
+
+    <!-- ==================== 控制條 ==================== -->
+
+    <string name="action_start_sampling">開始取樣</string>
+    <string name="action_stop_sampling">停止取樣</string>
+    <string name="action_export_csv">匯出 CSV</string>
+    <string name="action_clear_samples">清除取樣資料</string>
+
+    <!-- ==================== 取樣設定 ==================== -->
+
+    <string name="title_settings">取樣設定</string>
+    <string name="label_sampling_interval">取樣間隔</string>
+
+    <string name="option_keep_sampling_on_lock">鎖屏保持取樣</string>
+    <string name="option_keep_sampling_on_lock_desc">以 CPU 喚醒鎖換取螢幕關閉後持續取樣；關閉時螢幕關閉期間隔放寬到 5s，更省電</string>
+
+    <string name="option_charge_monitor">充電功率監測</string>
+    <string name="option_charge_monitor_desc">點擊開始取樣 5s 後關閉螢幕；充電功率低於 1W 且持續超過 5min 時自動儲存 CSV 檔案（不停止取樣）</string>
+
+    <string name="option_series_dual_battery">串聯雙電池</string>
+    <string name="option_series_dual_battery_desc">核心回報單節電壓，串聯機型整組電壓 ×2，功率隨之 ×2（小米機器不需要開啟）</string>
+
+    <string name="title_data_access_permission">資料讀取權限</string>
+    <string name="shizuku_ready">已就緒 · 以 shell 身分讀取底層節點</string>
+    <string name="shizuku_connecting">已授權 · 正在連線 Shizuku 服務…</string>
+    <string name="shizuku_not_granted">Shizuku 正在執行 · 尚未授權本應用程式</string>
+    <string name="shizuku_not_found">未偵測到 Shizuku（已 root 裝置可忽略此項）</string>
+
+    <!-- ==================== 前台服務：通知 ==================== -->
+
+    <string name="channel_name_sampling">即時功率取樣</string>
+    <string name="channel_desc_sampling">螢幕關閉後持續讀取底層電量節點</string>
+    <string name="notify_starting">正在啟動取樣…</string>
+    <string name="notify_title_charging">充電中 · %1$d%%</string>
+    <string name="notify_title_discharging">放電中 · %1$d%%</string>
+    <string name="notify_auto_saved">已自動儲存 %1$s（%2$d 筆記錄，取樣繼續）</string>
+    <string name="notify_auto_save_failed">自動儲存失敗，取樣繼續</string>
+
+    <string name="fgs_special_use_subtype">讀取 /sys/class/power_supply 與電量計底層節點，持續監測充放電功率、電壓、電流與溫度</string>
+
+    <!-- ==================== Toast / 錯誤提示 ==================== -->
+
+    <string name="toast_notification_permission_required">需要通知權限才能在鎖屏後常駐取樣</string>
+    <string name="toast_start_service_failed">啟動取樣服務失敗：%1$s</string>
+    <string name="toast_no_data">暫無取樣資料</string>
+    <string name="toast_export_done">已匯出：Download/PowerMeter/%1$s</string>
+    <string name="toast_export_failed">匯出失敗</string>
+
+    <string name="toast_file_too_large">檔案過大，無法作為取樣資料開啟</string>
+    <string name="toast_not_csv">只能開啟 CSV 檔案</string>
+    <string name="import_dropped_rows">，捨棄 %1$d 行</string>
+    <string name="toast_import_done">已開啟 %1$d 筆取樣記錄%2$s</string>
+    <string name="toast_open_failed">開啟失敗：%1$s</string>
+
+    <string name="error_read_failed">讀取失敗</string>
+
+    <!-- ==================== 取數通道錯誤 ==================== -->
+
+    <string name="error_no_access">無 root 權限，且未安裝/執行 Shizuku —— 無法讀取底層電量節點</string>
+    <string name="error_shizuku_service_not_ready">Shizuku 已授權但服務未就緒（正在自動重試繫結）</string>
+    <string name="error_shizuku_not_granted">Shizuku 正在執行但本應用程式未獲授權，請在「取樣設定」中授權</string>
+    <string name="error_voltage_node_unreadable">讀不到 %1$s/voltage_now —— %2$s 身分無法開啟該節點（機型節點路徑不同，或受 SELinux 限制）</string>
+    <string name="error_parse_failed">解析失敗：%1$s/voltage_now 為空或非數字（通道：%2$s）。原始輸出：%3$s</string>
+    <string name="error_no_command_output">命令未回傳</string>
+    <string name="error_binder_no_output">%1$s；binder 備援命令未回傳輸出</string>
+    <string name="error_binder_missing_voltage">%1$s；binder 備援輸出缺少電壓欄位。原始輸出：%2$s</string>
+
+    <string name="access_mode_shizuku">Shizuku(shell)</string>
+    <string name="access_mode_root">root</string>
+    <string name="access_mode_none">無權限</string>
+    <string name="channel_awk">awk</string>
+    <string name="channel_shell_loop">shell 迴圈</string>
+
+    <!-- ==================== CSV 解析錯誤 ==================== -->
+
+    <string name="error_csv_unreadable">無法讀取該檔案</string>
+    <string name="error_csv_empty">檔案內容為空</string>
+    <string name="error_csv_missing_time_column">不是本應用程式匯出的 CSV：缺少時間欄（timestamp / datetime）</string>
+    <string name="error_csv_missing_data_column">不是本應用程式匯出的 CSV：缺少資料欄（voltage_v / current_ma / power_w）</string>
+    <string name="error_csv_no_valid_rows">未解析出有效取樣行（捨棄 %1$d 行）</string>
+
+</resources>

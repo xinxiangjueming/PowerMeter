@@ -2,6 +2,7 @@ package com.chen.powermeter
 
 import android.app.Application
 import com.chen.powermeter.data.RootPowerReader
+import com.chen.powermeter.util.AppStrings
 import com.chen.powermeter.util.ShizukuHelper
 
 /**
@@ -22,6 +23,9 @@ import com.chen.powermeter.util.ShizukuHelper
 class PowerMeterApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        // 必须最先注入：RootPowerReader / CsvImporter 都在 object 里拼装用户可见的错误文案，
+        // 它们没有 Context，只能走 AppStrings 拿 applicationContext 这一份
+        AppStrings.init(this)
         ShizukuHelper.init(this)
         RootPowerReader.init(this)
     }

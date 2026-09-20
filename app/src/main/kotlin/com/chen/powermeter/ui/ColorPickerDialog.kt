@@ -46,9 +46,11 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.chen.powermeter.R
 import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.chen.powermeter.util.Prefs
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -230,7 +232,7 @@ internal fun ColorPickerSheet(
             )
             Spacer(Modifier.height(16.dp))
             Text(
-                "快速选择",
+                stringResource(R.string.label_quick_pick),
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -280,7 +282,7 @@ internal fun ColorPickerSheet(
                     modifier = Modifier.weight(1f).height(52.dp),
                     shape = buttonShape,
                 ) {
-                    Text("取消")
+                    Text(stringResource(R.string.action_cancel))
                 }
                 Button(
                     onClick = {
@@ -291,7 +293,7 @@ internal fun ColorPickerSheet(
                     modifier = Modifier.weight(1f).height(52.dp),
                     shape = buttonShape,
                 ) {
-                    Text("确定")
+                    Text(stringResource(R.string.action_confirm))
                 }
             }
             Spacer(Modifier.height(16.dp))

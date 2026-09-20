@@ -131,7 +131,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="读取 /sys/class/power_supply 与燃料计底层节点，持续监测充放电功率、电压、电流与温度" />
+                android:value="@string/fgs_special_use_subtype" />
         </service>
     </application>
 

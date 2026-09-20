@@ -52,16 +52,16 @@ object CsvExporter {
                                 fmt.format(Date(s.timeMillis)),
                                 s.voltageV.f3(),
                                 s.voltageOcvV.f3(),
-                                s.currentMa.f3(),
-                                s.fgCurrentMa?.f3() ?: "",
+                                s.currentMa.f0(),
+                                s.fgCurrentMa?.f0() ?: "",
                                 s.powerW.f3(),
                                 s.tempBatteryC.f1(),
-                                s.tempUsbC?.f1() ?: "",
+                                s.tempUsbC?.f0() ?: "",
                                 s.tempChargerC?.f3() ?: "",
                                 s.socPct.toString(),
                                 s.status,
                                 s.chargeType,
-                                s.remainingMah?.f3() ?: "",
+                                s.remainingMah?.f0() ?: "",
                                 s.usbVoltageV?.f3() ?: "",
                             ).joinToString(",") + "\n"
                         )
@@ -82,6 +82,12 @@ object CsvExporter {
 
     private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
 
-    /** 温度类（电池/接口）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余列仍 3 位 */
+    /** 温度类（电池）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余列仍 3 位 */
     private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
+
+    /**
+     * 整数档（2026-09-21 用户约定）：电流 mA / 燃料计电流 mA / 接口温度 / 剩余容量 mAh
+     * 分辨率只到个位，落盘与界面显示同口径（避免 CSV 里出现无意义的 .000 尾巴）。
+     */
+    private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
 }

@@ -52,12 +52,14 @@ import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
+import com.chen.powermeter.R
 import androidx.compose.ui.unit.sp
 import com.chen.powermeter.data.PowerSample
 import java.text.SimpleDateFormat
@@ -107,10 +109,26 @@ private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
 
 private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 
-/** 温度指标（电池温度）一律 1 位小数（用户约定 2026-09-21），其余指标维持 3 位 */
-private fun Double.fMetric(metric: Metric?): String = if (metric == Metric.TEMP) f1() else f3()
+/** 电流 mA 整数档（2026-09-21 用户约定）：内核只上报 mA 整数 */
+private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
 
-/** 一条曲线的绘制数据；[values] 与传入的 samples 按下标一一对应 */
+/**
+ * 按指标取小数位（2026-09-21 用户约定）：
+ * 电流 → 整数；温度（电池）→ 1 位小数；其余（功率 / 电压 / OCV）→ 3 位。
+ * Y 轴刻度、图例量程、读数气泡三处共用，保证同一指标在任何位置口径一致。
+ */
+private fun Double.fMetric(metric: Metric?): String = when (metric) {
+    Metric.CURRENT -> f0()
+    Metric.TEMP -> f1()
+    else -> f3()
+}
+
+/**
+ * 一条曲线的绘制数据；[values] 与传入的 samples 按下标一一对应。
+ *
+ * [label] 是**已解析**的本地化文本：图例与读数气泡在 `forEachIndexed` 等非 Composable
+ * lambda 里取用它，那里调不了 `stringResource`，故由 [toSeries] 的调用方提前解析好。
+ */
 internal data class ChartSeries(
     val metric: Metric,
     val label: String,
@@ -127,7 +145,7 @@ internal fun Metric.unitLabel(): String = when (this) {
     Metric.TEMP -> "℃"
 }
 
-internal fun Metric.toSeries(samples: List<PowerSample>, color: Color): ChartSeries =
+internal fun Metric.toSeries(samples: List<PowerSample>, color: Color, label: String): ChartSeries =
     ChartSeries(
         metric = this,
         label = label,
@@ -425,7 +443,7 @@ internal fun TrendChart(
         if (samples.size < 2 || series.isEmpty()) {
             Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                 Text(
-                    "暂无采样数据",
+                    stringResource(R.string.empty_no_samples),
                     fontSize = 15.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
@@ -561,7 +579,7 @@ private fun ColumnScope.ChartBody(
     Row(Modifier.fillMaxWidth().weight(1f)) {
         if (!normalized) {
             YAxisColumn(
-                labels = axisLabels(geom.ranges.first()),
+                labels = axisLabels(geom.ranges.first(), series.firstOrNull()?.metric),
                 labelSp = axisLabelSp,
                 color = labelColor,
                 modifier = Modifier.onSizeChanged { yAxisWidthPx = it.width },
@@ -783,10 +801,10 @@ private fun YAxisColumn(
     }
 }
 
-private fun axisLabels(range: Pair<Double, Double>): List<String> {
+private fun axisLabels(range: Pair<Double, Double>, metric: Metric?): List<String> {
     val (lo, hi) = range
     val span = hi - lo
-    return (0..AXIS_TICKS).map { k -> (hi - span * k / AXIS_TICKS).f3() }
+    return (0..AXIS_TICKS).map { k -> (hi - span * k / AXIS_TICKS).fMetric(metric) }
 }
 
 /** 归一化叠加时的图例：色块 + 指标名 + **可见窗口内**的量程与单位 */
@@ -808,7 +826,7 @@ private fun LegendRow(
                 Box(Modifier.size(8.dp).background(sr.color, RoundedCornerShape(50)))
                 Spacer(Modifier.width(5.dp))
                 Text(
-                    "${sr.label} ${ranges[index].first.f3()}~${ranges[index].second.f3()} ${sr.unit}",
+                    "${sr.label} ${ranges[index].first.fMetric(sr.metric)}~${ranges[index].second.fMetric(sr.metric)} ${sr.unit}",
                     fontSize = 11.sp,
                     fontFamily = ChartNumericFont,
                     color = labelColor,

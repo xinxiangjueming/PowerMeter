@@ -41,10 +41,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.chen.powermeter.R
 import com.chen.powermeter.data.ImportedSeries
 import com.chen.powermeter.service.SamplingService
 import com.chen.powermeter.ui.theme.LocalCornerRadius
@@ -262,7 +265,7 @@ private fun TrendFullscreenScreen(
     val liveVersion by SamplingService.sampleVersion.collectAsState()
     val live = remember(liveVersion) { SamplingService.snapshot() }
     val samples = if (imported.isNotEmpty()) imported else live
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
 
     // 指标多选：横屏叠加对比多条曲线。至少保留一条（点最后一条不可取消），
     // 否则图表会空掉、用户还得自己找回来
@@ -281,8 +284,12 @@ private fun TrendFullscreenScreen(
     val seriesColors = remember(metrics, customColors, themePrimary) {
         metrics.map { m -> m.seriesColor(customColors, themePrimary) }
     }
-    val seriesList = remember(samples, metrics, seriesColors) {
-        seriesColors.mapIndexed { i, color -> metrics[i].toSeries(samples, color) }
+    // 曲线标签在这里解析：remember 的计算 lambda 不是 Composable 作用域，调不了 stringResource，
+    // 而图例 / 读数气泡又是在非 Composable 的 forEachIndexed 里读 ChartSeries.label 的
+    val seriesList = remember(samples, metrics, seriesColors, context) {
+        seriesColors.mapIndexed { i, color ->
+            metrics[i].toSeries(samples, color, context.getString(metrics[i].labelRes))
+        }
     }
     // 非空 = 颜色面板打开中，值为正在编辑的指标
     var colorTarget by remember { mutableStateOf<Metric?>(null) }
@@ -340,7 +347,7 @@ private fun TrendFullscreenScreen(
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
-                                "趋势",
+                                stringResource(R.string.title_trend),
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.Bold,
                             )
@@ -351,7 +358,7 @@ private fun TrendFullscreenScreen(
                             val primary = metrics.first()
                             val primaryColor = rememberMetricColor(primary)
                             ChartPillButton(
-                                text = "颜色",
+                                text = stringResource(R.string.action_color),
                                 background = primaryColor,
                                 contentColor = onColorFor(primaryColor),
                                 onClick = { colorTarget = primary },
@@ -377,7 +384,7 @@ private fun TrendFullscreenScreen(
                                     // 空档里显示成一段空白
                                     chartState.reset()
                                 },
-                                label = { Text(m.label) },
+                                label = { Text(m.label()) },
                                 // 色点直接标出该指标当前的曲线色，叠加时不用去猜哪条是哪个
                                 leadingIcon = {
                                     Box(
@@ -403,7 +410,7 @@ private fun TrendFullscreenScreen(
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
-                                "暂无采样数据",
+                                stringResource(R.string.empty_no_samples),
                                 fontSize = 15.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center,
@@ -431,7 +438,7 @@ private fun TrendFullscreenScreen(
     val sheetTarget = if (closing) null else colorTarget
     sheetTarget?.let { target ->
         ColorPickerSheet(
-            title = "${target.label}曲线颜色",
+            title = stringResource(R.string.color_sheet_title, target.label()),
             initialColor = rememberMetricColor(target),
             onPick = { picked ->
                 ChartColors.set(context, target, picked)

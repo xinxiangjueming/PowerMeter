@@ -160,7 +160,11 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 
 > 框架层 `BATTERY_PROPERTY_CURRENT_NOW`（`cmd battery get`、`BatteryManager.getLongProperty`）是 HAL 原始值透传，**与 sysfs 同号**（同样负 = 充电），故两条通道共用同一取反口径。Android 文档称其「正 = 充电」，本机实测不成立；换 ROM 若发现「充电时功率为负」，说明该 ROM 按文档取号，届时适配。
 
-**温度精度分级**：电池温度、接口温度、最高温度、常驻通知内电池温度、CSV 的 `temp_battery_c` / `temp_usb_c`、图表 TEMP 系列的 Y 轴刻度与读数气泡 = **1 位小数**；充电 IC / PMIC 温度与其余指标 = 3 位小数。
+**数值精度分级**（2026-09-21 定案，显示与 CSV 记录同口径）：
+- **整数**：电流 mA（内核只上报 mA 整数，含燃料计电流）、接口温度、容量类（剩余 / 满充 / 设计 mAh）
+- **1 位小数**：电池温度、最高温度、常驻通知内电池温度、CSV 的 `temp_battery_c`、图表 TEMP 系列（Y 轴刻度 / 图例 / 读数气泡）
+- **3 位小数**：电压 / OCV / 功率 / Wh、充电 IC / PMIC 温度与其余指标
+- 图表按指标走 `TrendChartView.fMetric(metric)`，Y 轴刻度、图例量程、读数气泡共用同一函数
 
 ### 3.4 三个实测陷阱
 
@@ -458,16 +462,16 @@ timestamp,datetime,voltage_v,voltage_ocv_v,current_ma,fg_current_ma,power_w,temp
 | `datetime` | — | `yyyy-MM-dd HH:mm:ss.SSS`。**带毫秒是必须的**：采样间隔最小 500ms，秒级精度下相邻两行会重复，无法直接作为时间轴 |
 | `voltage_v` | V | 电池端电压 |
 | `voltage_ocv_v` | V | 开路电压（OCV） |
-| `current_ma` | mA | **正 = 充电，负 = 放电** |
-| `fg_current_ma` | mA | 燃料计独立测得的电流，用于交叉校验；无数据时留空 |
+| `current_ma` | mA | **正 = 充电，负 = 放电**；整数（内核只上报 mA 整数） |
+| `fg_current_ma` | mA | 燃料计独立测得的电流，用于交叉校验；整数，无数据时留空 |
 | `power_w` | W | `voltage_v × current_ma / 1000`，符号跟随电流 |
 | `temp_battery_c` | ℃ | 电池温度（1 位小数） |
-| `temp_usb_c` | ℃ | Type-C 接口温度（1 位小数） |
+| `temp_usb_c` | ℃ | Type-C 接口温度（整数） |
 | `temp_charger_c` | ℃ | 充电 IC 温度（3 位小数） |
 | `soc_pct` | % | 系统 SOC |
 | `status` | — | `Charging` / `Discharging` / `Full` / `Not charging` |
 | `charge_type` | — | `Fast` / `Trickle` / `None` |
-| `remaining_mah` | mAh | 剩余容量（来自燃料计 `fg1_rm`，权威） |
+| `remaining_mah` | mAh | 剩余容量（来自燃料计 `fg1_rm`，权威）；整数 |
 | `usb_voltage_v` | V | USB 输入电压 |
 
 ### 导入的容错范围

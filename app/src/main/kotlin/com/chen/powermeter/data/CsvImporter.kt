@@ -4,6 +4,8 @@ import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import com.chen.powermeter.R
+import com.chen.powermeter.util.appString
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -70,7 +72,7 @@ object CsvImporter {
     fun read(context: Context, uri: Uri): Result {
         val text = context.contentResolver.openInputStream(uri)?.use { input ->
             BufferedReader(InputStreamReader(input, Charsets.UTF_8)).readText()
-        } ?: throw CsvFormatException("无法读取该文件")
+        } ?: throw CsvFormatException(appString(R.string.error_csv_unreadable))
         return parse(text)
     }
 
@@ -129,7 +131,7 @@ object CsvImporter {
         // 第一条非空行即表头。BOM 只可能出现在文件首行，但逐行 removePrefix 成本可忽略，
         // 也顺便容忍「首行为空、BOM 落在第二个非空行」这种被编辑器动过手脚的文件。
         val headerLineIdx = lines.indexOfFirst { it.removePrefix("\uFEFF").isNotBlank() }
-        if (headerLineIdx < 0) throw CsvFormatException("文件内容为空")
+        if (headerLineIdx < 0) throw CsvFormatException(appString(R.string.error_csv_empty))
 
         val header = lines[headerLineIdx]
             .removePrefix("\uFEFF")
@@ -140,10 +142,10 @@ object CsvImporter {
         header.forEachIndexed { index, name -> if (name.isNotEmpty()) at[name] = index }
 
         if ("timestamp" !in at && "datetime" !in at) {
-            throw CsvFormatException("不是本应用导出的 CSV：缺少时间列（timestamp / datetime）")
+            throw CsvFormatException(appString(R.string.error_csv_missing_time_column))
         }
         if (listOf("voltage_v", "current_ma", "power_w").none { it in at }) {
-            throw CsvFormatException("不是本应用导出的 CSV：缺少数据列（voltage_v / current_ma / power_w）")
+            throw CsvFormatException(appString(R.string.error_csv_missing_data_column))
         }
 
         val capacity = (lines.size - headerLineIdx - 1).coerceIn(0, MAX_ROWS)
@@ -188,7 +190,9 @@ object CsvImporter {
             )
         }
 
-        if (out.isEmpty()) throw CsvFormatException("未解析到有效采样行（丢弃 $skipped 行）")
+        if (out.isEmpty()) {
+            throw CsvFormatException(appString(R.string.error_csv_no_valid_rows, skipped))
+        }
         // 曲线 X 轴按时间比例映射，乱序文件会让折线回折，故统一升序
         out.sortBy { it.timeMillis }
         return Result(out, skipped)

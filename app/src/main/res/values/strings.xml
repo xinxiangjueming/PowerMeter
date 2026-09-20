@@ -1,3 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
+
+    <!-- ==================== 通用 ==================== -->
+
     <string name="app_name">功率监测</string>
+
+    <!-- 数值段之间的间隔符（加引号保留首尾空格，aapt 默认会裁掉） -->
+    <string name="sep_dot">" · "</string>
+
+    <string name="action_settings">设置</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_confirm">确定</string>
+    <string name="action_retry">重试</string>
+    <string name="action_authorize">授权</string>
+    <string name="empty_no_samples">暂无采样数据</string>
+
+    <!-- ==================== 顶栏 / 主界面状态 ==================== -->
+
+    <string name="status_sampling">采样中 · 每 %1$dms</string>
+    <string name="status_stopped">已停止</string>
+
+    <!-- ==================== 主功率卡 ==================== -->
+
+    <string name="hero_waiting">等待采样</string>
+    <string name="hero_charging">充电中</string>
+    <string name="hero_discharging">放电中</string>
+    <string name="hero_soc">SOC %1$d%%</string>
+    <string name="hero_remaining">剩余 %1$s mAh</string>
+
+    <!-- ==================== 指标 ==================== -->
+
+    <string name="metric_power">功率</string>
+    <string name="metric_voltage">电压</string>
+    <string name="metric_current">电流</string>
+    <string name="metric_temp">温度</string>
+    <string name="metric_battery_temp">电池温度</string>
+    <string name="metric_ocv">开路电压</string>
+    <string name="metric_usb_temp">接口温度</string>
+    <string name="metric_charger_ic_temp">充电 IC 温度</string>
+
+    <!-- ==================== 趋势 ==================== -->
+
+    <string name="title_trend">趋势</string>
+    <string name="action_color">颜色</string>
+    <!-- %1$s = 指标名（功率 / 电压 / 电流 / 温度） -->
+    <string name="color_sheet_title">%1$s曲线颜色</string>
+    <string name="label_quick_pick">快速选择</string>
+
+    <!-- ==================== 导入提示条 ==================== -->
+
+    <string name="import_banner_title">查看导入的 CSV</string>
+    <!-- %1$s = 文件名，%2$d = 记录条数 -->
+    <string name="import_banner_count">%1$s · %2$d 条</string>
+    <string name="action_exit_import">退出查看</string>
+
+    <!-- ==================== 统计卡 ==================== -->
+
+    <string name="title_stats">统计</string>
+    <string name="stat_sample_count">样本数</string>
+    <string name="stat_duration">时长</string>
+    <string name="stat_avg_power">平均功率</string>
+    <string name="stat_peak_charge">峰值充电</string>
+    <string name="stat_peak_discharge">峰值放电</string>
+    <string name="stat_voltage_range">电压范围</string>
+    <string name="stat_max_temp">最高温度</string>
+    <string name="stat_charged_total">累计充入</string>
+    <string name="stat_discharged_total">累计放出</string>
+
+    <!-- ==================== 电池信息卡 ==================== -->
+
+    <string name="title_battery">电池</string>
+    <string name="battery_type">类型</string>
+    <string name="battery_soh">健康度 SOH</string>
+    <string name="battery_cycle_count">循环次数</string>
+    <string name="value_times">%1$d 次</string>
+    <string name="battery_full_capacity">满充容量</string>
+    <string name="battery_design_capacity">设计容量</string>
+    <string name="battery_max_charge_level">最大充电档位</string>
+
+    <!-- ==================== 控制条 ==================== -->
+
+    <string name="action_start_sampling">开始采样</string>
+    <string name="action_stop_sampling">停止采样</string>
+    <string name="action_export_csv">导出 CSV</string>
+    <string name="action_clear_samples">清空采样数据</string>
+
+    <!-- ==================== 采样设置（bottom sheet） ==================== -->
+
+    <string name="title_settings">采样设置</string>
+    <string name="label_sampling_interval">采样间隔</string>
+
+    <string name="option_keep_sampling_on_lock">锁屏保持采样</string>
+    <string name="option_keep_sampling_on_lock_desc">用 CPU 唤醒锁换取息屏后采样连续；关闭时息屏间隔放宽到 5s，更省电</string>
+
+    <string name="option_charge_monitor">充电功率监测</string>
+    <string name="option_charge_monitor_desc">点击开始采样 5s 后熄灭屏幕；充电功率低于 1W 且持续超过 5min 时自动保存 CSV 文件（不停止采样）</string>
+
+    <string name="option_series_dual_battery">串联双电池</string>
+    <string name="option_series_dual_battery_desc">内核上报单节电压，串联机型整组电压 ×2，功率随之 ×2（小米机器不需要开启）</string>
+
+    <string name="title_data_access_permission">数据读取权限</string>
+    <string name="shizuku_ready">已就绪 · 以 shell 身份读取底层节点</string>
+    <string name="shizuku_connecting">已授权 · 正在连接 Shizuku 服务…</string>
+    <string name="shizuku_not_granted">Shizuku 正在运行 · 尚未授权本应用</string>
+    <string name="shizuku_not_found">未检测到 Shizuku（已 root 设备可忽略此项）</string>
+
+    <!-- ==================== 前台服务：通知 ==================== -->
+
+    <string name="channel_name_sampling">实时功率采样</string>
+    <string name="channel_desc_sampling">锁屏后持续读取底层电量节点</string>
+    <string name="notify_starting">正在启动采样…</string>
+    <string name="notify_title_charging">充电中 · %1$d%%</string>
+    <string name="notify_title_discharging">放电中 · %1$d%%</string>
+    <!-- %1$s = 文件名，%2$d = 记录条数 -->
+    <string name="notify_auto_saved">已自动保存 %1$s（%2$d 条记录，采样继续）</string>
+    <string name="notify_auto_save_failed">自动保存失败，采样继续</string>
+
+    <!-- 前台服务 specialUse 子类型（Manifest 的 property 值，系统「正在运行的服务」页可见） -->
+    <string name="fgs_special_use_subtype">读取 /sys/class/power_supply 与燃料计底层节点，持续监测充放电功率、电压、电流与温度</string>
+
+    <!-- ==================== Toast / 错误提示 ==================== -->
+
+    <string name="toast_notification_permission_required">需要通知权限才能在锁屏后常驻采样</string>
+    <string name="toast_start_service_failed">启动采样服务失败：%1$s</string>
+    <string name="toast_no_data">暂无采样数据</string>
+    <string name="toast_export_done">已导出：Download/PowerMeter/%1$s</string>
+    <string name="toast_export_failed">导出失败</string>
+
+    <string name="toast_file_too_large">文件过大，无法作为采样数据打开</string>
+    <string name="toast_not_csv">只能打开 CSV 文件</string>
+    <!-- 拼接在「已打开 N 条采样记录」之后 -->
+    <string name="import_dropped_rows">，丢弃 %1$d 行</string>
+    <string name="toast_import_done">已打开 %1$d 条采样记录%2$s</string>
+    <string name="toast_open_failed">打开失败：%1$s</string>
+
+    <string name="error_read_failed">读取失败</string>
+
+    <!-- ==================== 取数通道错误（RootPowerReader.lastError，显示在错误卡） ==================== -->
+
+    <string name="error_no_access">无 root 权限，且未安装/运行 Shizuku —— 无法读取底层电量节点</string>
+    <string name="error_shizuku_service_not_ready">Shizuku 已授权但服务未就绪（正在自动重试绑定）</string>
+    <string name="error_shizuku_not_granted">Shizuku 正在运行但本应用未获授权，请在「采样设置」里授权</string>
+    <!-- %1$s = 电池节点目录，%2$s = 当前通道身份名 -->
+    <string name="error_voltage_node_unreadable">读不到 %1$s/voltage_now —— %2$s身份无法打开该节点（机型节点路径不同，或受 SELinux 限制）</string>
+    <!-- %1$s = 电池节点目录，%2$s = 命令通道名，%3$s = 原始输出摘要 -->
+    <string name="error_parse_failed">解析失败：%1$s/voltage_now 为空或非数字（通道：%2$s）。原始输出：%3$s</string>
+    <string name="error_no_command_output">命令未返回</string>
+    <string name="error_binder_no_output">%1$s；binder 兜底命令未返回输出</string>
+    <string name="error_binder_missing_voltage">%1$s；binder 兜底输出缺少电压字段。原始输出：%2$s</string>
+
+    <string name="access_mode_shizuku">Shizuku(shell)</string>
+    <string name="access_mode_root">root</string>
+    <string name="access_mode_none">无权限</string>
+    <string name="channel_awk">awk</string>
+    <string name="channel_shell_loop">shell 循环</string>
+
+    <!-- ==================== CSV 解析错误（CsvFormatException.message，Toast 展示） ==================== -->
+
+    <string name="error_csv_unreadable">无法读取该文件</string>
+    <string name="error_csv_empty">文件内容为空</string>
+    <string name="error_csv_missing_time_column">不是本应用导出的 CSV：缺少时间列（timestamp / datetime）</string>
+    <string name="error_csv_missing_data_column">不是本应用导出的 CSV：缺少数据列（voltage_v / current_ma / power_w）</string>
+    <string name="error_csv_no_valid_rows">未解析到有效采样行（丢弃 %1$d 行）</string>
+
 </resources>

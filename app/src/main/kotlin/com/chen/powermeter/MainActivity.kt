@@ -20,6 +20,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.chen.powermeter.R
 import com.chen.powermeter.data.BatteryInfoStore
 import com.chen.powermeter.data.CsvImporter
 import com.chen.powermeter.data.ImportedSeries
@@ -40,7 +41,11 @@ class MainActivity : ComponentActivity() {
     private val requestNotificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) launchService()
-            else Toast.makeText(this, "需要通知权限才能在锁屏后常驻采样", Toast.LENGTH_SHORT).show()
+            else Toast.makeText(
+                this,
+                getString(R.string.toast_notification_permission_required),
+                Toast.LENGTH_SHORT,
+            ).show()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -192,11 +197,11 @@ class MainActivity : ComponentActivity() {
             val check = withContext(Dispatchers.IO) { CsvImporter.quickCheck(this@MainActivity, uri) }
             when (check) {
                 CsvImporter.QuickCheck.TOO_LARGE -> {
-                    toast("文件过大，无法作为采样数据打开")
+                    toast(getString(R.string.toast_file_too_large))
                     return@launch
                 }
                 CsvImporter.QuickCheck.NOT_CSV -> {
-                    toast("只能打开 CSV 文件")
+                    toast(getString(R.string.toast_not_csv))
                     return@launch
                 }
                 CsvImporter.QuickCheck.OK -> Unit
@@ -208,11 +213,20 @@ class MainActivity : ComponentActivity() {
             result
                 .onSuccess { parsed ->
                     ImportedSeries.set(queryDisplayName(uri), parsed.samples)
-                    val dropped = if (parsed.skippedRows > 0) "，丢弃 ${parsed.skippedRows} 行" else ""
-                    toast("已打开 ${parsed.samples.size} 条采样记录$dropped")
+                    val dropped = if (parsed.skippedRows > 0) {
+                        getString(R.string.import_dropped_rows, parsed.skippedRows)
+                    } else {
+                        ""
+                    }
+                    toast(getString(R.string.toast_import_done, parsed.samples.size, dropped))
                 }
                 .onFailure { e ->
-                    toast("打开失败：${e.message ?: e.javaClass.simpleName}")
+                    toast(
+                        getString(
+                            R.string.toast_open_failed,
+                            e.message ?: e.javaClass.simpleName,
+                        ),
+                    )
                 }
         }
     }
@@ -248,7 +262,11 @@ class MainActivity : ComponentActivity() {
         runCatching {
             ContextCompat.startForegroundService(this, intent)
         }.onFailure {
-            Toast.makeText(this, "启动采样服务失败：${it.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                getString(R.string.toast_start_service_failed, it.message),
+                Toast.LENGTH_LONG,
+            ).show()
         }
     }
 
@@ -261,7 +279,7 @@ class MainActivity : ComponentActivity() {
         // 与界面所见一致（否则容易导出后才发现拿错了数据）
         val list = ImportedSeries.samples.value.ifEmpty { SamplingService.snapshot() }
         if (list.isEmpty()) {
-            toast("暂无采样数据")
+            toast(getString(R.string.toast_no_data))
             return
         }
         // ⚠️ 不能在主线程导出：CsvExporter 内含 MediaStore insert / openOutputStream /
@@ -271,7 +289,11 @@ class MainActivity : ComponentActivity() {
             val uri = withContext(Dispatchers.IO) { CsvExporter.export(this@MainActivity, list) }
             // Toast 回到主线程弹（lifecycleScope 默认 Dispatchers.Main）
             toast(
-                if (uri != null) "已导出：Download/PowerMeter/${uri.lastPathSegment}" else "导出失败",
+                if (uri != null) {
+                    getString(R.string.toast_export_done, uri.lastPathSegment)
+                } else {
+                    getString(R.string.toast_export_failed)
+                },
             )
         }
     }

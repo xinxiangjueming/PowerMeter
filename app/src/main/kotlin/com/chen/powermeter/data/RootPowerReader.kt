@@ -1,7 +1,9 @@
 package com.chen.powermeter.data
 
 import android.content.Context
+import com.chen.powermeter.R
 import com.chen.powermeter.util.ShizukuHelper
+import com.chen.powermeter.util.appString
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.concurrent.TimeUnit
@@ -207,11 +209,11 @@ object RootPowerReader {
         accessMode = AccessMode.NONE
         lastError = when {
             ShizukuHelper.available.value && ShizukuHelper.granted.value ->
-                "Shizuku 已授权但服务未就绪（正在自动重试绑定）"
+                appString(R.string.error_shizuku_service_not_ready)
             ShizukuHelper.available.value ->
-                "Shizuku 正在运行但本应用未获授权，请在「采样设置」里授权"
+                appString(R.string.error_shizuku_not_granted)
             else ->
-                "无 root 权限，且未安装/运行 Shizuku —— 无法读取底层电量节点"
+                appString(R.string.error_no_access)
         }
         return false
     }
@@ -329,8 +331,11 @@ object RootPowerReader {
         // 节点可读性自检：失败时给出**准确**原因（目录不存在 / 路径不符 / 身份不足以读该节点），
         // 而不是让下游笼统地报"解析失败"。
         if (!detectBatteryDir()) {
-            lastError = "读不到 $batteryDir/voltage_now —— " +
-                "${accessModeLabel()}身份无法打开该节点（机型节点路径不同，或受 SELinux 限制）"
+            lastError = appString(
+                R.string.error_voltage_node_unreadable,
+                batteryDir,
+                accessModeLabel(),
+            )
             return null
         }
 
@@ -345,12 +350,12 @@ object RootPowerReader {
         // 快路径：单进程 awk 一次读完（本机实测 0.01s）
         val fastOut = exec(awkDump(entries))
         var out = fastOut
-        var channel = "awk"
+        var channel = appString(R.string.channel_awk)
         var sample = fastOut?.let { parse(it, tz) }
 
         // 回退：个别 ROM 裁剪了 /system/bin/awk 或行为异常 → 退回逐文件 shell 循环（实测 1.4s）
         if (sample == null) {
-            channel = "shell 循环"
+            channel = appString(R.string.channel_shell_loop)
             out = exec(legacyDump(tz))
             sample = out?.let { parse(it, tz) }
         }
@@ -358,8 +363,12 @@ object RootPowerReader {
         if (sample == null) {
             // 自检通过却仍解析不出电压，只可能是"节点存在但内容为空/非数字"，或两条命令通道都失败。
             // 把通道名与原始输出摘要带上，用户截图即可定位（无需再装 logcat）。
-            lastError = "解析失败：$batteryDir/voltage_now 为空或非数字" +
-                "（通道：$channel）。原始输出：${out?.asSummary() ?: "命令未返回"}"
+            lastError = appString(
+                R.string.error_parse_failed,
+                batteryDir,
+                channel,
+                out?.asSummary() ?: appString(R.string.error_no_command_output),
+            )
         }
         return sample
     }
@@ -401,11 +410,15 @@ object RootPowerReader {
     private fun readViaShellBinder(): PowerSample? {
         val sysfsError = lastError
         val out = exec(binderDump()) ?: run {
-            lastError = "$sysfsError；binder 兜底命令未返回输出"
+            lastError = appString(R.string.error_binder_no_output, sysfsError)
             return null
         }
         val sample = parseBinder(out, thermalIndex) ?: run {
-            lastError = "$sysfsError；binder 兜底输出缺少电压字段。原始输出：${out.asSummary()}"
+            lastError = appString(
+                R.string.error_binder_missing_voltage,
+                sysfsError,
+                out.asSummary(),
+            )
             return null
         }
         // 温感区温度不再跟着本命令每样本 fork，改由低频缓存补齐（见 thermalTempsForBinder）
@@ -550,9 +563,9 @@ object RootPowerReader {
 
     /** 当前通道的可读名称，用于拼装用户可理解的错误文案 */
     private fun accessModeLabel(): String = when (accessMode) {
-        AccessMode.SHIZUKU -> "Shizuku(shell)"
-        AccessMode.ROOT -> "root"
-        AccessMode.NONE -> "无权限"
+        AccessMode.SHIZUKU -> appString(R.string.access_mode_shizuku)
+        AccessMode.ROOT -> appString(R.string.access_mode_root)
+        AccessMode.NONE -> appString(R.string.access_mode_none)
     }
 
     /** 把原始输出压成单行摘要（供 UI 显示，便于定位"读不到 / 路径不符"） */

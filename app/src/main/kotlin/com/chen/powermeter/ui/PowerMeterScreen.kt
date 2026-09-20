@@ -2,6 +2,16 @@ package com.chen.powermeter.ui
 
 import android.content.res.Configuration
 import android.os.Build
+import androidx.annotation.StringRes
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -60,13 +70,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.chen.powermeter.R
 import com.chen.powermeter.data.BatteryInfo
 import com.chen.powermeter.data.PowerSample
 import com.chen.powermeter.data.RootPowerReader
@@ -93,14 +106,31 @@ import java.util.Locale
  */
 private val NumericFontFamily = FontFamily.Monospace
 
+/**
+ * 指标网格「卡片显隐」过渡时长（进入 300ms / 退出 250ms）。
+ *
+ * 场景是 binder 兜底时的**一次性**布局切换（第二行整行收起 + 第二列内容互换），
+ * 不是每帧触发的动画；曲线取 FastOutSlowInEasing（M3 Standard 口径），与 miuix 观感一致。
+ */
+private const val GRID_ENTER_MS = 300
+private const val GRID_EXIT_MS = 250
+
 private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
 
 private fun Double?.f3OrDash(): String = this?.f3() ?: "—"
 
-/** 温度类（电池/接口/最高温度）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余温度仍 3 位 */
+/** 温度类（电池/最高温度）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余温度仍 3 位 */
 private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 
 private fun Double?.f1OrDash(): String = this?.f1() ?: "—"
+
+/**
+ * 整数档（2026-09-21 用户约定）：用于底层分辨率只到个位的量 —— 电流 mA（内核只上报 mA 整数）、
+ * 接口温度、剩余 / 满充 / 设计容量 mAh。显示与 CSV 记录同口径。
+ */
+private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
+
+private fun Double?.f0OrDash(): String = this?.f0() ?: "—"
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -290,12 +320,16 @@ fun PowerMeterScreen(
                 title = {
                     Column {
                         Text(
-                            "功率监测",
+                            stringResource(R.string.app_name),
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                         )
                         Text(
-                        if (running) "采样中 · 每 ${intervalMs}ms" else "已停止",
+                        if (running) {
+                            stringResource(R.string.status_sampling, intervalMs)
+                        } else {
+                            stringResource(R.string.status_stopped)
+                        },
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontFamily = NumericFontFamily,
@@ -315,7 +349,10 @@ fun PowerMeterScreen(
                         shape = RoundedCornerShape(50),
                         contentPadding = PaddingValues(horizontal = 16.dp),
                     ) {
-                        Text("设置", style = MaterialTheme.typography.labelLarge)
+                        Text(
+                            stringResource(R.string.action_settings),
+                            style = MaterialTheme.typography.labelLarge,
+                        )
                     }
                 },
             )
@@ -345,7 +382,7 @@ fun PowerMeterScreen(
 
     colorTarget?.let { target ->
         ColorPickerSheet(
-            title = "${target.label}曲线颜色",
+            title = stringResource(R.string.color_sheet_title, target.label()),
             initialColor = rememberMetricColor(target),
             onPick = { picked ->
                 ChartColors.set(context, target, picked)
@@ -405,13 +442,13 @@ private fun ImportBanner(
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    "查看导入的 CSV",
+                    stringResource(R.string.import_banner_title),
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    "$fileName · $count 条",
+                    stringResource(R.string.import_banner_count, fileName, count),
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = NumericFontFamily,
                     color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f),
@@ -425,7 +462,10 @@ private fun ImportBanner(
                 shape = RoundedCornerShape(50),
                 contentPadding = PaddingValues(horizontal = 16.dp),
             ) {
-                Text("退出查看", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    stringResource(R.string.action_exit_import),
+                    style = MaterialTheme.typography.labelLarge,
+                )
             }
         }
     }
@@ -463,9 +503,9 @@ private fun HeroPowerCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     when {
-                        sample == null -> "等待采样"
-                        charging -> "充电中"
-                        else -> "放电中"
+                        sample == null -> stringResource(R.string.hero_waiting)
+                        charging -> stringResource(R.string.hero_charging)
+                        else -> stringResource(R.string.hero_discharging)
                     },
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -504,9 +544,14 @@ private fun HeroPowerCard(
             Spacer(Modifier.height(6.dp))
             Text(
                 buildString {
-                    append("SOC ${sample?.socPct ?: 0}%")
-                    sample?.chargeType?.takeIf { it.isNotBlank() }?.let { append(" · $it") }
-                    sample?.remainingMah?.let { append(" · 剩余 ${it.f3()} mAh") }
+                    append(stringResource(R.string.hero_soc, sample?.socPct ?: 0))
+                    sample?.chargeType?.takeIf { it.isNotBlank() }?.let {
+                        append(stringResource(R.string.sep_dot)).append(it)
+                    }
+                    sample?.remainingMah?.let {
+                        append(stringResource(R.string.sep_dot))
+                        append(stringResource(R.string.hero_remaining, it.f3()))
+                    }
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -523,24 +568,57 @@ private fun MetricGrid(sample: PowerSample?, shape: RoundedCornerShape) {
     // Shizuku binder 兜底（sysfs 被 SELinux 拦截的机器）拿不到接口/充电 IC 温度：
     // 开路电压顶替接口温度的位置，接口温度与充电 IC 温度两张卡片隐藏（用户拍板 2026-09-21）
     val binderFallback by RootPowerReader.binderFallback.collectAsState()
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    // 「显隐」是一次性布局切换（点开始采样后 binder 兜底生效那一次），不是每帧动画；
+    // 曲线取 FastOutSlowInEasing（M3 Standard 口径），进入略长于退出。
+    val enterFade = remember { tween<Float>(GRID_ENTER_MS, easing = FastOutSlowInEasing) }
+    // expandVertically / shrinkVertically 的 animationSpec 是 FiniteAnimationSpec<IntSize>（按整体尺寸补间），不是 Int
+    val enterSize = remember { tween<IntSize>(GRID_ENTER_MS, easing = FastOutSlowInEasing) }
+    val exitFade = remember { tween<Float>(GRID_EXIT_MS, easing = FastOutSlowInEasing) }
+    val exitSize = remember { tween<IntSize>(GRID_EXIT_MS, easing = FastOutSlowInEasing) }
+    val lVoltage = stringResource(R.string.metric_voltage)
+    val lCurrent = stringResource(R.string.metric_current)
+    val lBatteryTemp = stringResource(R.string.metric_battery_temp)
+    val lOcv = stringResource(R.string.metric_ocv)
+    val lUsbTemp = stringResource(R.string.metric_usb_temp)
+    val lChargerIcTemp = stringResource(R.string.metric_charger_ic_temp)
+    // ⚠️ 外层 Column **不能**用 verticalArrangement.spacedBy：被隐藏的分支也占一份 spacing，
+    //    第三行收起后会残留 12dp 空隙。间距改由显式 Spacer 与 AnimatedVisibility **内容自带**
+    //    的 top padding 承担，高度动画才能干净地归零。
+    Column {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricCard("电压", sample?.voltageV.f3OrDash(), "V", shape, Modifier.weight(1f))
-            MetricCard("电流", sample?.currentMa.f3OrDash(), "mA", shape, Modifier.weight(1f))
+            MetricCard(lVoltage, sample?.voltageV.f3OrDash(), "V", shape, Modifier.weight(1f))
+            MetricCard(lCurrent, sample?.currentMa.f0OrDash(), "mA", shape, Modifier.weight(1f))
         }
-        if (binderFallback) {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                MetricCard("电池温度", sample?.tempBatteryC.f1OrDash(), "℃", shape, Modifier.weight(1f))
-                MetricCard("开路电压", sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.weight(1f))
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            MetricCard(lBatteryTemp, sample?.tempBatteryC.f1OrDash(), "℃", shape, Modifier.weight(1f))
+            // 同一个格子内换内容：接口温度 ↔ 开路电压。两张卡结构一致（高度相同），
+            // 交叉淡入淡出即可；加 SizeTransform 反而会让容器尺寸抖一下。
+            AnimatedContent(
+                targetState = binderFallback,
+                modifier = Modifier.weight(1f),
+                transitionSpec = { fadeIn(enterFade) togetherWith fadeOut(exitFade) },
+                label = "slotOcvOrUsbTemp",
+            ) { fallback ->
+                if (fallback) {
+                    MetricCard(lOcv, sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.fillMaxWidth())
+                } else {
+                    MetricCard(lUsbTemp, sample?.tempUsbC.f0OrDash(), "℃", shape, Modifier.fillMaxWidth())
+                }
             }
-        } else {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                MetricCard("电池温度", sample?.tempBatteryC.f1OrDash(), "℃", shape, Modifier.weight(1f))
-                MetricCard("接口温度", sample?.tempUsbC.f1OrDash(), "℃", shape, Modifier.weight(1f))
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                MetricCard("开路电压", sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.weight(1f))
-                MetricCard("充电 IC 温度", sample?.tempChargerC.f3OrDash(), "℃", shape, Modifier.weight(1f))
+        }
+        // 整行出现 / 消失：透明度与高度一起过渡，从顶边收起（不是向中间塌陷）
+        AnimatedVisibility(
+            visible = !binderFallback,
+            enter = fadeIn(enterFade) + expandVertically(enterSize, expandFrom = Alignment.Top),
+            exit = fadeOut(exitFade) + shrinkVertically(exitSize, shrinkTowards = Alignment.Top),
+        ) {
+            Row(
+                modifier = Modifier.padding(top = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                MetricCard(lOcv, sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.weight(1f))
+                MetricCard(lChargerIcTemp, sample?.tempChargerC.f3OrDash(), "℃", shape, Modifier.weight(1f))
             }
         }
     }
@@ -602,8 +680,12 @@ private fun MetricCard(
  * 需复用同一枚举与 [TrendChart]（见 TrendChartView.kt），
  * 避免两处各写一套导致口径/配色分叉。
  */
-internal enum class Metric(val label: String) {
-    POWER("功率"), VOLTAGE("电压"), CURRENT("电流"), TEMP("温度");
+internal enum class Metric(@StringRes val labelRes: Int) {
+    POWER(R.string.metric_power),
+    VOLTAGE(R.string.metric_voltage),
+    CURRENT(R.string.metric_current),
+    TEMP(R.string.metric_temp),
+    ;
 
     fun value(s: PowerSample): Double = when (this) {
         POWER -> s.powerW
@@ -612,6 +694,16 @@ internal enum class Metric(val label: String) {
         TEMP -> s.tempBatteryC
     }
 }
+
+/**
+ * 指标名的本地化文本。
+ *
+ * 做成 Composable 扩展而非枚举字段，是因为枚举常量初始化拿不到 Context；
+ * 拿不到 Composable 上下文的地方（如 `remember` 的计算 lambda）改用
+ * `LocalContext.current.getString(metric.labelRes)`。
+ */
+@Composable
+internal fun Metric.label(): String = stringResource(labelRes)
 
 @Composable
 internal fun TrendCard(
@@ -639,7 +731,7 @@ internal fun TrendCard(
             // 标题 Text.align(Center) 占满整宽居中，按钮 Box.align(CenterEnd) 贴右，二者叠加不冲突
             Box(Modifier.fillMaxWidth()) {
                 Text(
-                    "趋势",
+                    stringResource(R.string.title_trend),
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.align(Alignment.Center),
                 )
@@ -650,7 +742,7 @@ internal fun TrendCard(
                     // 底色 = 当前曲线色，一眼看出"这根线是什么颜色"；
                     // 文字颜色按亮度反算（色值由用户自由指定，不能像 SportLink 那样写死白色）
                     ChartPillButton(
-                        text = "颜色",
+                        text = stringResource(R.string.action_color),
                         background = metricColor,
                         contentColor = onColorFor(metricColor),
                         onClick = onColorClick,
@@ -664,7 +756,7 @@ internal fun TrendCard(
                     FilterChip(
                         selected = metric == m,
                         onClick = { onMetricChange(m) },
-                        label = { Text(m.label) },
+                        label = { Text(m.label()) },
                         shape = RoundedCornerShape(50),
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
@@ -677,7 +769,7 @@ internal fun TrendCard(
             // —— 单指直接拖动会与页面竖直滚动抢手势
             TrendChart(
                 samples = samples,
-                series = listOf(metric.toSeries(samples, metricColor)),
+                series = listOf(metric.toSeries(samples, metricColor, metric.label())),
             )
         }
     }
@@ -804,21 +896,30 @@ private fun StatsCard(stats: SessionStats, shape: RoundedCornerShape) {
     ) {
         Column(Modifier.padding(16.dp)) {
             Text(
-                "统计",
+                stringResource(R.string.title_stats),
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.fillMaxWidth(),
                 textAlign = TextAlign.Center,
             )
             Spacer(Modifier.height(10.dp))
-            StatRow("样本数", "${stats.sampleCount}")
-            StatRow("时长", formatDuration(stats.durationMs))
-            StatRow("平均功率", "${stats.avgPowerW.f3()} W")
-            StatRow("峰值充电", "${stats.peakChargeW.f3()} W")
-            StatRow("峰值放电", "${stats.peakDischargeW.f3()} W")
-            StatRow("电压范围", "${stats.minVoltageV.f3()} ~ ${stats.maxVoltageV.f3()} V")
-            StatRow("最高温度", "${stats.maxTempC.f1()} ℃")
-            StatRow("累计充入", "${stats.chargedMah.f3()} mAh · ${stats.chargedWh.f3()} Wh")
-            StatRow("累计放出", "${stats.dischargedMah.f3()} mAh · ${stats.dischargedWh.f3()} Wh")
+            StatRow(stringResource(R.string.stat_sample_count), "${stats.sampleCount}")
+            StatRow(stringResource(R.string.stat_duration), formatDuration(stats.durationMs))
+            StatRow(stringResource(R.string.stat_avg_power), "${stats.avgPowerW.f3()} W")
+            StatRow(stringResource(R.string.stat_peak_charge), "${stats.peakChargeW.f3()} W")
+            StatRow(stringResource(R.string.stat_peak_discharge), "${stats.peakDischargeW.f3()} W")
+            StatRow(
+                stringResource(R.string.stat_voltage_range),
+                "${stats.minVoltageV.f3()} ~ ${stats.maxVoltageV.f3()} V",
+            )
+            StatRow(stringResource(R.string.stat_max_temp), "${stats.maxTempC.f1()} ℃")
+            StatRow(
+                stringResource(R.string.stat_charged_total),
+                "${stats.chargedMah.f3()} mAh · ${stats.chargedWh.f3()} Wh",
+            )
+            StatRow(
+                stringResource(R.string.stat_discharged_total),
+                "${stats.dischargedMah.f3()} mAh · ${stats.dischargedWh.f3()} Wh",
+            )
         }
     }
 }
@@ -864,18 +965,29 @@ private fun BatteryInfoCard(info: BatteryInfo, shape: RoundedCornerShape) {
     ) {
         Column(Modifier.padding(16.dp)) {
             Text(
-                "电池",
+                stringResource(R.string.title_battery),
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.fillMaxWidth(),
                 textAlign = TextAlign.Center,
             )
             Spacer(Modifier.height(10.dp))
-            info.technology?.let { StatRow("类型", it) }
-            info.sohPct?.let { StatRow("健康度 SOH", "$it%") }
-            info.cycleCount?.let { StatRow("循环次数", "$it 次") }
-            info.fullMah?.let { StatRow("满充容量", "${it.f3()} mAh") }
-            info.designMah?.let { StatRow("设计容量", "${it.f3()} mAh") }
-            info.maxChargeW?.let { StatRow("最大充电档位", "${it.f3()} W") }
+            info.technology?.let { StatRow(stringResource(R.string.battery_type), it) }
+            info.sohPct?.let { StatRow(stringResource(R.string.battery_soh), "$it%") }
+            info.cycleCount?.let {
+                StatRow(
+                    stringResource(R.string.battery_cycle_count),
+                    stringResource(R.string.value_times, it),
+                )
+            }
+            info.fullMah?.let {
+                StatRow(stringResource(R.string.battery_full_capacity), "${it.f0()} mAh")
+            }
+            info.designMah?.let {
+                StatRow(stringResource(R.string.battery_design_capacity), "${it.f0()} mAh")
+            }
+            info.maxChargeW?.let {
+                StatRow(stringResource(R.string.battery_max_charge_level), "${it.f3()} W")
+            }
         }
     }
 }
@@ -907,14 +1019,20 @@ private fun ControlRow(
                 },
             ),
         ) {
-            Text(if (running) "停止采样" else "开始采样")
+            Text(
+                if (running) {
+                    stringResource(R.string.action_stop_sampling)
+                } else {
+                    stringResource(R.string.action_start_sampling)
+                },
+            )
         }
         FilledTonalButton(
             onClick = onExport,
             modifier = Modifier.height(56.dp),
             shape = RoundedCornerShape(50),
         ) {
-            Text("导出 CSV")
+            Text(stringResource(R.string.action_export_csv))
         }
     }
 }
@@ -996,7 +1114,7 @@ private fun SettingsSheet(
                 )
             }
             Text(
-                "采样设置",
+                stringResource(R.string.title_settings),
                 modifier = Modifier.fillMaxWidth(),
                 textAlign = TextAlign.Center,
                 style = MaterialTheme.typography.titleLarge,
@@ -1004,7 +1122,7 @@ private fun SettingsSheet(
             )
             Spacer(Modifier.height(16.dp))
             Text(
-                "采样间隔",
+                stringResource(R.string.label_sampling_interval),
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1026,9 +1144,12 @@ private fun SettingsSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("锁屏保持采样", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "用 CPU 唤醒锁换取息屏后采样连续；关闭时息屏间隔放宽到 5s，更省电",
+                        stringResource(R.string.option_keep_sampling_on_lock),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        stringResource(R.string.option_keep_sampling_on_lock_desc),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1042,9 +1163,12 @@ private fun SettingsSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("充电功率监测", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "点击开始采样 5s 后熄灭屏幕；充电功率低于 1W 且持续超过 5min 时自动保存 CSV 文件（不停止采样）",
+                        stringResource(R.string.option_charge_monitor),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        stringResource(R.string.option_charge_monitor_desc),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1058,9 +1182,12 @@ private fun SettingsSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("串联双电池", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "内核上报单节电压，串联机型整组电压 ×2，功率随之 ×2（小米机器不需要开启）",
+                        stringResource(R.string.option_series_dual_battery),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        stringResource(R.string.option_series_dual_battery_desc),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1076,10 +1203,26 @@ private fun SettingsSheet(
             // 非 root 机器必须装 Shizuku 并授权，才能以 shell 身份读 /sys 电量节点；
             // 已 root 设备走 su 通道，本节显示「未检测到 Shizuku」可忽略。
             val shizukuUi: Triple<String, String?, (() -> Unit)?> = when {
-                shizukuBound -> Triple("已就绪 · 以 shell 身份读取底层节点", null, null)
-                shizukuAvailable && shizukuGranted -> Triple("已授权 · 正在连接 Shizuku 服务…", "重试", onShizukuRetry)
-                shizukuAvailable -> Triple("Shizuku 正在运行 · 尚未授权本应用", "授权", onShizukuRequest)
-                else -> Triple("未检测到 Shizuku（已 root 设备可忽略此项）", null, null)
+                shizukuBound -> Triple(
+                    stringResource(R.string.shizuku_ready),
+                    null,
+                    null,
+                )
+                shizukuAvailable && shizukuGranted -> Triple(
+                    stringResource(R.string.shizuku_connecting),
+                    stringResource(R.string.action_retry),
+                    onShizukuRetry,
+                )
+                shizukuAvailable -> Triple(
+                    stringResource(R.string.shizuku_not_granted),
+                    stringResource(R.string.action_authorize),
+                    onShizukuRequest,
+                )
+                else -> Triple(
+                    stringResource(R.string.shizuku_not_found),
+                    null,
+                    null,
+                )
             }
             Row(
                 Modifier.fillMaxWidth(),
@@ -1087,7 +1230,10 @@ private fun SettingsSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("数据读取权限", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        stringResource(R.string.title_data_access_permission),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
                     Text(
                         shizukuUi.first,
                         style = MaterialTheme.typography.bodySmall,
@@ -1111,7 +1257,7 @@ private fun SettingsSheet(
                 modifier = Modifier.fillMaxWidth().height(52.dp),
                 shape = RoundedCornerShape(corner),
             ) {
-                Text("清空采样数据")
+                Text(stringResource(R.string.action_clear_samples))
             }
             Spacer(Modifier.height(16.dp))
             Spacer(Modifier.windowInsetsBottomHeight(WindowInsets.safeDrawing))
