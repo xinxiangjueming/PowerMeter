@@ -115,8 +115,9 @@ private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
 
 /**
  * 按指标取小数位（2026-09-21 用户约定）：
- * 电流 → 整数；温度（电池）→ 1 位小数；其余（功率 / 电压 / OCV / 充电 IC 温度 /
- * PMIC 温度）→ 3 位。Y 轴刻度、图例量程、读数气泡三处共用，保证同一指标任何位置口径一致。
+ * 电流 → 整数；PMIC 温度 → 整数（温感区分辨率只到整度）；电池温度 → 1 位小数；
+ * 其余（功率 / 电压 / OCV / 充电 IC 温度）→ 3 位。
+ * Y 轴刻度、图例量程、读数气泡三处共用，保证同一指标任何位置口径一致。
  *
  * [Double.NaN] = 该点无读数（典型：PMIC 温度在旧版 15 列 CSV 里整列为空），统一渲染成
  * 破折号 —— 与指标卡片的 `f3OrDash` 同口径。不处理的话 `String.format` 会写出 "NaN"，
@@ -125,7 +126,8 @@ private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
 private fun Double.fMetric(metric: Metric?): String {
     if (isNaN()) return "—"
     return when (metric) {
-        Metric.CURRENT -> f0()
+        // 只到个位的量：电流 mA（内核只上报 mA 整数）与 PMIC 温度（温感区分辨率只到整度）
+        Metric.CURRENT, Metric.PMIC_TEMP -> f0()
         Metric.TEMP -> f1()
         else -> f3()
     }

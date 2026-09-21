@@ -147,19 +147,19 @@ object CsvExporter {
             s.chargeType,
             s.remainingMah?.f0() ?: "",
             s.usbVoltageV?.f3() ?: "",
-            s.tempPmicC?.f3() ?: "",
+            s.tempPmicC?.f0() ?: "",
             s.fullMah?.f0() ?: "",
             s.usbCurrentLimitMa?.f0() ?: "",
         ).joinToString(",") + "\n"
 
     private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
 
-    /** 温度类（电池）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余列仍 3 位 */
+    /** 温度类（电池）按用户约定取 1 位小数（2026-09-21）；充电 IC 温度取 3 位，接口 / PMIC 温度取整 */
     private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 
     /**
-     * 整数档（2026-09-21 用户约定）：电流 mA / 燃料计电流 mA / 接口温度 / 剩余容量 mAh
-     * / 满充容量 mAh / USB 限流 mA
+     * 整数档（2026-09-21 用户约定）：电流 mA / 燃料计电流 mA / 接口温度 / **PMIC 温度**
+     * （温感区分辨率只到整度）/ 剩余容量 mAh / 满充容量 mAh / USB 限流 mA
      * 分辨率只到个位，落盘与界面显示同口径（避免 CSV 里出现无意义的 .000 尾巴）。
      */
     private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)

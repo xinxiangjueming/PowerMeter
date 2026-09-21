@@ -120,7 +120,7 @@ private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
 
 private fun Double?.f3OrDash(): String = this?.f3() ?: "—"
 
-/** 温度类（电池/最高温度）按用户约定取 1 位小数（2026-09-21）；充电 IC 等其余温度仍 3 位 */
+/** 温度类（电池 / 最高温度）按用户约定取 1 位小数（2026-09-21）；充电 IC 温度取 3 位，接口温度取整 */
 private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 
 private fun Double?.f1OrDash(): String = this?.f1() ?: "—"
