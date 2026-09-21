@@ -15,7 +15,7 @@ android {
         minSdk = 30
         targetSdk = 36
         versionCode = 1
-        versionName = "1.0.1"
+        versionName = "1.0.2"
     }
 
     compileOptions {
@@ -79,6 +79,15 @@ dependencies {
     // 若日后解析出 org.jetbrains.compose.* 传递依赖导致 duplicate class，
     // 按上方 backdrop 的写法加同样的 exclude 即可（当前与 SportLink 实测配置一致，未加）。
     implementation(libs.yukonga.miuix.ui)
+
+    // Miuix Blur：弹窗内部毛玻璃 + 高光描边（textureBlur + Highlight）。与 SportLink 完全一致（0.9.2）。
+    // AAR minSdk=33 → 已在 Manifest 用 tools:overrideLibrary 放行，低版本由 isRuntimeShaderSupported
+    // 自动失效（textureBlur 退化为无效果，不崩）。同 miuix-ui 一样是 KMP 库，可能传递
+    // org.jetbrains.compose.*（CMP 版）产物，需按 backdrop 写法排除，改用项目自带 androidx.compose.*。
+    implementation(libs.yukonga.miuix.blur) {
+        exclude(group = "org.jetbrains.compose.foundation")
+        exclude(group = "org.jetbrains.compose.ui")
+    }
 
     // Shizuku：非 root 机器通过 adb（无线调试）授权，以 shell 身份读取 /sys 电量节点。
     // 版本与 fold 完全一致（13.1.5）。api = 宿主侧 SDK；provider = 声明 ShizukuProvider

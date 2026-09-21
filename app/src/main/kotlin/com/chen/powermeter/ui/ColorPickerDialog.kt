@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.SheetValue
@@ -116,6 +117,9 @@ internal fun Metric.seriesColor(custom: Map<String, Int>, primary: Color): Color
         Metric.VOLTAGE -> Color(0xFF2979FF)
         Metric.CURRENT -> Color(0xFF00E676)
         Metric.TEMP -> Color(0xFFFF9100)
+        // 充电 IC 温度（温感区 charger_therm0，非 root 也有）：青，与电池温度的橙、
+        // PMIC 温度的紫一眼可区分；取预置色板内的值，打开颜色面板时当前色会被直接高亮
+        Metric.CHARGER_TEMP -> Color(0xFF00BCD4)
         // PMIC 温度（仅真 root 机器出现）：紫，与电池温度的橙同属"读温度"但一眼可区分；
         // 取预置色板内的值，用户打开颜色面板时当前色会被直接高亮
         Metric.PMIC_TEMP -> Color(0xFF9C27B0)
@@ -303,4 +307,79 @@ internal fun ColorPickerSheet(
             Spacer(Modifier.windowInsetsBottomHeight(WindowInsets.safeDrawing))
         }
     }
+}
+
+/**
+ * 多曲线叠加时的「选曲线」弹窗（居中玻璃对话框，移植自 SportLink `SelectListDialog`）。
+ *
+ * 对齐 SportLink `ChartFullscreenActivity.showColorPickerForSelection()`：叠加多条曲线时点颜色按钮
+ * 先让用户挑"给哪条改色"，再打开颜色面板；否则颜色按钮只能改首条曲线，其余叠加曲线永远改不了色，
+ * 也永远不会出现"选择曲线"这一层 —— 即 2026-09-21 用户报告的「点击颜色没有设备选择弹窗」。
+ *
+ * ⚠️ 形态分工（用户拍板 2026-09-21）：
+ * - **选曲线**这一层 = 居中 `GlassDialog`（本函数，外部 Haze 模糊 + 内部 miuix 毛玻璃 + Highlight 描边）；
+ * - **颜色面板** [ColorPickerSheet] = 底部弹层（`ModalBottomSheet`），不是居中弹窗。
+ * 单列指标（只有一条曲线）时本弹窗不会被调用 —— 颜色按钮会直接打开 [ColorPickerSheet]。
+ *
+ * @param metrics 当前叠加的指标列表（调用方保证 size > 1 才打开本弹窗）
+ * @param onSelect 点某条曲线回调，参数为被选中的指标（随后由调用方打开 [ColorPickerSheet]）
+ * @param onDismiss 关闭（点遮罩 / 系统返回）回调
+ */
+@Composable
+internal fun CurveSelectSheet(
+    metrics: List<Metric>,
+    onSelect: (Metric) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val isDark = isSystemInDarkTheme()
+    // 行框线：浅色模式浅黑、深色模式浅白（与项目弹窗边框体系一致）
+    val borderColor = if (isDark) Color(0x22FFFFFF) else Color(0x1A000000)
+
+    GlassDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                stringResource(R.string.select_curve),
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+        },
+        text = {
+            Column(Modifier.fillMaxWidth()) {
+                metrics.forEach { m ->
+                    val dot = rememberMetricColor(m)
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(m) }
+                            .padding(vertical = 14.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        // 当前曲线色点：和 tab 上的色点同一个取色口径（rememberMetricColor）
+                        Box(
+                            Modifier
+                                .size(12.dp)
+                                .background(dot, RoundedCornerShape(50)),
+                        )
+                        Text(
+                            m.label(),
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
+                    // 行分隔：只画一条水平细线（除末行）。
+                    // ⚠️ 不能用 Modifier.border(shape = RoundedCornerShape(0.dp)) 冒充「下边框」——
+                    // border() 会给四条边都描边，于是每行被画成一个方角矩形框（即用户报告的
+                    // 「设备列是方角的」）。用 HorizontalDivider 只留底部一条线。
+                    if (m != metrics.last()) {
+                        HorizontalDivider(color = borderColor, thickness = 1.dp)
+                    }
+                }
+            }
+        },
+        // 列表类弹窗无按钮：点项即选、点遮罩/返回即关（与 SportLink SelectListDialog 同口径）
+        confirmButton = {},
+    )
 }

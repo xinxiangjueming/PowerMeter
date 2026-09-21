@@ -47,6 +47,8 @@
     <!-- %1$s = 指标名（功率 / 电压 / 电流 / 温度） -->
     <string name="color_sheet_title">%1$s曲线颜色</string>
     <string name="label_quick_pick">快速选择</string>
+    <!-- 多曲线叠加时，点颜色按钮先弹此列表挑选"给哪条曲线改色" -->
+    <string name="select_curve">选择曲线</string>
 
     <!-- ==================== 导入提示条 ==================== -->
 

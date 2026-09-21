@@ -40,6 +40,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -149,8 +150,8 @@ internal fun Metric.unitLabel(): String = when (this) {
     Metric.POWER -> "W"
     Metric.VOLTAGE -> "V"
     Metric.CURRENT -> "mA"
-    // 温度类共用量纲：电池温度与 PMIC 温度
-    Metric.TEMP, Metric.PMIC_TEMP -> "℃"
+    // 温度类共用量纲：电池温度 / 充电 IC 温度 / PMIC 温度
+    Metric.TEMP, Metric.CHARGER_TEMP, Metric.PMIC_TEMP -> "℃"
 }
 
 internal fun Metric.toSeries(samples: List<PowerSample>, color: Color, label: String): ChartSeries =
@@ -770,12 +771,7 @@ private fun ColumnScope.ChartBody(
                         .padding(horizontal = 10.dp, vertical = 6.dp),
                 ) {
                     Column {
-                        Text(
-                            formatBubbleTime(samples[idx].timeMillis),
-                            fontSize = 10.sp,
-                            fontFamily = ChartNumericFont,
-                            color = labelColor,
-                        )
+                        // 读数时间不放气泡里，改由底部 x 轴行贴读数竖线显示（见 XAxisTimeRow）
                         series.forEachIndexed { index, sr ->
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Box(
@@ -797,6 +793,23 @@ private fun ColumnScope.ChartBody(
             }
         }
     }
+
+    // x 轴时间（精确到秒）：常态标**可见窗口**两端，随缩放 / 平移实时更新；读数中改为贴竖线
+    // 显示**当前该点**的时间（读数气泡不再重复带时间）。全屏页位于「x 轴与底部滑条之间的空白区」
+    // ——即绘图区之后、ChartScrollbar 之前；卡片内嵌页无滑条，则直接贴在绘图区下方。
+    val axisScrubIdx = scrubIndex
+    val axisScrubbing = axisScrubIdx in samples.indices && axisScrubIdx in geom.visStart..geom.visEnd
+    XAxisTimeRow(
+        startMillis = geom.vT0,
+        endMillis = geom.vT0 + geom.vSpan,
+        cursorMillis = if (axisScrubbing) samples[axisScrubIdx].timeMillis else null,
+        cursorFraction = if (axisScrubbing) geom.xFractions[axisScrubIdx] else 0f,
+        leadingSpacePx = if (normalized) 0 else yAxisWidthPx,
+        plotWidthPx = plotWidthPx,
+        labelSp = axisLabelSp,
+        color = labelColor,
+        density = density,
+    )
 
     if (state != null) {
         Spacer(Modifier.height(6.dp))
@@ -956,6 +969,96 @@ private fun ChartScrollbar(
     }
 }
 
-private val BubbleTimeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
+/** x 轴时间的淡出时长（窗口起止 ↔ 读数点时间互切，短促即可，不影响读数手感） */
+private const val AXIS_TIME_FADE_MS = 120
 
-private fun formatBubbleTime(timeMillis: Long): String = BubbleTimeFormat.format(Date(timeMillis))
+/**
+ * x 轴时间行。
+ *
+ * - **常态**：只标**可见窗口**的两端时刻（精确到秒 `HH:mm:ss`），左端与绘图区左沿对齐
+ *   （`leadingSpacePx` = Y 轴刻度列宽；归一化叠加模式无 Y 轴刻度列，传 0）；
+ * - **读数中**（[cursorMillis] 非空）：两端淡出，改在**读数竖线正下方**显示当前该点的时间
+ *   —— 读数气泡不再重复携带时间（用户 2026-09-21 拍板：「上面数据窗口里面的时间就不需要了」）。
+ *
+ * ⚠️ 两种状态都是「单行 + 同字号」文本，行高一致 —— 切换时绘图区（weight(1f)）高度不跳动，
+ * 手指锚点不漂移、读数竖线不乱跑。故读数态**不移除本行**，只切换内容。
+ */
+@Composable
+private fun XAxisTimeRow(
+    startMillis: Long,
+    endMillis: Long,
+    cursorMillis: Long?,
+    cursorFraction: Float,
+    leadingSpacePx: Int,
+    plotWidthPx: Int,
+    labelSp: TextUnit,
+    color: Color,
+    density: androidx.compose.ui.unit.Density,
+) {
+    val windowAlpha by animateFloatAsState(
+        targetValue = if (cursorMillis != null) 0f else 1f,
+        animationSpec = tween(durationMillis = AXIS_TIME_FADE_MS),
+        label = "axisWindowTimeAlpha",
+    )
+    var cursorLabelWidthPx by remember { mutableIntStateOf(0) }
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (leadingSpacePx > 0) {
+            Spacer(Modifier.width(with(density) { leadingSpacePx.toDp() }))
+        }
+        Box(Modifier.weight(1f)) {
+            // 常态：可见窗口起止两端
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    formatClockTime(startMillis),
+                    modifier = Modifier.alpha(windowAlpha),
+                    fontSize = labelSp,
+                    fontFamily = ChartNumericFont,
+                    color = color,
+                    maxLines = 1,
+                )
+                Text(
+                    formatClockTime(endMillis),
+                    modifier = Modifier.alpha(windowAlpha),
+                    fontSize = labelSp,
+                    fontFamily = ChartNumericFont,
+                    color = color,
+                    maxLines = 1,
+                )
+            }
+            // 读数中：贴在读数竖线正下方的当前点时间（按标签自身宽度夹住两端，不出绘图区）
+            if (cursorMillis != null) {
+                val centerX = cursorFraction.coerceIn(0f, 1f) * plotWidthPx
+                Text(
+                    formatClockTime(cursorMillis),
+                    modifier = Modifier
+                        .offset {
+                            IntOffset(
+                                x = (centerX - cursorLabelWidthPx / 2f).roundToInt()
+                                    .coerceIn(0, (plotWidthPx - cursorLabelWidthPx).coerceAtLeast(0)),
+                                y = 0,
+                            )
+                        }
+                        .onSizeChanged { cursorLabelWidthPx = it.width },
+                    fontSize = labelSp,
+                    fontFamily = ChartNumericFont,
+                    color = color,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+private val ClockTimeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+/** 时间格式化（精确到秒）：读数气泡与 x 轴起止时间共用同一 `HH:mm:ss` 口径 */
+private fun formatClockTime(timeMillis: Long): String = ClockTimeFormat.format(Date(timeMillis))

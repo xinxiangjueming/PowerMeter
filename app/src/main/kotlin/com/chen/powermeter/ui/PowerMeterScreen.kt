@@ -575,9 +575,14 @@ private fun HeroPowerCard(
 
 @Composable
 private fun MetricGrid(sample: PowerSample?, shape: RoundedCornerShape) {
-    // Shizuku binder 兜底（sysfs 被 SELinux 拦截的机器）拿不到接口/充电 IC 温度：
-    // 开路电压顶替接口温度的位置，接口温度与充电 IC 温度两张卡片隐藏（用户拍板 2026-09-21）
-    val binderFallback by RootPowerReader.binderFallback.collectAsState()
+    // ⚠️ 判据**不能**用 binderFallback：它只代表「power_supply 被 SELinux 拦」，并不代表这两个温度拿不到 ——
+    // 接口温度 / 充电 IC 温度实际取自 thermal 温感区（type=usb / charger_therm0），shell(Shizuku) 身份可读，
+    // 本机实测 36.0℃ / 41.8℃，CSV 两列也有值。旧判据会把明明拿得到的温度藏起来，造成
+    // 「CSV 有值、界面看不到」（用户 2026-09-21 报告）。
+    // 改为按「该温度是否真的拿不到」判：仅当**有样本且两个温度都缺席**时才降级
+    // （开路电压顶替接口温度的位置、收起充电 IC 温度行）；无样本时乐观显示温度卡，保持空闲态观感。
+    val tempsUnavailable =
+        sample != null && sample.tempUsbC == null && sample.tempChargerC == null
     // 「显隐」是一次性布局切换（点开始采样后 binder 兜底生效那一次），不是每帧动画；
     // 曲线取 FastOutSlowInEasing（M3 Standard 口径），进入略长于退出。
     val enterFade = remember { tween<Float>(GRID_ENTER_MS, easing = FastOutSlowInEasing) }
@@ -605,12 +610,12 @@ private fun MetricGrid(sample: PowerSample?, shape: RoundedCornerShape) {
             // 同一个格子内换内容：接口温度 ↔ 开路电压。两张卡结构一致（高度相同），
             // 交叉淡入淡出即可；加 SizeTransform 反而会让容器尺寸抖一下。
             AnimatedContent(
-                targetState = binderFallback,
+                targetState = tempsUnavailable,
                 modifier = Modifier.weight(1f),
                 transitionSpec = { fadeIn(enterFade) togetherWith fadeOut(exitFade) },
                 label = "slotOcvOrUsbTemp",
-            ) { fallback ->
-                if (fallback) {
+            ) { unavailable ->
+                if (unavailable) {
                     MetricCard(lOcv, sample?.voltageOcvV.f3OrDash(), "V", shape, Modifier.fillMaxWidth())
                 } else {
                     MetricCard(lUsbTemp, sample?.tempUsbC.f0OrDash(), "℃", shape, Modifier.fillMaxWidth())
@@ -619,7 +624,7 @@ private fun MetricGrid(sample: PowerSample?, shape: RoundedCornerShape) {
         }
         // 整行出现 / 消失：透明度与高度一起过渡，从顶边收起（不是向中间塌陷）
         AnimatedVisibility(
-            visible = !binderFallback,
+            visible = !tempsUnavailable,
             enter = fadeIn(enterFade) + expandVertically(enterSize, expandFrom = Alignment.Top),
             exit = fadeOut(exitFade) + shrinkVertically(exitSize, shrinkTowards = Alignment.Top),
         ) {
@@ -697,6 +702,16 @@ internal enum class Metric(@StringRes val labelRes: Int) {
     TEMP(R.string.metric_temp),
 
     /**
+     * 充电 IC 温度（温感区 `charger_therm0`）。
+     *
+     * ⚠️ 与 [PMIC_TEMP] **不是一回事** —— 取自**不同温感区**（`charger_therm0` vs
+     * `pm8350c_tz` / `pm8350b_tz`），两者读数是两个不同的器件温度。
+     * 该温感区在 shell(Shizuku) 身份下即可读（本机实测 41.8℃），故**非 root 机器也列出本 tab**，
+     * 不按 root 过滤（对比 [PMIC_TEMP]）。
+     */
+    CHARGER_TEMP(R.string.metric_charger_ic_temp),
+
+    /**
      * 主 PMIC 温度（温感区 `pm8350c_tz` / `pm8350b_tz`）。
      *
      * ⚠️ 该节点由 root 通道稳定取得，UI 侧**仅在真 root 机器**列出本 tab
@@ -713,6 +728,7 @@ internal enum class Metric(@StringRes val labelRes: Int) {
         // 无读数（旧版 15 列 CSV 不含该列、或本机缺该温感区）返回 NaN：
         // 曲线按"断点"处理、读数与刻度显示破折号，绝不回落成 0.0 —— 否则会被画成
         // 一条贴在 0℃ 的假曲线，与 CSV 导入"留空即 null"的口径（README 3.x）相悖
+        CHARGER_TEMP -> s.tempChargerC ?: Double.NaN
         PMIC_TEMP -> s.tempPmicC ?: Double.NaN
     }
 }

@@ -44,6 +44,7 @@
     <string name="action_color">顏色</string>
     <string name="color_sheet_title">%1$s曲線顏色</string>
     <string name="label_quick_pick">快速選擇</string>
+    <string name="select_curve">選擇曲線</string>
 
     <!-- ==================== 匯入提示條 ==================== -->
 

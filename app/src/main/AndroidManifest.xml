@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- miuix-blur（AAR minSdk=33）放行：本项目 minSdk=30，库要求更高需 overrideLibrary。
+         低版本（API<33）由 miuix-blur 内部 isRuntimeShaderSupported 守卫自动失效，不崩。 -->
+    <uses-sdk tools:overrideLibrary="top.yukonga.miuix.kmp.blur" />
 
     <!-- 前台服务：锁屏后持续采样 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

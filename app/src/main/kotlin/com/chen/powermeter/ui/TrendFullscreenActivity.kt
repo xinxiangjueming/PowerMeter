@@ -9,8 +9,12 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -300,11 +304,12 @@ private fun TrendFullscreenScreen(
     }
     // 非空 = 颜色面板打开中，值为正在编辑的指标
     var colorTarget by remember { mutableStateOf<Metric?>(null) }
+    // 多曲线叠加时为 true：点颜色按钮先弹「选曲线」列表，挑完再开颜色面板
+    // （对齐 SportLink showColorPickerForSelection：单列直接开面板，多列先选曲线）
+    var colorSelectOpen by remember { mutableStateOf(false) }
     val chartState = remember { TrendChartState() }
 
-    val bg = MaterialTheme.colorScheme.background
-
-    // 关闭中：内容淡到主题底色（bg 由外层 Box 铺满，故淡出即"整页变纯色"）。
+    // 关闭中：内容淡到主题底色（DialogBackdropHost 源层铺满主题底色，故淡出即"整页变纯色"）。
     // 纯色屏没有可重排的内容 —— 紧随其后的显示方向旋转（本页解锁方向后转回竖屏）
     // 因此完全不可见；窗口尺寸变化时纯色只是重新铺一次。
     val contentAlpha by animateFloatAsState(
@@ -313,9 +318,11 @@ private fun TrendFullscreenScreen(
         label = "trendFullscreenCloseFade",
     )
 
-    // 背景铺满全屏（含系统栏与挖孔区）——真沉浸的前提：底色延伸到栏下，
-    // 而不是把整块内容用 insets 顶开
-    Box(Modifier.fillMaxSize().background(bg)) {
+    // DialogBackdropHost：提供 miuix backdrop 源 + Haze 源（页面内容层）与弹窗浮层 slot 的
+    // 「宿主 + slot」结构 —— 居中玻璃对话框（GlassDialog）作为源兄弟渲染，满足 miuix / Haze
+    // 「同窗口兄弟」铁律；源层内部铺满主题不透明底色，保证模糊采样有像素。
+    // 背景铺满全屏（含系统栏与挖孔区）——真沉浸的前提：底色延伸到栏下。
+    DialogBackdropHost {
         Column(
             Modifier
                 .fillMaxSize()
@@ -371,7 +378,12 @@ private fun TrendFullscreenScreen(
                                 text = stringResource(R.string.action_color),
                                 background = ColorButtonLilac,
                                 contentColor = onColorFor(ColorButtonLilac),
-                                onClick = { colorTarget = primary },
+                                // 多曲线叠加：先弹「选曲线」列表，挑完再开颜色面板；
+                                // 仅一条曲线：直接开颜色面板（对齐 SportLink showColorPickerForSelection）
+                                onClick = {
+                                    if (metrics.size > 1) colorSelectOpen = true
+                                    else colorTarget = primary
+                                },
                             )
                         }
                     }
@@ -457,19 +469,40 @@ private fun TrendFullscreenScreen(
                 }
             }
         }
-    }
 
-    // 关闭中整页已是纯色底，浮层不该继续挂在上面
-    val sheetTarget = if (closing) null else colorTarget
-    sheetTarget?.let { target ->
-        ColorPickerSheet(
-            title = stringResource(R.string.color_sheet_title, target.label()),
-            initialColor = rememberMetricColor(target),
-            onPick = { picked ->
-                ChartColors.set(context, target, picked)
-                colorTarget = null
-            },
-            onDismiss = { colorTarget = null },
-        )
-    }
+        // 关闭中整页已是纯色底，浮层不该继续挂在上面（本段位于 DialogBackdropHost 内，
+        // 弹层经 GlassDialog→DialogOverlay 注册到宿主 slot，与采样源层同窗口兄弟）
+        val sheetTarget = if (closing) null else colorTarget
+        // 颜色面板 = 底部弹层（ModalBottomSheet），自带滑入/滑出动画，
+        // 不需要 AnimatedVisibility 包裹（居中弹窗才需要，见下方选曲线层）
+        sheetTarget?.let { target ->
+            ColorPickerSheet(
+                title = stringResource(R.string.color_sheet_title, target.label()),
+                initialColor = rememberMetricColor(target),
+                onPick = { picked ->
+                    ChartColors.set(context, target, picked)
+                    colorTarget = null
+                },
+                onDismiss = { colorTarget = null },
+            )
+        }
+
+    // 多曲线叠加时的「选曲线」浮层（关闭中同样不挂）：挑完某条 → 关本层、开颜色面板给该条改色
+        val selectTarget = if (closing) null else if (colorSelectOpen) metrics else null
+        AnimatedVisibility(
+            visible = selectTarget != null,
+            enter = EnterTransition.None,
+            exit = fadeOut(animationSpec = tween(150)) +
+                scaleOut(targetScale = 0.92f, animationSpec = tween(150)),
+        ) {
+            CurveSelectSheet(
+                metrics = metrics,
+                onSelect = { m ->
+                    colorSelectOpen = false
+                    colorTarget = m
+                },
+                onDismiss = { colorSelectOpen = false },
+            )
+        }
+    }   // DialogBackdropHost
 }

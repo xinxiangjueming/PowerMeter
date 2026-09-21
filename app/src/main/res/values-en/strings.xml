@@ -44,6 +44,7 @@
     <string name="action_color">Color</string>
     <string name="color_sheet_title">%1$s curve color</string>
     <string name="label_quick_pick">Quick pick</string>
+    <string name="select_curve">Select curve</string>
 
     <!-- ==================== Import banner ==================== -->
 
