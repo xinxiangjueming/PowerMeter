@@ -363,14 +363,14 @@ private fun TrendFullscreenScreen(
                             )
                         }
                         Box(modifier = Modifier.align(Alignment.CenterEnd)) {
-                            // 多选叠加时颜色胶囊编辑「第一条」曲线 —— 图例上带色点的指标
-                            // 才需要改色，而第一条是必然存在的那条（见上面 metrics 的非空兜底）
+                            // 颜色胶囊底色固定为淡紫，与竖屏趋势卡同一口径（PowerMeterScreen.TrendCard）：
+                            // 不再跟随首条曲线色。曲线色改由 tab 上的色点表达 —— 见下方 FilterChip 的 leadingIcon。
+                            // 文字色仍按亮度反算，保留"底浅则字深"的自适应能力。
                             val primary = metrics.first()
-                            val primaryColor = rememberMetricColor(primary)
                             ChartPillButton(
                                 text = stringResource(R.string.action_color),
-                                background = primaryColor,
-                                contentColor = onColorFor(primaryColor),
+                                background = ColorButtonLilac,
+                                contentColor = onColorFor(ColorButtonLilac),
                                 onClick = { colorTarget = primary },
                             )
                         }

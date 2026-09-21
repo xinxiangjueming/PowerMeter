@@ -756,7 +756,7 @@ internal fun rememberAvailableMetrics(): List<Metric> {
  * 不是颜色指示器。固定色让标题行右侧的视觉权重稳定；浅紫底 + 亮度反算出的深色文字
  * 在明暗两种主题下都有足够对比度。
  */
-private val ColorButtonLilac = Color(0xFFB39DDB)
+internal val ColorButtonLilac = Color(0xFFB39DDB)
 
 @Composable
 internal fun TrendCard(
