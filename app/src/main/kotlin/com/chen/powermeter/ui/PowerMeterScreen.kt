@@ -14,6 +14,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -779,11 +780,16 @@ internal fun TrendCard(
         shadowElevation = 1.dp,
         modifier = modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(16.dp)) {
+        // ⚠️ 外层**只留垂直 padding**，水平内边距下放到各子节点 —— 目的是让指标 tab 行的
+        // 滚动视口**撑满到卡片左右边框**。视口若被卡片内边距收窄，chip 会在距边框 16dp 处
+        // 就被裁掉（2026-09-21 用户报告「裁切在卡片边框内部就开始了」）。
+        // 口径同 SportLink：SegmentSection.kt:117-119「水平内边距移到非滚动内容内部，
+        // 外层只留垂直 padding」；ChartSection.kt:117-119（padding 置于 horizontalScroll 之后）。
+        Column(Modifier.padding(vertical = 16.dp)) {
             // 标题行：「趋势」二字在整张卡片宽度内真正居中；两个胶囊置于右端
             // 口径对齐 SportLink 分段数据卡 SegmentSection.kt:139-172：
             // 标题 Text.align(Center) 占满整宽居中，按钮 Box.align(CenterEnd) 贴右，二者叠加不冲突
-            Box(Modifier.fillMaxWidth()) {
+            Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
                 Text(
                     stringResource(R.string.title_trend),
                     style = MaterialTheme.typography.titleMedium,
@@ -809,7 +815,22 @@ internal fun TrendCard(
                 }
             }
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // 指标 tab 行必须是**横向滚动**容器（口径对齐 SportLink ChartSection.kt:115-135）：
+            // 普通 Row 按"剩余宽度"测量子项，竖屏下 5 个 chip 的总固有宽度超出卡片内容宽度时，
+            // 末位的「PMIC 温度」会被压到近 0 宽；而 Material3 FilterChip 的 label 没有 maxLines
+            // 约束 → 逐字换行，chip 被撑成一根竖排细条（2026-09-21 用户报告）。
+            // 滚动容器给子项**无界最大宽度** ⇒ chip 恒保持固有尺寸与单行高度。
+            // ⚠️ 首端 16dp 内边距必须写在 horizontalScroll **之后**：此时它属于滚动内容，
+            // 不参与收窄视口 —— 首个 chip 仍与标题行左对齐，而视口右边界 = 卡片边框，
+            // 末位 chip 可一直滑到卡缘才被裁切（末尾有意不留 padding，同 SportLink 写法）。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(start = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 tabs.forEach { m ->
                     // 色点标出该指标当前的曲线色，口径与全屏趋势页的 tab 完全一致
                     // （TrendFullscreenActivity 的 leadingIcon 同一写法：8dp 圆点 + 该指标色）
@@ -817,7 +838,9 @@ internal fun TrendCard(
                     FilterChip(
                         selected = metric == m,
                         onClick = { onMetricChange(m) },
-                        label = { Text(m.label()) },
+                        // softWrap = false + maxLines = 1：单行硬约束。即便将来再遇到宽度受限的
+                        // 场景，也只会被截断，不会逐字换行把 chip 撑高
+                        label = { Text(m.label(), maxLines = 1, softWrap = false) },
                         leadingIcon = {
                             Box(
                                 Modifier
@@ -838,6 +861,11 @@ internal fun TrendCard(
             TrendChart(
                 samples = samples,
                 series = listOf(metric.toSeries(samples, metricColor, metric.label())),
+                // 图表自身仍按 16dp 内缩 —— 外层 Column 已改为只留垂直 padding，故在此补齐
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(150.dp)
+                    .padding(horizontal = 16.dp),
             )
         }
     }

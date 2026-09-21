@@ -12,6 +12,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -336,14 +338,17 @@ private fun TrendFullscreenScreen(
                     .fillMaxWidth()
                     .weight(1f),
             ) {
+                // ⚠️ 同趋势卡：外层**只留垂直 padding**，水平内边距下放到各子节点，
+                // 让指标 tab 行的滚动视口撑满到卡片左右边框；否则 chip 会在距边框 16dp
+                // 处就被裁掉（2026-09-21 用户报告）
                 Column(
                     Modifier
                         .fillMaxSize()
-                        .padding(16.dp),
+                        .padding(vertical = 16.dp),
                 ) {
                     // 标题行：左侧关闭胶囊（口径对齐 SportLink 分段全屏页
                     // SegmentFullscreenActivity.kt:221-235）+ 居中标题 + 右侧颜色胶囊
-                    Box(modifier = Modifier.fillMaxWidth()) {
+                    Box(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
                         Box(modifier = Modifier.align(Alignment.CenterStart)) {
                             FullscreenPillButton(text = "✕", onClick = onFinish)
                         }
@@ -371,7 +376,19 @@ private fun TrendFullscreenScreen(
                         }
                     }
                     Spacer(Modifier.height(12.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // 指标 tab 行必须是**横向滚动**容器（口径对齐 SportLink ChartSection.kt:115-135，
+                    // 与趋势卡 TrendCard 同一写法）：普通 Row 按剩余宽度测量子项，竖屏下末位
+                    // 「PMIC 温度」被压到近 0 宽 + label 逐字换行 → 撑成竖排细条（2026-09-21 用户报告）。
+                    // 首端 16dp 写在 horizontalScroll **之后** ⇒ 属滚动内容、不收窄视口；
+                    // 视口右边界 = 卡片边框，末位 chip 滑到卡缘才被裁切
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(start = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         tabs.forEach { m ->
                             val on = m in metrics
                             val chipColor = rememberMetricColor(m)
@@ -389,7 +406,8 @@ private fun TrendFullscreenScreen(
                                     // 空档里显示成一段空白
                                     chartState.reset()
                                 },
-                                label = { Text(m.label()) },
+                                // 单行硬约束：宽度受限时只会被截断，绝不逐字换行撑高 chip
+                                label = { Text(m.label(), maxLines = 1, softWrap = false) },
                                 // 色点直接标出该指标当前的曲线色，叠加时不用去猜哪条是哪个
                                 leadingIcon = {
                                     Box(
@@ -411,7 +429,8 @@ private fun TrendFullscreenScreen(
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .weight(1f),
+                                .weight(1f)
+                                .padding(horizontal = 16.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
@@ -427,7 +446,8 @@ private fun TrendFullscreenScreen(
                             series = seriesList,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .weight(1f),
+                                .weight(1f)
+                                .padding(horizontal = 16.dp),
                             // 叠加多条时收细线宽，否则 4 条 8px 的线糊成一片
                             strokeWidth = if (metrics.size > 1) 5f else 8f,
                             axisLabelSp = 13.sp,
