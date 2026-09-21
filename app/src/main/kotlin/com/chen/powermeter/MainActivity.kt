@@ -43,17 +43,59 @@ class MainActivity : ComponentActivity() {
     companion object {
         /** 手动导出文件名前缀（自动保存用 `powermeter_charge`，见 SamplingService） */
         private const val EXPORT_PREFIX = "powermeter"
+
+        /**
+         * 实况更新（Live Update / 超级岛 / 灵动岛）准入权限。
+         *
+         * 用字符串字面量而非 `Manifest.permission.*` 常量：该权限较新，低版本 compileSdk 上
+         * 无对应常量（SportLink 同样写字面量）。Android 16 起它是**运行时权限**。
+         */
+        private const val PROMOTED_NOTIFICATION_PERMISSION =
+            "android.permission.POST_PROMOTED_NOTIFICATIONS"
     }
 
     private val requestNotificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) launchService()
+            if (granted) ensurePromotedPermissionThenStart()
             else Toast.makeText(
                 this,
                 getString(R.string.toast_notification_permission_required),
                 Toast.LENGTH_SHORT,
             ).show()
         }
+
+    /**
+     * 实况更新（Live Update / 超级岛 / 灵动岛）准入权限的申请回调。
+     *
+     * ⚠️ 不授予时 `NotificationManager.canPostPromotedNotifications()` 恒为 false，
+     * [SamplingService] 里 `android.requestPromotedOngoing` 会被系统忽略 ——
+     * 表现即「常驻通知不进实况更新 / 灵动岛」。这里只提示，不阻断采样。
+     */
+    private val requestPromotedPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                Toast.makeText(
+                    this,
+                    getString(R.string.toast_focus_notification_required),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+            // 无论是否授予都继续启动采样：实况更新是锦上添花，不该拦住核心功能
+            launchService()
+        }
+
+    /** 通知权限已满足后：再争取实况更新权限（未授予则弹系统授权框），最后启动采样服务 */
+    private fun ensurePromotedPermissionThenStart() {
+        // 守卫 SDK≥34，口径与 SportLink `SportsActivity.requestAllPermissions()` 一致
+        if (Build.VERSION.SDK_INT >= 34 &&
+            ContextCompat.checkSelfPermission(this, PROMOTED_NOTIFICATION_PERMISSION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPromotedPermission.launch(PROMOTED_NOTIFICATION_PERMISSION)
+            return
+        }
+        launchService()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -261,7 +303,7 @@ class MainActivity : ComponentActivity() {
             requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
             return
         }
-        launchService()
+        ensurePromotedPermissionThenStart()
     }
 
     private fun launchService() {

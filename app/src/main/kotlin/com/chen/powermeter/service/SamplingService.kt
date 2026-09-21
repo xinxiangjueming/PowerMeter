@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -40,6 +41,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.abs
+import org.json.JSONObject
 
 /**
  * 前台采样服务：
@@ -523,29 +525,98 @@ class SamplingService : Service() {
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
     )
 
+    /**
+     * 构建常驻通知（**实况更新 / Live Update**，机制对齐 SportLink `SportNotificationHelper`）：
+     * - **折叠态**：左侧小图标 + 右侧主值（功率）；
+     * - **展开态**（[Notification.BigTextStyle] 两行）：第一行 电压 / 电流，第二行 电池温度 / 充电 IC 温度；
+     * - **提升为实况更新**：`android.requestPromotedOngoing`（SDK≥36 且系统允许）+ `miui.focus.param`
+     *   （MIUI 焦点通知 / 灵动岛），见 [applyLiveUpdateExtras]。
+     *
+     * 文案全部走 string resources（[R.string.notify_live_row1] / [R.string.notify_live_row2]）以支持多语言；
+     * 数值（含单位）在本函数里拼好作为参数传入，数值模板本身不翻译。
+     */
     private fun buildNotification(sample: PowerSample?): Notification {
-        val text = if (sample == null) {
+        // 右侧主值 = 功率（折叠态）；无样本时退回启动文案
+        val powerText = if (sample == null) {
             getString(R.string.notify_starting)
         } else {
-            "${sample.powerW.f3()} W · ${sample.voltageV.f3()} V · " +
-                "${sample.currentMa.f0()} mA · ${sample.tempBatteryC.f1()} ℃"
+            "${sample.powerW.f3()} W"
         }
-        val title = when {
-            sample == null -> getString(R.string.app_name)
+        // 展开态两行（第一行 电压/电流，第二行 电池温度/充电 IC 温度）；
+        // 刚启动（无样本）时留空，BigTextStyle 不挂。
+        // 功率只在折叠态右侧主值出现，不再进展开行。
+        val liveBody = sample?.let { s ->
+            // 充电 IC 温度可能取不到（非所有机型都有 charger_therm0 温感区）→ 与指标卡同口径显示破折号
+            val chargerIcText = s.tempChargerC?.let { v -> "${v.f3()} ℃" } ?: "—"
+            getString(R.string.notify_live_row1, "${s.voltageV.f3()} V", "${s.currentMa.f0()} mA") +
+                "\n" +
+                getString(R.string.notify_live_row2, "${s.tempBatteryC.f1()} ℃", chargerIcText)
+        }
+        val statusText = when {
+            sample == null -> getString(R.string.notify_starting)
             sample.isCharging -> getString(R.string.notify_title_charging, sample.socPct)
             else -> getString(R.string.notify_title_discharging, sample.socPct)
         }
         val pi = contentIntent()
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_bolt)
-            .setContentTitle(title)
-            .setContentText(text)
+            .setContentTitle(powerText)
+            .setContentText(statusText)
             .setOngoing(true)
+            .setAutoCancel(false)
             .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_PROGRESS)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setContentIntent(pi)
-            .setCategory(NotificationCompat.CATEGORY_STATUS)
-            .build()
+
+        if (liveBody != null) {
+            builder.setStyle(Notification.BigTextStyle().bigText(liveBody))
+        }
+        applyLiveUpdateExtras(builder, title = powerText, body = liveBody ?: statusText)
+        return builder.build()
     }
+
+    /**
+     * 把常驻通知提升为「实况更新」（口径对齐 SportLink `SyncNotificationHelper.applyLiveUpdateExtras`）：
+     * 1. Android 16+ 的 `android.requestPromotedOngoing`（**仅当系统允许提升时**才加，否则会被忽略）；
+     * 2. MIUI / HyperOS 的 `miui.focus.param`（焦点通知 / 灵动岛实时更新）。
+     *
+     * 两者都通过 extras 下发；任一失败都不影响基础常驻通知，故内部全部 runCatching 吞异常。
+     */
+    private fun applyLiveUpdateExtras(builder: Notification.Builder, title: String, body: String) {
+        val extras = Bundle()
+        if (Build.VERSION.SDK_INT >= 36) {
+            runCatching {
+                val nm = getSystemService(NotificationManager::class.java)
+                if (nm?.canPostPromotedNotifications() == true) {
+                    extras.putBoolean("android.requestPromotedOngoing", true)
+                }
+            }
+        }
+        buildMiuiFocusParam(title, body)?.let { extras.putString("miui.focus.param", it) }
+        if (!extras.isEmpty) builder.setExtras(extras)
+    }
+
+    /** MIUI 焦点通知参数（与 SportLink 同结构）：baseInfo 承载标题 / 正文，供灵动岛与小窗实时更新 */
+    private fun buildMiuiFocusParam(title: String, body: String): String? = runCatching {
+        JSONObject().apply {
+            put(
+                "param_v2",
+                JSONObject().apply {
+                    put("protocol", 1)
+                    put("updatable", true)
+                    put("enableFloat", true)
+                    put("ticker", title)
+                    put("baseInfo", JSONObject().apply {
+                        put("title", title)
+                        put("content", body)
+                        put("type", 2)
+                    })
+                },
+            )
+        }.toString()
+    }.getOrNull()
 
     private fun createChannel() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
@@ -558,6 +629,8 @@ class SamplingService : Service() {
                 ).apply {
                     description = getString(R.string.channel_desc_sampling)
                     setShowBadge(false)
+                    // 与 SportLink 通知渠道同口径：锁屏可见，实况更新（Live Update）卡片才能上锁屏
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                 }
             )
         }
@@ -648,6 +721,11 @@ class SamplingService : Service() {
 
     override fun onBind(intent: Intent?) = null
 
+    /**
+     * 常驻通知右侧主值（功率）沿用项目精度约定 3 位小数，且**只显示「数值 + 单位」**
+     * （如 `35.250 W`），**不加**「功率」标签 —— 实况通知折叠态空间有限，一个带单位的数值
+     * 比「功率 35.250 W」更紧凑。展开态第二行才带标签（见 [R.string.notify_live_row2]）。
+     */
     private fun Double.f3(): String = String.format(Locale.US, "%.3f", this)
 
     /** 常驻通知里的电池温度按用户约定取 1 位小数（2026-09-21） */

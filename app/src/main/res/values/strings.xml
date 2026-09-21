@@ -115,6 +115,9 @@
     <string name="notify_starting">正在启动采样…</string>
     <string name="notify_title_charging">充电中 · %1$d%%</string>
     <string name="notify_title_discharging">放电中 · %1$d%%</string>
+    <!-- 实况通知（Live Update）展开态两行；%1$s / %2$s = 已带单位的数值（不翻译数值模板） -->
+    <string name="notify_live_row1">电压 %1$s  电流 %2$s</string>
+    <string name="notify_live_row2">电池温度 %1$s  充电 IC 温度 %2$s</string>
     <!-- %1$s = 文件名，%2$d = 记录条数 -->
     <string name="notify_auto_saved">已自动保存 %1$s（%2$d 条记录，采样继续）</string>
     <string name="notify_auto_save_failed">自动保存失败，采样继续</string>
@@ -122,6 +125,7 @@
     <!-- ==================== Toast / 错误提示 ==================== -->
 
     <string name="toast_notification_permission_required">需要通知权限才能在锁屏后常驻采样</string>
+    <string name="toast_focus_notification_required">未授予「实况通知」权限，超级岛（灵动岛）效果可能受限</string>
     <string name="toast_start_service_failed">启动采样服务失败：%1$s</string>
     <string name="toast_no_data">暂无采样数据</string>
     <string name="toast_export_done">已导出：Download/PowerMeter/%1$s</string>

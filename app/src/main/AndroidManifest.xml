@@ -11,6 +11,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- Android 13+ 通知权限（常驻通知显示实时读数） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 实况更新（Live Update / 超级岛 / 灵动岛）准入：Android 16 起是**运行时权限**，
+         不授予则 canPostPromotedNotifications() 恒 false → requestPromotedOngoing 被忽略、
+         通知不会进入实况更新。口径对齐 SportLink（其 Manifest 同样声明本权限）。 -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
     <!-- 锁屏后保持 CPU 运行 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 

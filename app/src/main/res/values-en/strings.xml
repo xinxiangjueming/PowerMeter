@@ -110,12 +110,16 @@
     <string name="notify_starting">Starting sampling…</string>
     <string name="notify_title_charging">Charging · %1$d%%</string>
     <string name="notify_title_discharging">Discharging · %1$d%%</string>
+    <!-- Live Update expanded rows; %1$s / %2$s = values with units (numeric templates not translated) -->
+    <string name="notify_live_row1">Voltage %1$s  Current %2$s</string>
+    <string name="notify_live_row2">Battery %1$s  Charger IC %2$s</string>
     <string name="notify_auto_saved">Auto-saved %1$s (%2$d records, sampling continues)</string>
     <string name="notify_auto_save_failed">Auto-save failed, sampling continues</string>
 
     <!-- ==================== Toasts / errors ==================== -->
 
     <string name="toast_notification_permission_required">Notification permission is required to keep sampling after the screen locks</string>
+    <string name="toast_focus_notification_required">Promoted notification permission not granted — the status island may be limited</string>
     <string name="toast_start_service_failed">Failed to start sampling service: %1$s</string>
     <string name="toast_no_data">No samples yet</string>
     <string name="toast_export_done">Exported: Download/PowerMeter/%1$s</string>
