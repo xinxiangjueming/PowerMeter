@@ -12,6 +12,10 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -23,11 +27,18 @@ import androidx.lifecycle.lifecycleScope
 import com.chen.powermeter.R
 import com.chen.powermeter.data.BatteryInfoStore
 import com.chen.powermeter.data.CsvImporter
+import com.chen.powermeter.data.FrameHistoryStore
 import com.chen.powermeter.data.ImportedSeries
 import com.chen.powermeter.data.PowerSample
 import com.chen.powermeter.data.db.SessionRecorder
 import com.chen.powermeter.service.SamplingService
 import com.chen.powermeter.ui.ChartColors
+import com.chen.powermeter.ui.DialogBackdropHost
+import com.chen.powermeter.ui.FrameDetailActivity
+import com.chen.powermeter.ui.FrameMeterScreen
+import com.chen.powermeter.ui.ModeRevealOverlay
+import com.chen.powermeter.ui.ModeSwitchArgs
+import com.chen.powermeter.ui.MonitorMode
 import com.chen.powermeter.ui.PowerMeterScreen
 import com.chen.powermeter.ui.theme.PowerMeterTheme
 import com.chen.powermeter.util.CsvExporter
@@ -108,6 +119,21 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             PowerMeterTheme {
+                // 顶栏双击切换的监测模式，持久化在 Prefs（下次冷启动仍停在上次所在的模式）
+                var mode by remember {
+                    mutableStateOf(MonitorMode.of(Prefs.getMonitorMode(this@MainActivity)))
+                }
+                // 进行中的模式切换转场（ClipReveal 上下展开，见 ModeRevealOverlay）；null = 无转场。
+                // 双击标题 → 先起覆盖层（底层旧屏保持原样），收拢动画结束（onCommit）才落地 mode / Prefs
+                var modeReveal by remember { mutableStateOf<ModeSwitchArgs?>(null) }
+                val sessions by FrameHistoryStore.sessions.collectAsState()
+                // 切进帧率监测时拉一次历史列表（冷启动恢复该模式时同样覆盖）
+                LaunchedEffect(mode) {
+                    if (mode == MonitorMode.FRAME) {
+                        FrameHistoryStore.refresh(this@MainActivity)
+                    }
+                }
+
                 val running by SamplingService.running.collectAsState()
                 // 实时序列走环形缓冲（档二-1）：订阅**版本号**触发重组，再按需取一次快照。
                 // ⚠️ 刻意不订阅 List 类型的 StateFlow —— 那等价于每秒做一次整表分配。
@@ -137,48 +163,119 @@ class MainActivity : ComponentActivity() {
                     mutableStateOf(Prefs.getSeriesDualBattery(this@MainActivity))
                 }
 
-                PowerMeterScreen(
-                    running = running,
-                    samples = samples,
-                    batteryInfo = batteryInfo,
-                    error = error,
-                    intervalMs = interval,
-                    wakeLock = wakeLock,
-                    chargeMonitor = chargeMonitor,
-                    seriesDualBattery = seriesDualBattery,
-                    shizukuAvailable = shizukuAvailable,
-                    shizukuGranted = shizukuGranted,
-                    shizukuBound = shizukuBound,
-                    importedName = if (viewingImport) importedFileName.ifEmpty { "CSV" } else null,
-                    onStart = { startSampling() },
-                    onStop = { stopSampling() },
-                    onIntervalChange = { value ->
-                        interval = value
-                        Prefs.setIntervalMs(this@MainActivity, value)
-                        SamplingService.setInterval(value)
-                    },
-                    onWakeLockChange = { value ->
-                        wakeLock = value
-                        Prefs.setWakeLock(this@MainActivity, value)
-                        // 立即同步持锁策略，不必等下一次采样循环或息屏广播
-                        SamplingService.onPrefsChanged()
-                    },
-                    onChargeMonitorChange = { value ->
-                        chargeMonitor = value
-                        Prefs.setChargeMonitor(this@MainActivity, value)
-                        // 充电监测开启 → 强制释放 wakelock（测量精度要求 CPU 不参与负载）
-                        SamplingService.onPrefsChanged()
-                    },
-                    onSeriesDualBatteryChange = { value ->
-                        seriesDualBattery = value
-                        Prefs.setSeriesDualBattery(this@MainActivity, value)
-                    },
-                    onShizukuRequest = { ShizukuHelper.requestPermission() },
-                    onShizukuRetry = { ShizukuHelper.forceRebind() },
-                    onExport = { exportCsv() },
-                    onClear = { SamplingService.clearSamples() },
-                    onExitImport = { ImportedSeries.clear() },
-                )
+                // DialogBackdropHost：弹窗毛玻璃的「宿主 + slot」结构 —— 外部 Haze 采样源 +
+                // 内部 miuix textureBlur 采样源，GlassDialog 卡片作为源兄弟渲染（同窗口兄弟铁律）。
+                // 此前只有全屏趋势页挂了宿主，主页面的弹窗会静默降级实色卡（2026-09-25 接入，
+                // 口径对齐 SportLink：弹窗三件套 = 外部 haze 模糊 + 内部 miuix 模糊 + 高光描边）。
+                // 双模式屏的统一渲染入口：底屏（当前模式）与转场覆盖层（目标模式）共用
+                // 同一套参数与回调（2026-09-25 切换动画 = ClipReveal 上下展开，见 ModeRevealOverlay）
+                val monitorScreen: @Composable (MonitorMode, (Float) -> Unit) -> Unit = { m, onToggle ->
+                    when (m) {
+                        MonitorMode.POWER -> PowerMeterScreen(
+                            running = running,
+                            samples = samples,
+                            batteryInfo = batteryInfo,
+                            error = error,
+                            intervalMs = interval,
+                            wakeLock = wakeLock,
+                            chargeMonitor = chargeMonitor,
+                            seriesDualBattery = seriesDualBattery,
+                            shizukuAvailable = shizukuAvailable,
+                            shizukuGranted = shizukuGranted,
+                            shizukuBound = shizukuBound,
+                            importedName = if (viewingImport) {
+                                importedFileName.ifEmpty { "CSV" }
+                            } else {
+                                null
+                            },
+                            onStart = { startSampling() },
+                            onStop = { stopSampling() },
+                            onIntervalChange = { value ->
+                                interval = value
+                                Prefs.setIntervalMs(this@MainActivity, value)
+                                SamplingService.setInterval(value)
+                            },
+                            onWakeLockChange = { value ->
+                                wakeLock = value
+                                Prefs.setWakeLock(this@MainActivity, value)
+                                // 立即同步持锁策略，不必等下一次采样循环或息屏广播
+                                SamplingService.onPrefsChanged()
+                            },
+                            onChargeMonitorChange = { value ->
+                                chargeMonitor = value
+                                Prefs.setChargeMonitor(this@MainActivity, value)
+                                // 充电监测开启 → 强制释放 wakelock（测量精度要求 CPU 不参与负载）
+                                SamplingService.onPrefsChanged()
+                            },
+                            onSeriesDualBatteryChange = { value ->
+                                seriesDualBattery = value
+                                Prefs.setSeriesDualBattery(this@MainActivity, value)
+                            },
+                            onShizukuRequest = { ShizukuHelper.requestPermission() },
+                            onShizukuRetry = { ShizukuHelper.forceRebind() },
+                            onExport = { exportCsv() },
+                            onClear = { SamplingService.clearSamples() },
+                            onExitImport = { ImportedSeries.clear() },
+                            onToggleMode = onToggle,
+                        )
+    
+                        MonitorMode.FRAME -> FrameMeterScreen(
+                            sessions = sessions,
+                            onOpenSession = { sessionId ->
+                                FrameDetailActivity.launch(this@MainActivity, sessionId)
+                            },
+                            onDeleteSession = { sessionId ->
+                                FrameHistoryStore.delete(this@MainActivity, sessionId)
+                            },
+                            onToggleMode = onToggle,
+                        )
+                    }
+                }
+
+                DialogBackdropHost {
+                    monitorScreen(mode) { anchorY ->
+                        // 双击标题 = 起转场：目标模式在覆盖层里上下展开，**展开完成即落地**
+                        // mode / Prefs —— 一次双击完整切换（见 ModeRevealOverlay 的类 KDoc）。
+                        // 动画期 ClipReveal 已吞掉全部触摸（第一道防线），已有转场在途时
+                        // 这里再兜一道：在途转场的重入会抹掉/覆盖在途状态。
+                        if (modeReveal == null) {
+                            modeReveal = ModeSwitchArgs(
+                                target = if (mode == MonitorMode.POWER) {
+                                    MonitorMode.FRAME
+                                } else {
+                                    MonitorMode.POWER
+                                },
+                                anchorYInWindow = anchorY,
+                            )
+                        }
+                    }
+                }
+
+                // 转场覆盖层挂在整棵 compose 树之上 —— 同 SportLink DeviceDetailOverlay 的
+                // 挂载位置（android.R.id.content 的兄弟层）
+                modeReveal?.let { args ->
+                    ModeRevealOverlay(
+                        args = args,
+                        // 覆盖层底色 = 页面真实背景（Compose 主题色，随深浅色/动态取色走；
+                        // View 层主题的 colorBackground 深色下是白的，动画会闪白）
+                        backgroundColor = MaterialTheme.colorScheme.background.toArgb(),
+                        // 展开完成 = 切换落地（一次双击完整切换，见 ModeRevealOverlay 的类 KDoc）
+                        onCommit = {
+                            // 幂等守卫：迟到的收尾回调不得覆盖新转场的在途状态
+                            if (modeReveal === args) {
+                                mode = args.target
+                                Prefs.setMonitorMode(this@MainActivity, args.target.key)
+                                // mode 变化触发上面的 LaunchedEffect(mode) 拉帧率历史（若切到帧率）
+                                modeReveal = null
+                            }
+                        },
+                        // 预览期收回（返回键）= 放弃切换，留在旧模式
+                        onCancel = { if (modeReveal === args) modeReveal = null },
+                    ) { onToggle ->
+                        // 预览期内再双击 = 收回放弃（420ms 窗口，触摸被吞基本不可达）
+                        monitorScreen(args.target, onToggle)
+                    }
+                }
             }
         }
 
@@ -391,6 +488,9 @@ class MainActivity : ComponentActivity() {
         // 用户可能刚在 Shizuku 里完成授权，或重启过 Shizuku 服务；回到前台重新探测一次
         // （绑定 UserService 是异步的，recheck 内部会按需重新绑定）
         ShizukuHelper.recheck()
+        // 从帧率详情页返回时同步一次历史列表（详情页可能删过记录）。
+        // 开销是一次带索引的小表查询，功率监测模式下也执行，代价可忽略
+        FrameHistoryStore.refresh(this)
     }
 
     // 配置变更（旋转/深浅色切换/180° 翻转）后重放透明系统栏设置

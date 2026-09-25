@@ -96,22 +96,24 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 面向「测涓流截止点」的场景，把熄屏与自动留存串成一条链：
 
 1. 点击「开始采样」后 **5 秒自动熄屏**（去掉屏幕自身那几瓦耗电，让电池端读数接近真实充电功率）
-2. 充电功率**连续低于 1W 满 5 分钟**时，**自动导出一份 CSV** 到 `Download/PowerMeter/powermeter_charge_*.csv`，并发一条通知告知文件名与条数
+2. **输入电池的电流为 0mA 且连续保持 30 秒**时，**自动导出一份 CSV** 到 `Download/PowerMeter/powermeter_charge_*.csv`，并发一条通知告知文件名与条数
 3. **采样本身不中断** —— 自动保存只写文件，不触碰采样循环
+
+判据取 `current_ma`（见 [2.7](#27-csv-导出与回看) 的列定义）而不是功率：涓流截止、已充满、充电器断开，输入电流都会干脆地塌到 0，而此时电压仍在、功率读数只在零点附近飘。判定取绝对值比较 —— 本机充电时 `current_ma` 上报为负值（shizuku / binder 两通道同口径，不翻符号）。
 
 三道护栏缺一不可（缺任一条都会在真实场景里静默误触发）：
 
 | 护栏 | 作用 |
 | --- | --- |
-| **武装前提** | 本场会话至少出现过一次 > 1W 的功率才认为「正在充电」。没插充电器时功率恒为负值，不设这道判断会直接误触发 |
-| **连续区间** | 功率一旦回升到阈值以上即复位，只认连续低功率，避免把若干段零散低功率累加成 5 分钟 |
-| **幂等** | 命中一次后本场会话不再触发。涓流/已充满阶段功率会长期低于 1W，不拦就会每 5 分钟刷出一个新文件 |
+| **武装前提** | 本场会话至少出现过一次 ≥ 50mA 的输入电流才认为「确实在充电」。这条同时兜住 binder 通道 `CURRENT_NOW` 恒返回 0 的机型 —— 不设就会在「根本没充上电」时直接误触发 |
+| **连续区间** | 电流一旦回到 1mA 以上即复位，只认**连续**归零，避免把若干段零散的零电流累加成 30 秒 |
+| **幂等** | 命中一次后本场会话不再触发。停充以后电流长期为 0，不拦就会每 30 秒刷出一个新文件 |
 
 熄屏走特权通道注入电源键（`input keyevent 26`）—— `PowerManager.goToSleep` 需要 signature 级 `DEVICE_POWER` 权限，`lockNow` 需要 DeviceAdmin 且要用户手动激活，二者都不可行。
 
 ### 2.6 串联双电池（默认关闭）
 
-串联机型的电量计常上报**单节**电芯电压，整组为两节叠加。开关打开后，换算在**采样入口**统一完成：电压（工作电压与开路电压）与功率 ×2，**电流与容量不变**（串联电流处处相等），USB 输入侧电压不翻（Type-C 输入与电池组无关）。下游的曲线、统计、常驻通知、导出、自动保存与 1W 判定因此全部自动同口径。
+串联机型的电量计常上报**单节**电芯电压，整组为两节叠加。开关打开后，换算在**采样入口**统一完成：电压（工作电压与开路电压）与功率 ×2，**电流与容量不变**（串联电流处处相等），USB 输入侧电压不翻（Type-C 输入与电池组无关）。下游的曲线、统计、常驻通知、导出、自动保存因此全部自动同口径（充电功率监测的「电流归零」判定不受本换算影响 —— 串联回路电流处处相等，`current_ma` 不翻）。
 
 ### 2.7 CSV 导出与回看
 
@@ -145,9 +147,62 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 两个补充规则：
 
 - **采样仍在运行时点导出**：导出并删除后**立刻开一个新会话**，后续样本写进新会话。不这么做的话，样本会继续带着已删除的 `sessionId` 写入，直接撞外键约束。
-- **「充电功率监测」自动保存的场景**：低功率满 5 分钟时从库里导出（`deleteAfter = false` —— 采样没停，会话必须留着继续累积），并打上 `autoSaved` 标记；停止采样时该会话直接删除，因为用户手里已经有 CSV 了。
+- **「充电功率监测」自动保存的场景**：输入电流归零满 30 秒时从库里导出（`deleteAfter = false` —— 采样没停，会话必须留着继续累积），并打上 `autoSaved` 标记；停止采样时该会话直接删除，因为用户手里已经有 CSV 了。
 
 清空数据（「清空采样数据」按钮）同样走这条链：删会话 + 若采样仍在运行则立刻开一个新的空会话。
+
+### 2.9 帧率监测（2026-09 新增，**界面骨架阶段**）
+
+PowerMeter 从这一版起是**双模式**应用：**双击顶栏标题**在「功率监测」与「帧率监测」之间切换，切换结果持久化到 `SharedPreferences`（下次冷启动仍停在上次所在的模式）。
+
+| 项 | 说明 |
+| --- | --- |
+| 入口 | 顶栏标题双击（两个模式互为对称入口，不占顶栏横向空间） |
+| 帧率监测页 | 顶栏标题「帧率监测」，下方是**历史记录列表**；单条记录显示应用名 / 包名 / 起始时间 / 时长 / 平均帧率 / 最低·最高帧率 / 丢帧 / 刷新率；右下角 FAB 开关**系统悬浮窗**（见 [2.10](#210-帧率悬浮窗系统级)） |
+| 详情页 | 点击记录进入 `FrameDetailActivity`：平均帧率大号读数 + 指标网格（最低/最高帧率、帧间隔、丢帧、平均功率、电池温度、**平均电压、平均电流**）+ 帧率 / 帧间隔 / 功率 / 电池温度四条曲线可切换 + 统计 |
+| 存储 | `frame_sessions` + `frame_samples` 两张表（数据库 version 2，v1→v2 迁移见 `PowerMeterDatabase.MIGRATION_1_2`） |
+
+### 2.10 帧率悬浮窗（系统级）
+
+帧率监测页右下角 **+** 是 miuix `FloatingActionButton`（紫底白图标，+ ↔ × 用 `AnimatedContent` 200ms 缩放淡入淡出过渡），点它开关**帧率悬浮窗**。
+
+**为什么是系统级悬浮窗而不是 Compose 内嵌悬浮层**：帧率监测的核心场景是「人在别的应用（游戏 / 视频）里看帧率」，Compose 的悬浮层只活在自家窗口里，一切到被测应用就没了。2026-09-22 起改用 `service/FrameOverlayService.kt`（原生 View，`TYPE_APPLICATION_OVERLAY`）—— tab 盖在**任何**应用上方，常显实时帧率。
+
+| 项 | 说明 |
+| --- | --- |
+| 权限 | 需 `SYSTEM_ALERT_WINDOW`（「显示在其它应用上层」）。这是**特殊权限**，没有系统弹窗，只能引导：Toast 说明用途 → 跳 `Settings.ACTION_MANAGE_OVERLAY_PERMISSION`；从设置页回来时若已授权，直接拉起悬浮窗（用户不必再点一次 +） |
+| 进程保活 | 悬浮窗服务是**前台服务**（`specialUse`，常驻通知共用 `frame_record` 低重要性渠道）。悬浮窗本身不能阻止 Android 12+ 冻结缓存进程，进程一冻结预览采样就停了，帧率会变成再也不动的死数字 |
+| 常显帧率 | 悬浮窗一出现就开始 1s 一次的**预览采样**（只更新读数、不产样本、不落库）—— **tab 恒显示实时帧率**，与是否录制无关，**任何前台界面都测**（2026-09-22 用户口径：不排除本应用自身，停在自己的页面就测自己的渲染帧率）；关悬浮窗才停预览 |
+| 形态 | 椭圆形 pill（43×25dp），内部**只有一行等宽帧率数字**：**< 100 保留 1 位小数**（89.0）、**≥ 100 取整**（120）；尚未采到有效差分（通道未通 / 首轮只建基线 / 未认领到目标图层）显示 **`—`** 而不是 `0.0`（`NaN` 语义，见 `ui/FrameFormat.formatLiveFps`）。「录没在录」由**底色**承担（见配色行），tab 内无其它装饰 |
+| 配色 | 未录制 = 浅绿 `0xFFA5D6A7` 黑字；**录制中 = 热烈红 `0xFFE53935` 白字**（2026-09-22 用户口径：录制态必须一眼可辨）。文字色统一由底色相对亮度（>0.55 配黑字）反算 |
+| 起停 | 轻点 tab 开始 / 停止录制；位移未超 touch slop 才算轻点，否则算拖动。**默认就是不限时**（每次 `stop()` 都会 `clearLimit()`），必须再点一次 tab 手动停止；只有在时长窗口里挑了 5 / 10 / 15 / 30，才按**本场开始时间**推算到点自动停 |
+| 拖动 | 单指拖动 pill。**每次开窗都回到默认位**（安全区右缘 4dp、垂直居中），位置**不再持久化**（`Prefs` 的 overlay x/y 已删除）。⚠️ 范围一律夹在**「完整可见 + 完整可点」的安全区**（2026-09-22 用户口径收紧）：`TYPE_APPLICATION_OVERLAY` 在 z 序上低于状态栏 / 导航条，配合 `FLAG_LAYOUT_NO_LIMITS` 把 tab 拖进系统栏区域会被盖住 —— 看得见摸不着，拖进去就再也救不回来；边界每次实时取 `maximumWindowMetrics` 再向内收 `systemBars + displayCutout`（`safeDragBounds`），旋转后自动跟随 |
+| 时长窗口 | tab **正下方、与 tab 左对齐**（拖动同步更新位置，下方放不下则翻到上方）；底色就是一枚**半透明黑 `0xCC1E1E24`**，此外无任何特效 —— overlay 窗口拿不到背后像素（`FLAG_BLUR_BEHIND` 对第三方应用无效），做不了真 backdrop blur，项目里也没有给它加任何模糊依赖。选中胶囊 = 浅绿底 + miuix 蓝字。内容**仅两行**（标题 + 5 / 10 / 15 / 30 四枚胶囊），**5s 无点击自动隐藏**。⚠️ **不记忆上次选择**：每次开悬浮窗 / 每次录制结束都 `clearLimit()`，四个胶囊一律不高亮。⚠️ 用户明确要求窗口内**不放任何其它信息**：错误原因 / 已录时长 / 起始帧率都不在这里展示，失败反馈走 `FrameRecordController` 的 Toast 与录制服务的常驻通知 |
+| 取数失败 | 首轮读不到**不判死**：连续 6 轮（≈6s）内持续重试（等 Shizuku 绑定完成 / 通道恢复）；**预览循环读不到也不退场**、通道自愈后读数自动恢复；宽限期满仍无一个样本才停表并补一条 Toast。⚠️ 功率侧的「看起来正常」不能反证通道可用：功率有 `BatteryManagerSource`（SDK 公共 API，零特权调用）兜底，且 `checkAccess()` 的 `hasAccess` 是粘性的（成功过一次就不再复查）—— 帧率每条命令都要走特权通道，没有这层掩护 |
+| 关闭 | FAB（此时为 ×）关悬浮窗；**正在录制时关闭会先停止并落库**，预览采样随之停止 |
+
+采集由 `service/FrameRecordController.kt`（进程级单例）承载 —— 页面因旋转 / 深浅色切换重建不会打断录制。点开始录制会同时拉起前台服务 `FrameRecordService`（常驻通知显示当前帧率与已录时长）+ 持 `PARTIAL_WAKE_LOCK`：前台服务让**进程**不被冻结 / 回收，唤醒锁让 **CPU** 在息屏后不休眠。
+
+每个采样周期（1s）采集：帧率 / 帧间隔 / 丢帧，以及**电量四项（电压 / 电流 / 功率 / 电池温度）**——后者与功率监测走**同一条取数链** `RootPowerReader.read()`（root 机器 sysfs 节点、Shizuku / 无特权机器 `BatteryManagerSource` 实时电流，见 [3](#3-取数通道)），与帧率逐秒对齐；CPU 8 核频率、前台应用与虚拟温度（CPU 代表温感区）按 5s 抽稀（这几项变化慢，且每条命令都要起进程）。周期用**补偿式等待**（`1s − 本轮耗时`，下界 200ms），避免采集本身把周期越拖越长。
+
+⚠️ **拖动边界的「空区间」陷阱**（2026-09-22 实测崩溃）：面板比 tab 宽，横向夹取的下界要按**面板宽度**算，而 Kotlin 的一元负号**覆盖整条调用链** —— `-x.coerceAtMost(-4f)` 实际是 `-(x.coerceAtMost(-4f))`，屏宽 384 时算出来是 **+4**，与上界 `-4` 正好颠倒，于是 `coerceIn(4f, -4f)` 抛 `IllegalArgumentException: Cannot coerce value to an empty range: maximum -4.0 is less than minimum 4.0`，症状是**手指一在悬浮 tab 上移动（超过 touch slop）整个应用立刻崩**。正确写法是先取负、再夹上界（见 `FrameMeterScreen` 的 `minOffsetX`），并保证 `min ≤ max`。
+
+⚠️ 帧率会话与功率会话的语义**相反**，勿混用生命周期规则：
+
+- `power_sessions` = **自动保存的临时存档**（导出即删、稳态下最多一行，见 [2.8](#28-采样数据落库与会话生命周期)）；
+- `frame_sessions` = **用户资产**（出现在历史列表里供随时回看，只有用户显式删除才消失）。
+
+采集数据源按 Kite 采集表定好：帧率 / CPU / 前台应用需 shell / Shizuku 身份即可读取；电量四项与功率监测共用取数链（root 机器 sysfs、Shizuku 机器 SDK API，均不需要额外特权）：
+
+| 字段 | 数据源 | 状态 |
+| --- | --- | --- |
+| FPS / FrameSpace / 丢帧 | `dumpsys SurfaceFlinger --timestats`（每图层 `totalFrames` **差分** + `presentToPresent` 直方图加权均值 + `missedFrames`）。⚠️ **部分 ROM 默认关闭 timestats**（2026-09-22 在 22081212C / Android 15 实测）：plain 读法**恒为 0 行**，必须先 `-enable`、读取用 `-dump`（`-maxlayers` 只是 `-dump` 的可选伴随参数，不传则全量图层按累计帧数降序输出）。⚠️ 解析陷阱（2026-09-22 真机事故）：AOSP dump 字段是 `layerName = xxx`（**等号前有空格**），图层认领正则必须 `\s*[=:]`——旧写法 `layerName[=:]` 恒不命中，症状是帧率永远 0.0 且无任何告警 | ✅ 已接入 |
+| CPU 8 核频率 | `/sys/devices/system/cpu/cpuN/cpufreq/scaling_cur_freq` | ✅ 已接入 |
+| 刷新率 / 前台应用 | `dumpsys display` 的 `mActiveRenderFrameRate`、`dumpsys activity activities` 的 `topResumedActivity` | ✅ 已接入 |
+| 电压 / 电流 / 功率 / 电池温度 | `RootPowerReader.read()`（与功率监测**同一实现**，见 [3](#3-取数通道)）：root 机器走 sysfs `voltage_now` / `current_now`；Shizuku / 无特权机器走 `BatteryManagerSource`（`CURRENT_NOW` 实时电流 + 粘性广播电压 / 温度）。⚠️ 2026-09-22 起**不再**自采 `dumpsys thermalservice` 的 ibat —— 22081212C 无此字段（电流 / 功率恒空），且符号未取反、单位靠启发式 | ✅ 已接入 |
+| 虚拟温度 | `/sys/class/thermal/thermal_zone*` 取 CPU 类温感区**最热**的一个；无 CPU 命名则退回全部温感区最大值（5s 抽稀） | ✅ 已接入 |
+
+⚠️ `--timestats` 是**累计值**，帧率由相邻两个采样周期做差分得到；首轮只建立基线、不产出样本。屏幕静止或熄屏时无合成帧，此时帧率为 **0** —— 语义是「本周期没有帧」，不是「掉到 0 帧」。
 
 ---
 
@@ -254,29 +309,42 @@ app/src/main/
 ├── aidl/com/chen/powermeter/shizuku/IShellService.aidl    15 行  UserService 的 AIDL 契约
 └── kotlin/com/chen/powermeter/
     ├── PowerMeterApp.kt                      42 行  Application：Shizuku / BatteryManager / 落库初始化 + 冷启动清理
-    ├── MainActivity.kt                      368 行  入口：权限、外部 Intent 分发、导出、配置变更重放
+    ├── MainActivity.kt                      456 行  入口：权限、外部 Intent 分发、导出、监测模式分支、配置变更重放
     ├── data/
     │   ├── PowerSample.kt                    70 行  采样快照 PowerSample / 会话统计 SessionStats
+    │   ├── FrameSample.kt                    41 行  帧率采样快照（FPS / 帧间隔 / 丢帧 / 8 核频率 / 功率 / 温度）
     │   ├── RootPowerReader.kt               832 行  三通道取数 + 单位换算 + 解析（唯一数据来源）
     │   ├── SampleStore.kt                   194 行  实时环形缓冲 + O(1) 增量统计（**退化为显示窗口**）
     │   ├── BatteryManagerSource.kt          158 行  主进程零 fork 通道（getLongProperty + 粘性广播）
     │   ├── SuSession.kt                     168 行  root 常驻 shell 会话（免每次 fork su）
     │   ├── BatteryInfoStore.kt               69 行  电池静态信息仓库（进程级单例）
+    │   ├── FrameHistoryStore.kt              55 行  帧率历史记录仓库（进程级单例，StateFlow）
+    │   ├── FrameRateSource.kt               205 行  帧率取数：timestats 解析 + CPU 频率 + 前台应用 + 刷新率
     │   ├── CsvImporter.kt                   266 行  CSV 解析 + ImportedSeries（导入态单例）
     │   └── db/
     │       ├── SessionRecorder.kt           339 行  会话录制器：10s 增量落库 / 导出 / 会话生命周期
     │       ├── PowerSampleEntity.kt          99 行  样本行（字段同 PowerSample；唯一索引保 flush 幂等）
     │       ├── SampleDao.kt                  58 行  会话 + 样本 DAO（含导出用分页查询）
-    │       ├── PowerMeterDatabase.kt         34 行  Room 数据库（私有目录 powermeter.db）
-    │       └── PowerSession.kt               25 行  采样会话（自动保存的临时存档，非用户资产）
+    │       ├── PowerMeterDatabase.kt        105 行  Room 数据库（私有目录 powermeter.db，version 2 + v1→v2 迁移）
+    │       ├── PowerSession.kt               25 行  采样会话（自动保存的临时存档，非用户资产）
+    │       ├── FrameSession.kt               38 行  帧率会话（**用户资产**，与 PowerSession 语义相反）
+    │       ├── FrameSampleEntity.kt          93 行  帧率样本行（8 个 CPU 频率独立列 + 唯一索引）
+    │       └── FrameDao.kt                   43 行  帧率会话 / 样本 DAO
     ├── service/
-    │   └── SamplingService.kt               658 行  前台服务：采样循环、通知节流、息屏降频、wakelock、充电监测
+    │   ├── SamplingService.kt               658 行  前台服务：采样循环、通知节流、息屏降频、wakelock、充电监测
+    │   ├── FrameRecordController.kt         604 行  帧率录制控制器（进程级单例：1s 采集 / 预览 / 宽限重试 / 限时自动停 / 落库；时长选择不跨场次保留）
+    │   ├── FrameRecordService.kt            155 行  帧率录制前台服务（保持进程前台 + 常驻通知）
+    │   └── FrameOverlayService.kt           581 行  帧率**系统悬浮窗**前台服务（TYPE_APPLICATION_OVERLAY 常显帧率 + 安全区拖动 + 录制态变红 + 两行时长窗口 5s 自隐）
     ├── shizuku/
     │   └── ShellService.kt                   59 行  Shizuku UserService（shell 身份执行命令）
     ├── ui/
-    │   ├── PowerMeterScreen.kt             1311 行  主页面（竖屏单列 / 横屏双列）、Metric 枚举与 tab 过滤、各卡片
-    │   ├── TrendChartView.kt                961 行  图表组件：多序列 / 填充 / 读数 / 缩放 / 抽稀 / 滑条 / 断点
+    │   ├── PowerMeterScreen.kt             1391 行  功率监测主页（竖屏单列 / 横屏双列）、Metric 枚举与 tab 过滤、各卡片
+    │   ├── TrendChartView.kt               1083 行  图表组件：多序列 / 填充 / 读数 / 缩放 / 抽稀 / 滑条 / 断点
     │   ├── TrendFullscreenActivity.kt       455 行  趋势全屏页（沉浸式 + 挖孔避让 + 关闭时序）
+    │   ├── FrameMeterScreen.kt              443 行  帧率监测页：历史记录列表（空态 / 记录卡）
+    │   ├── FrameDetailActivity.kt           580 行  帧率记录详情页：概览 + 指标网格 + 曲线 + 统计
+    │   ├── MonitorMode.kt                    25 行  监测模式枚举（顶栏双击切换，键持久化到 Prefs）
+    │   ├── FrameFormat.kt                    29 行  帧率两页共用的时间 / 时长格式化
     │   ├── ColorPickerDialog.kt             306 行  ChartColors 仓库 + 颜色选择面板（miuix ColorPalette）
     │   ├── common/BlurTopBar.kt             115 行  顶栏三档模糊封装
     │   └── theme/
@@ -288,10 +356,10 @@ app/src/main/
         ├── ScreenController.kt               76 行  特权通道注入电源键熄屏
         ├── CsvExporter.kt                   163 行  导出 CSV 到 MediaStore.Downloads（含分页流式写出）
         ├── AppStrings.kt                     40 行  object 单例取文案的桥（i18n，由 Application 注入）
-        └── Prefs.kt                          88 行  SharedPreferences 封装
+        └── Prefs.kt                         104 行  SharedPreferences 封装（含监测模式持久化）
 ```
 
-Kotlin 共 **29 个文件、7540 行**；另有 1 个 AIDL 契约与 11 个资源文件。
+Kotlin 共 **39 个文件、9820 行**；另有 1 个 AIDL 契约与 11 个资源文件。
 
 ### 数据流
 

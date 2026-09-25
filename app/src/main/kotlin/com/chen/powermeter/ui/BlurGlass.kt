@@ -114,6 +114,13 @@ val DialogGlassBorderLight = Color(0x33000000)
 val DialogGlassBorderDark = Color(0x33FFFFFF)
 
 /**
+ * 弹窗按钮背景占所在半区（单按钮为整行）的宽度比例。
+ * 口径对齐 SportLink DialogButtonRow（2026-08-24 定稿 0.8）：按钮恒定落在弹窗宽度的
+ * 1/4 与 3/4 处，不随文字宽度漂移。
+ */
+const val DialogButtonWidthFraction = 0.8f
+
+/**
  * 弹窗外部 scrim 毛玻璃样式：25% 黑压暗底 + 20dp 模糊。模糊层自带压暗底色，替代原 scrim 的
  * 纯 background(Black@0.25f)，弹窗外部显示模糊的页面内容。
  */
@@ -353,12 +360,36 @@ fun GlassDialog(
                     }
                 }
                 if (text != null) Spacer(Modifier.height(16.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    dismissButton?.invoke()
-                    confirmButton()
+                // ── 按钮栏（口径对齐 SportLink DialogButtonRow.kt）──
+                // 双按钮：取消/确定各居中于左/右半区，按钮背景宽 = 半区的 80%
+                // （[DialogButtonWidthFraction]），恒定落在弹窗宽度的 1/4 与 3/4 处。
+                // ⚠️ 半区必须 weight(1f) 而非 fillMaxWidth(0.5f)：Row 对固定尺寸子项逐个
+                // 扣减剩余宽，第二个 0.5f Box 实际只分到 0.25W，fillMaxWidth 的按钮被撑进
+                // 窄盒 → 文字竖排/省略号（SportLink 2026-08-22 实机教训，逐字照搬兜底）。
+                // 单按钮（无 dismissButton）：整行居中，占整行 80%。
+                val dismiss = dismissButton
+                if (dismiss != null) {
+                    Row(Modifier.fillMaxWidth()) {
+                        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                            Box(
+                                Modifier.fillMaxWidth(DialogButtonWidthFraction),
+                                contentAlignment = Alignment.Center,
+                            ) { dismiss() }
+                        }
+                        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                            Box(
+                                Modifier.fillMaxWidth(DialogButtonWidthFraction),
+                                contentAlignment = Alignment.Center,
+                            ) { confirmButton() }
+                        }
+                    }
+                } else {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Box(
+                            Modifier.fillMaxWidth(DialogButtonWidthFraction),
+                            contentAlignment = Alignment.Center,
+                        ) { confirmButton() }
+                    }
                 }
             }
         }

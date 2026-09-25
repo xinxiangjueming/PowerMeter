@@ -3,8 +3,10 @@ package com.chen.powermeter
 import android.app.Application
 import com.chen.powermeter.data.RootPowerReader
 import com.chen.powermeter.data.db.SessionRecorder
+import com.chen.powermeter.service.FrameRecordController
 import com.chen.powermeter.util.AppStrings
 import com.chen.powermeter.util.ShizukuHelper
+import java.io.File
 
 /**
  * Application：尽早初始化 [ShizukuHelper] 与 [RootPowerReader]。
@@ -30,6 +32,10 @@ class PowerMeterApp : Application() {
         ShizukuHelper.init(this)
         RootPowerReader.init(this)
 
+        // 帧率录制控制器：只注入 applicationContext（落库用），不起任何线程 ——
+        // 采集循环等用户点开始录制时才拉起
+        FrameRecordController.init(this)
+
         // 采样会话落库（Room，私有目录）。init 只做两件事：取 DAO、拉起单消费者协程，
         // 不建库不写盘（Room 是懒打开的），因此对冷启动耗时无实质影响。
         SessionRecorder.init(this)
@@ -38,5 +44,10 @@ class PowerMeterApp : Application() {
         // 放在 Application 里而不是 Activity —— 服务可能在无界面的情况下被拉起，
         // 届时同样需要把历史存档收敛到一条。
         SessionRecorder.pruneOldSessionsAsync()
+
+        // 帧率 xlsx 分享暂存目录（cacheDir/share）冷启动清空（2026-09-25 方案 A）：
+        // 每次分享本来就会先清空，这里兜的是「分享过一次之后再也没分享过」的残留。
+        // 最多一个文件几百 KB；纯本地 IO 且目录几乎总是空/不存在，不值得为它起协程。
+        runCatching { File(cacheDir, "share").deleteRecursively() }
     }
 }

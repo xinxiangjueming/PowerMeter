@@ -9,9 +9,12 @@ object Prefs {
     private const val KEY_WAKELOCK = "wake_lock"
     private const val KEY_CHARGE_MONITOR = "charge_monitor"
     private const val KEY_SERIES_DUAL_BATTERY = "series_dual_battery"
+    private const val KEY_MONITOR_MODE = "monitor_mode"
 
     /** 曲线自定义颜色（ARGB Int），按指标名分键存储 */
     private const val KEY_METRIC_COLOR_PREFIX = "metric_color_"
+
+    /** 帧率悬浮窗位置（px）；-1 = 未拖动过，用默认位（右缘留 4dp、垂直 1/2 屏高） */
 
     fun getIntervalMs(context: Context): Long =
         context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -42,7 +45,7 @@ object Prefs {
     }
 
     /**
-     * 充电功率监测：开始采样 5s 后自动熄屏，并在「充电功率低于阈值持续足够久」时自动导出 CSV。
+     * 充电功率监测：开始采样 5s 后自动熄屏，并在「输入电流为 0 持续 30s」时自动导出 CSV。
      * 默认关闭 —— 该开关会主动改变屏幕状态，必须由用户显式开启。
      */
     fun getChargeMonitor(context: Context): Boolean =
@@ -69,6 +72,21 @@ object Prefs {
     }
 
     /**
+     * 顶栏双击切换的监测模式（[com.chen.powermeter.ui.MonitorMode.key]）。
+     *
+     * 存字符串而非枚举序号：序号会随枚举项增删漂移，字符串始终可读且可安全回落。
+     * 默认 POWER —— 老用户升级后仍停在功率监测。
+     */
+    fun getMonitorMode(context: Context): String =
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .getString(KEY_MONITOR_MODE, "power") ?: "power"
+
+    fun setMonitorMode(context: Context, mode: String) {
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_MONITOR_MODE, mode).apply()
+    }
+
+    /**
      * 读某指标的自定义曲线颜色（ARGB）。
      *
      * 未设置时返回 **null 而不是某个占位色** —— 「未自定义」与「自定义成了黑色」必须可区分：
@@ -85,4 +103,5 @@ object Prefs {
         context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
             .edit().putInt(KEY_METRIC_COLOR_PREFIX + metric, argb).apply()
     }
+
 }

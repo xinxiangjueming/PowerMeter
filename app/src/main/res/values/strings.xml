@@ -15,6 +15,11 @@
     <string name="action_authorize">授权</string>
     <string name="empty_no_samples">暂无采样数据</string>
 
+    <!-- ==================== 监测模式（顶栏双击切换） ==================== -->
+
+    <string name="mode_power">功率监测</string>
+    <string name="mode_frame">帧率监测</string>
+
     <!-- ==================== 顶栏 / 主界面状态 ==================== -->
 
     <string name="status_sampling">采样中 · 每 %1$dms</string>
@@ -70,6 +75,72 @@
     <string name="stat_charged_total">累计充入</string>
     <string name="stat_discharged_total">累计放出</string>
 
+    <!-- ==================== 帧率监测：历史记录 ==================== -->
+
+    <string name="frame_history_title">历史记录</string>
+    <!-- %1$d = 记录条数 -->
+    <string name="frame_history_count">共 %1$d 条</string>
+    <string name="frame_history_empty">暂无帧率记录</string>
+    <string name="frame_history_empty_desc">开始一次帧率采集后，记录会显示在这里</string>
+    <!-- 删除：历史列表管理模式（标题行右侧 Delete 图标 → 卡片右侧红框 → 确认弹窗） -->
+    <string name="frame_delete">删除记录</string>
+    <string name="frame_delete_confirm_title">删除这条帧率记录？</string>
+
+    <!-- ==================== 帧率监测：指标 ==================== -->
+
+    <string name="frame_fps">帧率</string>
+    <string name="frame_fps_avg">平均帧率</string>
+    <string name="frame_fps_min">最低帧率</string>
+    <string name="frame_fps_max">最高帧率</string>
+    <!-- 1% / 5% Low：最差 1%/5% 帧的平均帧率（CapFrameX 口径，帧加权）。业界通名，各语言同形；
+         裸 % 不是格式化占位，必须 formatted="false" 否则 aapt2 拒编译 -->
+    <string name="frame_fps_low_1" formatted="false">1% Low</string>
+    <string name="frame_fps_low_5" formatted="false">5% Low</string>
+    <string name="frame_space">帧间隔</string>
+    <string name="frame_jank">丢帧</string>
+    <string name="frame_refresh_rate">刷新率</string>
+    <string name="frame_cpu_clock">CPU 频率</string>
+    <string name="frame_cpu_usage">CPU 使用率</string>
+    <string name="frame_temp_virtual">虚拟温度</string>
+    <string name="unit_fps">FPS</string>
+    <!-- 悬浮 tab 右下角角标：%1$s = 本场录制的起始帧率（未采到时为破折号） -->
+    <string name="frame_start_fps">起始帧率 %1$s</string>
+    <!-- %1$s = 采集开始时间 -->
+    <string name="frame_captured_at">采集于 %1$s</string>
+    <string name="frame_not_found">记录不存在或已被删除</string>
+    <!-- 分享：详情页顶栏 → Kite 兼容 xlsx（系统分享接口） -->
+    <string name="frame_share">分享数据</string>
+    <string name="frame_share_empty">没有可分享的数据</string>
+    <string name="frame_share_failed">分享失败，请重试</string>
+    <!-- 详情页重构（Kite 报告版式）：顶部统计网格 / 帧率与温度卡 / 卡顿口径 -->
+    <string name="frame_detail_fps_temp">帧率与温度</string>
+    <string name="frame_energy_per_frame">帧能耗</string>
+    <string name="frame_jank_rate">卡顿率</string>
+    <string name="frame_steady_index">稳帧指数</string>
+    <string name="frame_steady_index_info">稳帧指数 = 帧时间标准差（ms），是 PerfDog 稳帧指数（Smooth，综合帧时间波动评估平稳度）的简化口径：数值越小，帧间隔越均匀，画面越稳。</string>
+    <string name="frame_jank_info">卡顿判定（PerfDog 式口径，按 1 秒粒度）：帧时间大于前 3 秒均值 2× 记小卡顿；再超过 83ms（两倍电影帧耗时）记卡顿；大于均值 3× 且超过 125ms 记严重卡顿。顶部卡顿率 = 卡顿总时长 ÷ 总时长。</string>
+    <string name="frame_variance">方差</string>
+    <!-- FPS 卡右上角：切换右轴指标（电量/温度/CPU/GPU load） -->
+    <string name="frame_right_axis_switch">切换右轴指标</string>
+
+    <!-- ==================== 帧率监测：录制悬浮窗 ==================== -->
+
+    <string name="frame_fab_open">显示帧率悬浮窗</string>
+    <string name="frame_fab_close">关闭帧率悬浮窗</string>
+    <string name="frame_record_duration">录制时长（分）</string>
+    <string name="frame_overlay_permission_rationale">需要「显示在其它应用上层」权限，帧率悬浮窗才能盖在游戏或视频上方</string>
+    <string name="notify_overlay_title">帧率悬浮窗运行中</string>
+    <string name="frame_record_remaining">剩余 %1$s</string>
+    <!-- %1$d = 剩余秒数（限时录制的倒计时） -->
+    <string name="frame_record_countdown">剩余 %1$d 秒</string>
+    <!-- %1$s = 已录时长 mm:ss -->
+    <string name="frame_record_elapsed">已录 %1$s</string>
+    <string name="frame_error_no_access">无可用取数通道：未检测到 root 授权，也未连接 Shizuku</string>
+    <!-- 通道判定为「有」（Shizuku 已绑定 / 有 root）却仍读不到：问题在命令本身，详情见 logcat 的 FrameRateSource -->
+    <string name="frame_error_command_failed">取数通道已就绪，但命令执行失败（详情见 logcat：FrameRateSource）</string>
+    <string name="frame_error_no_target_app">尚未识别到被测应用：请切到要测试的应用（本应用不计）</string>
+    <string name="frame_error_save_failed">帧率记录保存失败</string>
+
     <!-- ==================== 电池信息卡 ==================== -->
 
     <string name="title_battery">电池</string>
@@ -97,7 +168,7 @@
     <string name="option_keep_sampling_on_lock_desc">用 CPU 唤醒锁换取息屏后采样连续；关闭时息屏间隔放宽到 5s，更省电</string>
 
     <string name="option_charge_monitor">充电功率监测</string>
-    <string name="option_charge_monitor_desc">点击开始采样 5s 后熄灭屏幕；充电功率低于 1W 且持续超过 5min 时自动保存 CSV 文件（不停止采样）</string>
+    <string name="option_charge_monitor_desc">点击开始采样 5s 后熄灭屏幕；输入电池的电流为 0mA 且持续 30s 时自动保存 CSV 文件（不停止采样）</string>
 
     <string name="option_series_dual_battery">串联双电池</string>
     <string name="option_series_dual_battery_desc">内核上报单节电压，串联机型整组电压 ×2，功率随之 ×2（小米机器不需要开启）</string>
@@ -112,12 +183,22 @@
 
     <string name="channel_name_sampling">实时功率采样</string>
     <string name="channel_desc_sampling">锁屏后持续读取底层电量节点</string>
+
+    <!-- 帧率录制的常驻通知：录制时要能切到被测应用，进程必须保持前台 -->
+    <string name="channel_name_frame_record">帧率录制</string>
+    <string name="channel_desc_frame_record">录制期间持续采集帧率与设备温度，保持进程不被系统冻结</string>
+    <!-- %1$d = 当前帧率 -->
+    <!-- %1$s = 帧率整数；录制刚开始还没有第一帧差分时是「—」 -->
+    <string name="notify_frame_title">帧率录制中 · %1$s FPS</string>
+    <!-- %1$s = 已录时长 mm:ss -->
+    <string name="notify_frame_text">已录 %1$s</string>
+    <string name="notify_frame_no_access">帧率录制已中止：无可用取数通道</string>
     <string name="notify_starting">正在启动采样…</string>
     <string name="notify_title_charging">充电中 · %1$d%%</string>
     <string name="notify_title_discharging">放电中 · %1$d%%</string>
     <!-- 实况通知（Live Update）展开态两行；%1$s / %2$s = 已带单位的数值（不翻译数值模板） -->
     <string name="notify_live_row1">电压 %1$s  电流 %2$s</string>
-    <string name="notify_live_row2">电池温度 %1$s  充电 IC 温度 %2$s</string>
+    <string name="notify_live_row2">电池温度 %1$s</string>
     <!-- %1$s = 文件名，%2$d = 记录条数 -->
     <string name="notify_auto_saved">已自动保存 %1$s（%2$d 条记录，采样继续）</string>
     <string name="notify_auto_save_failed">自动保存失败，采样继续</string>

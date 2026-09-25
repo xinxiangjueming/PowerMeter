@@ -1,7 +1,14 @@
 package com.chen.powermeter.ui
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -73,9 +80,11 @@ import kotlin.math.roundToInt
  * 增强版趋势曲线组件。
  *
  * 承载四项能力的组合，各调用点按需开启：
- * 1. **多序列叠加**（`series.size > 1`）—— 各曲线按**自身在可见窗口内的量程**归一化到绘图区，
- *    实现不同量纲指标同屏对比。此时 Y 轴刻度失去统一物理含义，故改为「图例标量程 +
- *    按住气泡显示真实值」，不再画数值刻度（避免误读）。
+ * 1. **多序列叠加** —— 三段轴口径（对齐 SportLink `ChartFullscreenActivity`）：
+ *    1 条 = 单 Y 轴（灰）；2 条 = **左右双 Y 轴**（左轴 = 第 1 条曲线的量程、右轴 = 第 2 条的，
+ *    刻度各染曲线色，绘制几何与归一化叠加完全相同，只是把两侧「各自量程」用刻度显式标出）；
+ *    3+ 条 = 各曲线按**自身在可见窗口内的量程**归一化到绘图区，Y 轴刻度失去统一物理含义
+ *    → 双轴一并隐藏，改「图例标量程 + 按住气泡显示真实值」（避免误读）。
  * 2. **曲线下方同色渐变填充** —— 渐变锚定在绘图区上下边（即该序列自身量程的上下界），
  *    所以填充顶部恰好贴着曲线的最高点，是标准面积图形态。
  * 3. **按住读数** —— 竖线 + 数据点 + 悬浮气泡。气泡是 Compose 文本节点而非 Canvas 绘制：
@@ -100,6 +109,12 @@ private const val FILL_TOP_ALPHA = 0.38f
 /** 填充淡入/淡出时长：单 ↔ 多曲线切换时用，避免填充瞬间消失或出现 */
 private const val FILL_FADE_MS = 260
 
+/**
+ * Y 轴列 / 量程图例出现与隐藏的过渡时长（淡入淡出 + 宽度/高度展开收缩）。
+ * 对齐 SportLink `HeartRateChartView.PADDING_ANIM_MS`。
+ */
+private const val AXIS_ANIM_MS = 250
+
 /** [scrubIndex] 的「无读数」哨兵值 */
 private const val NO_INDEX = -1
 
@@ -114,33 +129,39 @@ private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 private fun Double.f0(): String = String.format(Locale.US, "%.0f", this)
 
 /**
- * 按指标取小数位（2026-09-21 用户约定）：
- * 电流 → 整数；PMIC 温度 → 整数（温感区分辨率只到整度）；电池温度 → 1 位小数；
- * 其余（功率 / 电压 / OCV / 充电 IC 温度）→ 3 位。
- * Y 轴刻度、图例量程、读数气泡三处共用，保证同一指标任何位置口径一致。
+ * 按小数位格式化一个坐标值。Y 轴刻度、图例量程、读数气泡三处共用，保证同一条曲线
+ * 在任何位置口径一致。
+ *
+ * 参数改成「小数位」而不是指标枚举（2026-09-21 泛化）：帧率监测的曲线不是 [Metric]，
+ * 而图表本身只关心"这个量该显示几位"——把格式化按小数位收口后，功率侧与帧率侧共用
+ * 同一套绘图与读数逻辑，不必为帧率再抄一份图表。
+ * 小数位的取值口径仍由各侧自己定：功率侧见 [Metric.decimals]，帧率侧见
+ * `FrameDetailActivity.FrameMetric.decimals`。
  *
  * [Double.NaN] = 该点无读数（典型：PMIC 温度在旧版 15 列 CSV 里整列为空），统一渲染成
  * 破折号 —— 与指标卡片的 `f3OrDash` 同口径。不处理的话 `String.format` 会写出 "NaN"，
  * 摆在读数气泡与量程里比留白更像故障。
  */
-private fun Double.fMetric(metric: Metric?): String {
+private fun Double.fDecimals(decimals: Int): String {
     if (isNaN()) return "—"
-    return when (metric) {
-        // 只到个位的量：电流 mA（内核只上报 mA 整数）与 PMIC 温度（温感区分辨率只到整度）
-        Metric.CURRENT, Metric.PMIC_TEMP -> f0()
-        Metric.TEMP -> f1()
+    return when {
+        decimals <= 0 -> f0()
+        decimals == 1 -> f1()
         else -> f3()
     }
 }
 
 /**
- * 一条曲线的绘制数据；[values] 与传入的 samples 按下标一一对应。
+ * 一条曲线的绘制数据；[values] 与传入的 `times` 按下标一一对应。
  *
  * [label] 是**已解析**的本地化文本：图例与读数气泡在 `forEachIndexed` 等非 Composable
  * lambda 里取用它，那里调不了 `stringResource`，故由 [toSeries] 的调用方提前解析好。
+ *
+ * [decimals]：该曲线数值的显示小数位（见 [Double.fDecimals]）。刻意不放指标枚举 ——
+ * 绘图层不该知道"这是功率还是帧率"，只该知道"显示几位"。
  */
 internal data class ChartSeries(
-    val metric: Metric,
+    val decimals: Int,
     val label: String,
     val unit: String,
     val color: Color,
@@ -156,9 +177,20 @@ internal fun Metric.unitLabel(): String = when (this) {
     Metric.TEMP, Metric.CHARGER_TEMP, Metric.PMIC_TEMP -> "℃"
 }
 
+/**
+ * 指标显示小数位（2026-09-21 用户约定的精度分级）：
+ * 电流 mA → 整数（内核只上报 mA 整数）；PMIC 温度 → 整数（温感区分辨率只到整度）；
+ * 电池温度 → 1 位；其余（功率 / 电压 / 充电 IC 温度）→ 3 位。
+ */
+internal fun Metric.decimals(): Int = when (this) {
+    Metric.CURRENT, Metric.PMIC_TEMP -> 0
+    Metric.TEMP -> 1
+    else -> 3
+}
+
 internal fun Metric.toSeries(samples: List<PowerSample>, color: Color, label: String): ChartSeries =
     ChartSeries(
-        metric = this,
+        decimals = decimals(),
         label = label,
         unit = unitLabel(),
         color = color,
@@ -345,26 +377,26 @@ private fun decimateIndices(
 }
 
 /** 第一个 timeMillis >= [t] 的下标（可能等于 size） */
-private fun lowerBound(samples: List<PowerSample>, t: Long): Int {
+private fun lowerBound(times: List<Long>, t: Long): Int {
     var lo = 0
-    var hi = samples.size
+    var hi = times.size
     while (lo < hi) {
         val mid = (lo + hi) ushr 1
-        if (samples[mid].timeMillis < t) lo = mid + 1 else hi = mid
+        if (times[mid] < t) lo = mid + 1 else hi = mid
     }
     return lo
 }
 
 private fun computeGeometry(
-    samples: List<PowerSample>,
+    times: List<Long>,
     series: List<ChartSeries>,
     winStart: Float,
     winEnd: Float,
 ): ChartGeometry {
-    val last = samples.lastIndex
-    val t0 = samples.first().timeMillis
+    val last = times.lastIndex
+    val t0 = times.first()
     // 时间跨度；全部时间戳相同 → 0，X 轴退化为按序号均分（否则所有点会挤在 x = 0）
-    val tSpan = (samples[last].timeMillis - t0).coerceAtLeast(0L)
+    val tSpan = (times[last] - t0).coerceAtLeast(0L)
     val byIndex = tSpan <= 0L
 
     val ws = winStart.coerceIn(0f, 1f)
@@ -373,8 +405,8 @@ private fun computeGeometry(
     val vSpan = ((tSpan * we).toLong() - (tSpan * ws).toLong()).coerceAtLeast(1L)
 
     // 可见窗口边界用二分定位（导入文件可达 2 万点，线性扫描在每帧缩放时也会积少成多）
-    var visStart = if (byIndex) (ws * last).roundToInt() else lowerBound(samples, vT0)
-    var visEnd = if (byIndex) (we * last).roundToInt() else lowerBound(samples, vT0 + vSpan) - 1
+    var visStart = if (byIndex) (ws * last).roundToInt() else lowerBound(times, vT0)
+    var visEnd = if (byIndex) (we * last).roundToInt() else lowerBound(times, vT0 + vSpan) - 1
 
     if (visStart > visEnd) {
         // 窗口窄到两个采样点之间：退化为离窗口起点最近的一个点，保证仍有东西可画
@@ -386,13 +418,13 @@ private fun computeGeometry(
     visEnd = visEnd.coerceIn(visStart, last)
 
     // 横向比例预计算：曲线、读数竖线、气泡三处共用，避免各自换算导致时间轴错位
-    val xFractions = FloatArray(samples.size)
+    val xFractions = FloatArray(times.size)
     val visSpanFraction = (we - ws).coerceAtLeast(1e-4f)
     for (i in 0..last) {
         xFractions[i] = if (byIndex) {
             if (last <= 0) 0f else i.toFloat() / last
         } else {
-            val global = (samples[i].timeMillis - t0).toDouble() / tSpan.toDouble()
+            val global = (times[i] - t0).toDouble() / tSpan.toDouble()
             ((global - ws) / visSpanFraction).toFloat()
         }
     }
@@ -434,29 +466,29 @@ private fun computeGeometry(
 
 /** 手指横坐标 → 最近的采样下标（按序号均分的退化模式下直接线性映射） */
 private fun nearestIndex(
-    samples: List<PowerSample>,
+    times: List<Long>,
     geom: ChartGeometry,
     x: Float,
     widthPx: Int,
 ): Int {
-    if (samples.isEmpty()) return 0
+    if (times.isEmpty()) return 0
     if (widthPx <= 0) return geom.visStart
     val fraction = (x / widthPx).coerceIn(0f, 1f)
     if (geom.byIndex) {
-        val picked = (fraction * samples.lastIndex).roundToInt()
+        val picked = (fraction * times.lastIndex).roundToInt()
         return picked.coerceIn(geom.visStart, geom.visEnd)
     }
     val target = geom.vT0 + (geom.vSpan * fraction).toLong()
-    val i = lowerBound(samples, target)
-    val a = (i - 1).coerceIn(0, samples.lastIndex)
-    val b = i.coerceIn(0, samples.lastIndex)
-    val picked = if (abs(samples[a].timeMillis - target) <= abs(samples[b].timeMillis - target)) a else b
+    val i = lowerBound(times, target)
+    val a = (i - 1).coerceIn(0, times.lastIndex)
+    val b = i.coerceIn(0, times.lastIndex)
+    val picked = if (abs(times[a] - target) <= abs(times[b] - target)) a else b
     return picked.coerceIn(geom.visStart, geom.visEnd)
 }
 
 @Composable
 internal fun TrendChart(
-    samples: List<PowerSample>,
+    times: List<Long>,
     series: List<ChartSeries>,
     modifier: Modifier = Modifier.fillMaxWidth().height(150.dp),
     strokeWidth: Float = 6f,
@@ -471,7 +503,7 @@ internal fun TrendChart(
     state: TrendChartState? = null,
 ) {
     Column(modifier) {
-        if (samples.size < 2 || series.isEmpty()) {
+        if (times.size < 2 || series.isEmpty()) {
             Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                 Text(
                     stringResource(R.string.empty_no_samples),
@@ -482,7 +514,7 @@ internal fun TrendChart(
             }
         } else {
             ChartBody(
-                samples = samples,
+                times = times,
                 series = series,
                 strokeWidth = strokeWidth,
                 axisLabelSp = axisLabelSp,
@@ -494,16 +526,22 @@ internal fun TrendChart(
 
 @Composable
 private fun ColumnScope.ChartBody(
-    samples: List<PowerSample>,
+    times: List<Long>,
     series: List<ChartSeries>,
     strokeWidth: Float,
     axisLabelSp: TextUnit,
     state: TrendChartState?,
 ) {
-    val normalized = series.size > 1
-    // 填充的显示程度：单曲线 1、叠加 0，用动画过渡（曲线数量变化时不出现瞬间跳变）
+    // 三段轴口径（对齐 SportLink ChartFullscreenActivity.updateChartConfig）：
+    // 1 tab 单轴（灰）→ 2 tab 左右双轴（刻度染曲线色）→ 3+ tab 归一化叠加、轴隐藏、量程进图例。
+    // 2 tab 的绘制几何与 3+ 完全相同（各曲线按自身量程映射到绘图区），双轴只是把两条曲线
+    // 各自的量程用左右刻度显式标出来 —— 曲线位置一个像素都不用挪。
+    val normalized = series.size > 2
+    val dualAxis = series.size == 2
+    // 填充的显示程度：单曲线 1、叠加（2+）0，用动画过渡（曲线数量变化时不出现瞬间跳变）。
+    // 阈值对齐 SportLink setDrawFilled(size <= 1)：双轴下两条不同量程的填充叠画毫无可读性
     val fillProgress by animateFloatAsState(
-        targetValue = if (normalized) 0f else 1f,
+        targetValue = if (series.size == 1) 1f else 0f,
         animationSpec = tween(durationMillis = FILL_FADE_MS),
         label = "chartFillProgress",
     )
@@ -518,19 +556,24 @@ private fun ColumnScope.ChartBody(
     // 几何量只依赖「样本 + 指标集合 + 窗口」，与颜色无关。
     // 用 series 的指标名当轻量签名：ChartSeries.values 是上万长度的 List，
     // 直接拿 series 当 remember key 会退化成每次重组做一次 O(n) 的 equals 比较。
-    val seriesKey = series.map { it.metric.name }
-    val geom = remember(samples, seriesKey, winStart, winEnd) {
-        computeGeometry(samples, series, winStart, winEnd)
+    val seriesKey = series.map { it.label }
+    val geom = remember(times, seriesKey, winStart, winEnd) {
+        computeGeometry(times, series, winStart, winEnd)
     }
 
     // 手势回调里要读到最新几何量，但 pointerInput 的 key 必须是稳定的：
     // 若把 geom 当 key，每缩放一步协程都会被取消重建，正在进行的捏合手势会当场断掉。
     val geomRef = rememberUpdatedState(geom)
-    val samplesRef = rememberUpdatedState(samples)
+    val timesRef = rememberUpdatedState(times)
 
     var scrubIndex by remember { mutableIntStateOf(NO_INDEX) }
     var plotWidthPx by remember { mutableIntStateOf(0) }
     var yAxisWidthPx by remember { mutableIntStateOf(0) }
+
+    // 右轴（2 tab 双轴）列实测宽度：x 轴时间行 / 底部滑条右侧同样要给它让位。
+    // 与 yAxisWidthPx 一样挂在 AnimatedVisibility 容器上 —— 动画中测到的是**容器**宽度，
+    // 出现/隐藏时 x 轴与滑条跟着连续缩进，而不是瞬间跳变。
+    var trailingAxisWidthPx by remember { mutableIntStateOf(0) }
     var bubbleWidthPx by remember { mutableIntStateOf(0) }
 
     // 抽稀（档二-2）：可见点数超过绘图区像素宽的 2 倍时，按分桶 min/max 抽到「约 1 像素 2 点」。
@@ -552,7 +595,7 @@ private fun ColumnScope.ChartBody(
             awaitEachGesture {
                 val first = awaitFirstDown(requireUnconsumed = false)
                 var scrubbing = true
-                scrubIndex = nearestIndex(samplesRef.value, geomRef.value, first.position.x, size.width)
+                scrubIndex = nearestIndex(timesRef.value, geomRef.value, first.position.x, size.width)
                 while (true) {
                     val event = awaitPointerEvent()
                     val pressed = event.changes.filter { it.pressed }
@@ -574,7 +617,7 @@ private fun ColumnScope.ChartBody(
                         event.changes.forEach { it.consume() }
                     } else if (scrubbing) {
                         val change = pressed.first()
-                        scrubIndex = nearestIndex(samplesRef.value, geomRef.value, change.position.x, size.width)
+                        scrubIndex = nearestIndex(timesRef.value, geomRef.value, change.position.x, size.width)
                         change.consume()
                     }
                 }
@@ -585,10 +628,10 @@ private fun ColumnScope.ChartBody(
         Modifier.pointerInput(Unit) {
             detectDragGesturesAfterLongPress(
                 onDragStart = { offset ->
-                    scrubIndex = nearestIndex(samplesRef.value, geomRef.value, offset.x, size.width)
+                    scrubIndex = nearestIndex(timesRef.value, geomRef.value, offset.x, size.width)
                 },
                 onDrag = { change, _ ->
-                    scrubIndex = nearestIndex(samplesRef.value, geomRef.value, change.position.x, size.width)
+                    scrubIndex = nearestIndex(timesRef.value, geomRef.value, change.position.x, size.width)
                 },
                 onDragEnd = { scrubIndex = NO_INDEX },
                 onDragCancel = { scrubIndex = NO_INDEX },
@@ -596,10 +639,17 @@ private fun ColumnScope.ChartBody(
         }
     }
 
-    if (normalized) {
-        // 归一化叠加时 Y 轴没有统一物理含义 → 量程由图例承载，真实值由读数气泡承载
-        LegendRow(series, geom.ranges, labelColor)
-        Spacer(Modifier.height(6.dp))
+    // 归一化叠加（3+）时 Y 轴没有统一物理含义 → 量程由图例承载，真实值由读数气泡承载。
+    // 出现/消失与轴列同节奏（淡入 + 高度展开），不把下方绘图区一下子顶开/收回来
+    AnimatedVisibility(
+        visible = normalized,
+        enter = fadeIn(tween(AXIS_ANIM_MS)) + expandVertically(tween(AXIS_ANIM_MS)),
+        exit = fadeOut(tween(AXIS_ANIM_MS)) + shrinkVertically(tween(AXIS_ANIM_MS)),
+    ) {
+        Column {
+            LegendRow(series, geom.ranges, labelColor)
+            Spacer(Modifier.height(6.dp))
+        }
     }
 
     // 图例 / 绘图区 / 滑条三段作为**外层 Column 的直接子节点**排布：绘图区 weight(1f)
@@ -608,12 +658,23 @@ private fun ColumnScope.ChartBody(
     // 拿到外层 TrendChart 那个 Column 的作用域（跨 Composable 调用会断掉隐式接收者，
     // 普通函数里 Modifier.weight 直接 Unresolved reference）。
     Row(Modifier.fillMaxWidth().weight(1f)) {
-        if (!normalized) {
+        // 左轴：1 tab = 单轴（灰）；2 tab = 双轴的左轴（第 1 条曲线色 + 它的量程）；3+ tab 隐藏。
+        // onSizeChanged 必须挂在 AnimatedVisibility 上（容器）：挂内部 YAxisColumn 测到的是
+        // 完整内容宽，出现/隐藏动画期间不会收缩；挂容器则 x 轴行 / 滑条跟着连续缩进。
+        // expand/shrink 靠绘图区一侧（左轴 End / 右轴 Start）——对齐 SportLink 边距动画观感：
+        // 刻度贴着绘图区一侧滑出/滑入，而不是从屏幕边缘飘进来。
+        AnimatedVisibility(
+            visible = !normalized,
+            enter = fadeIn(tween(AXIS_ANIM_MS)) +
+                expandHorizontally(tween(AXIS_ANIM_MS), expandFrom = Alignment.End),
+            exit = fadeOut(tween(AXIS_ANIM_MS)) +
+                shrinkHorizontally(tween(AXIS_ANIM_MS), shrinkTowards = Alignment.End),
+            modifier = Modifier.onSizeChanged { yAxisWidthPx = it.width },
+        ) {
             YAxisColumn(
-                labels = axisLabels(geom.ranges.first(), series.firstOrNull()?.metric),
+                labels = axisLabels(geom.ranges.first(), series.first().decimals),
                 labelSp = axisLabelSp,
-                color = labelColor,
-                modifier = Modifier.onSizeChanged { yAxisWidthPx = it.width },
+                color = if (dualAxis) series[0].color else labelColor,
             )
         }
         Box(
@@ -644,8 +705,8 @@ private fun ColumnScope.ChartBody(
                 }
 
                 // 填充与折线分两轮画：先铺完全部填充再画全部线，否则后画的填充会盖住先画的线。
-                // 叠加模式（normalized）**不画填充**：各条曲线按自身量程映射到 0..1，
-                // 填充高度没有统一物理含义，且四种半透明色互相叠压会糊成一片。
+                // 叠加（2+ 条曲线）**不画填充**：各条按自身量程映射到 0..1，2 tab 双轴下两条
+                // 不同量程的填充互相叠压、3+ 归一化叠加填充高度无统一物理含义，都会糊成一片。
                 // 单 → 多切换时由 fillProgress 做淡出/淡入，不让填充"啪"地消失。
                 val fillTopAlpha = FILL_TOP_ALPHA * fillProgress
                 clipRect(left = 0f, top = 0f, right = w, bottom = h) {
@@ -756,7 +817,7 @@ private fun ColumnScope.ChartBody(
 
             // 读数气泡：位置跟随手指所在的采样点，并按气泡自身宽度夹住两端不出框
             val idx = scrubIndex
-            if (idx in samples.indices && idx in geom.visStart..geom.visEnd && plotWidthPx > 0) {
+            if (idx in times.indices && idx in geom.visStart..geom.visEnd && plotWidthPx > 0) {
                 val centerX = geom.xFractions[idx] * plotWidthPx
                 Box(
                     Modifier
@@ -783,7 +844,7 @@ private fun ColumnScope.ChartBody(
                                 )
                                 Spacer(Modifier.width(5.dp))
                                 Text(
-                                    "${sr.label} ${sr.values[idx].fMetric(sr.metric)} ${sr.unit}",
+                                    "${sr.label} ${sr.values[idx].fDecimals(sr.decimals)} ${sr.unit}",
                                     fontSize = 11.sp,
                                     fontFamily = ChartNumericFont,
                                     fontWeight = FontWeight.Medium,
@@ -794,19 +855,41 @@ private fun ColumnScope.ChartBody(
                 }
             }
         }
+
+        // 右轴：仅 2 tab 双轴时出现（第 2 条曲线色 + 它的量程刻度），出现/隐藏与左轴同节奏。
+        // 2→1 切走的退出动画里 series 可能已只剩 1 条 → 内容按存在性降级为空：刻度立即停画、
+        // 绘图区随容器动画展开（对齐 SportLink clearDualYAxis 后立即停画刻度、边距渐回的观感）
+        AnimatedVisibility(
+            visible = dualAxis,
+            enter = fadeIn(tween(AXIS_ANIM_MS)) +
+                expandHorizontally(tween(AXIS_ANIM_MS), expandFrom = Alignment.Start),
+            exit = fadeOut(tween(AXIS_ANIM_MS)) +
+                shrinkHorizontally(tween(AXIS_ANIM_MS), shrinkTowards = Alignment.Start),
+            modifier = Modifier.onSizeChanged { trailingAxisWidthPx = it.width },
+        ) {
+            if (series.size >= 2) {
+                YAxisColumn(
+                    labels = axisLabels(geom.ranges[1], series[1].decimals),
+                    labelSp = axisLabelSp,
+                    color = series[1].color,
+                    alignStart = true,
+                )
+            }
+        }
     }
 
     // x 轴时间（精确到秒）：常态标**可见窗口**两端，随缩放 / 平移实时更新；读数中改为贴竖线
     // 显示**当前该点**的时间（读数气泡不再重复带时间）。全屏页位于「x 轴与底部滑条之间的空白区」
     // ——即绘图区之后、ChartScrollbar 之前；卡片内嵌页无滑条，则直接贴在绘图区下方。
     val axisScrubIdx = scrubIndex
-    val axisScrubbing = axisScrubIdx in samples.indices && axisScrubIdx in geom.visStart..geom.visEnd
+    val axisScrubbing = axisScrubIdx in times.indices && axisScrubIdx in geom.visStart..geom.visEnd
     XAxisTimeRow(
         startMillis = geom.vT0,
         endMillis = geom.vT0 + geom.vSpan,
-        cursorMillis = if (axisScrubbing) samples[axisScrubIdx].timeMillis else null,
+        cursorMillis = if (axisScrubbing) times[axisScrubIdx] else null,
         cursorFraction = if (axisScrubbing) geom.xFractions[axisScrubIdx] else 0f,
-        leadingSpacePx = if (normalized) 0 else yAxisWidthPx,
+        leadingSpacePx = yAxisWidthPx,
+        trailingSpacePx = trailingAxisWidthPx,
         plotWidthPx = plotWidthPx,
         labelSp = axisLabelSp,
         color = labelColor,
@@ -819,33 +902,43 @@ private fun ColumnScope.ChartBody(
             zoomed = state.zoomed,
             windowStart = state.windowStart,
             windowEnd = state.windowEnd,
-            leadingSpacePx = if (normalized) 0 else yAxisWidthPx,
+            leadingSpacePx = yAxisWidthPx,
+            trailingSpacePx = trailingAxisWidthPx,
             onCenterTo = { state.centerOn(it) },
             density = density,
         )
     }
 }
 
-/** Y 轴刻度列；宽度取 IntrinsicSize.Max = 最宽一条刻度的固有宽度（自适应，不硬编码 dp） */
+/**
+ * Y 轴刻度列；宽度取 IntrinsicSize.Max = 最宽一条刻度的固有宽度（自适应，不硬编码 dp）。
+ *
+ * [alignStart] = false（左轴）：刻度右对齐、与绘图区的 8dp 间距开在 end —— 数字贴近绘图区
+ * （对齐 SportLink 左轴 `Paint.Align.RIGHT`）；true（右轴）：镜像，刻度左对齐、间距开在 start。
+ */
 @Composable
 private fun YAxisColumn(
     labels: List<String>,
     labelSp: TextUnit,
     color: Color,
     modifier: Modifier = Modifier,
+    alignStart: Boolean = false,
 ) {
     Column(
         modifier
             .fillMaxHeight()
             .width(IntrinsicSize.Max)
-            .padding(end = 8.dp),
+            .padding(
+                start = if (alignStart) 8.dp else 0.dp,
+                end = if (alignStart) 0.dp else 8.dp,
+            ),
     ) {
         // 每条刻度各占 1/5 高度且在其槽内垂直居中 → 刻度中心恰好落在 (k + 0.5) / 5
         // 的高度比例上，与 Canvas 里的网格线公式天然对齐，不需要任何像素级换算
         labels.forEach { text ->
             Box(
                 Modifier.weight(1f).fillMaxWidth(),
-                contentAlignment = Alignment.CenterEnd,
+                contentAlignment = if (alignStart) Alignment.CenterStart else Alignment.CenterEnd,
             ) {
                 Text(
                     text,
@@ -860,10 +953,10 @@ private fun YAxisColumn(
     }
 }
 
-private fun axisLabels(range: Pair<Double, Double>, metric: Metric?): List<String> {
+private fun axisLabels(range: Pair<Double, Double>, decimals: Int): List<String> {
     val (lo, hi) = range
     val span = hi - lo
-    return (0..AXIS_TICKS).map { k -> (hi - span * k / AXIS_TICKS).fMetric(metric) }
+    return (0..AXIS_TICKS).map { k -> (hi - span * k / AXIS_TICKS).fDecimals(decimals) }
 }
 
 /** 归一化叠加时的图例：色块 + 指标名 + **可见窗口内**的量程与单位 */
@@ -885,7 +978,7 @@ private fun LegendRow(
                 Box(Modifier.size(8.dp).background(sr.color, RoundedCornerShape(50)))
                 Spacer(Modifier.width(5.dp))
                 Text(
-                    "${sr.label} ${ranges[index].first.fMetric(sr.metric)}~${ranges[index].second.fMetric(sr.metric)} ${sr.unit}",
+                    "${sr.label} ${ranges[index].first.fDecimals(sr.decimals)}~${ranges[index].second.fDecimals(sr.decimals)} ${sr.unit}",
                     fontSize = 11.sp,
                     fontFamily = ChartNumericFont,
                     color = labelColor,
@@ -912,6 +1005,7 @@ private fun ChartScrollbar(
     windowStart: Float,
     windowEnd: Float,
     leadingSpacePx: Int,
+    trailingSpacePx: Int,
     onCenterTo: (Float) -> Unit,
     density: androidx.compose.ui.unit.Density,
 ) {
@@ -968,6 +1062,10 @@ private fun ChartScrollbar(
                 )
             }
         }
+        // 右轴（2 tab 双轴）让位：轨道与绘图区右沿对齐，动画中连续收缩
+        if (trailingSpacePx > 0) {
+            Spacer(Modifier.width(with(density) { trailingSpacePx.toDp() }))
+        }
     }
 }
 
@@ -978,7 +1076,8 @@ private const val AXIS_TIME_FADE_MS = 120
  * x 轴时间行。
  *
  * - **常态**：只标**可见窗口**的两端时刻（精确到秒 `HH:mm:ss`），左端与绘图区左沿对齐
- *   （`leadingSpacePx` = Y 轴刻度列宽；归一化叠加模式无 Y 轴刻度列，传 0）；
+ *   （`leadingSpacePx` = 左 Y 轴刻度列实测宽、`trailingSpacePx` = 右轴列实测宽，双轴时
+ *   两侧都让位；归一化叠加模式两轴均隐藏，动画中测到 0 即自然过渡到位）；
  * - **读数中**（[cursorMillis] 非空）：两端淡出，改在**读数竖线正下方**显示当前该点的时间
  *   —— 读数气泡不再重复携带时间（用户 2026-09-21 拍板：「上面数据窗口里面的时间就不需要了」）。
  *
@@ -992,6 +1091,7 @@ private fun XAxisTimeRow(
     cursorMillis: Long?,
     cursorFraction: Float,
     leadingSpacePx: Int,
+    trailingSpacePx: Int,
     plotWidthPx: Int,
     labelSp: TextUnit,
     color: Color,
@@ -1056,6 +1156,10 @@ private fun XAxisTimeRow(
                     maxLines = 1,
                 )
             }
+        }
+        // 右轴（2 tab 双轴）让位：右端时刻与绘图区右沿对齐；动画中宽度连续收缩
+        if (trailingSpacePx > 0) {
+            Spacer(Modifier.width(with(density) { trailingSpacePx.toDp() }))
         }
     }
 }

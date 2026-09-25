@@ -13,6 +13,11 @@
     <string name="action_authorize">授權</string>
     <string name="empty_no_samples">暫無取樣資料</string>
 
+    <!-- ==================== 監測模式（雙擊頂欄標題切換） ==================== -->
+
+    <string name="mode_power">功率監測</string>
+    <string name="mode_frame">幀率監測</string>
+
     <!-- ==================== 頂欄 / 主介面狀態 ==================== -->
 
     <string name="status_sampling">取樣中 · 每 %1$dms</string>
@@ -65,6 +70,72 @@
     <string name="stat_charged_total">累計充入</string>
     <string name="stat_discharged_total">累計放出</string>
 
+    <!-- ==================== 幀率監測：歷史記錄 ==================== -->
+
+    <string name="frame_history_title">歷史記錄</string>
+    <!-- %1$d = 記錄筆數 -->
+    <string name="frame_history_count">共 %1$d 筆</string>
+    <string name="frame_history_empty">暫無幀率記錄</string>
+    <string name="frame_history_empty_desc">開始一次幀率採集後，記錄會顯示在這裡</string>
+    <!-- 刪除：歷史列表管理模式（標題列右側 Delete 圖示 → 卡片右側紅框 → 確認彈窗） -->
+    <string name="frame_delete">刪除記錄</string>
+    <string name="frame_delete_confirm_title">刪除這條幀率記錄？</string>
+
+    <!-- ==================== 幀率監測：指標 ==================== -->
+
+    <string name="frame_fps">幀率</string>
+    <string name="frame_fps_avg">平均幀率</string>
+    <string name="frame_fps_min">最低幀率</string>
+    <string name="frame_fps_max">最高幀率</string>
+    <!-- 1% / 5% Low：最差 1%/5% 幀的平均幀率（CapFrameX 口徑，幀加權）。業界通名，各語言同形；
+         裸 % 不是格式化佔位，必須 formatted="false" 否則 aapt2 拒編譯 -->
+    <string name="frame_fps_low_1" formatted="false">1% Low</string>
+    <string name="frame_fps_low_5" formatted="false">5% Low</string>
+    <string name="frame_space">幀間隔</string>
+    <string name="frame_jank">掉幀</string>
+    <string name="frame_refresh_rate">刷新率</string>
+    <string name="frame_cpu_clock">CPU 頻率</string>
+    <string name="frame_cpu_usage">CPU 使用率</string>
+    <string name="frame_temp_virtual">虛擬溫度</string>
+    <string name="unit_fps">FPS</string>
+    <!-- 懸浮 tab 右下角角標：%1$s = 本場錄製的起始幀率（未採到時為破折號） -->
+    <string name="frame_start_fps">起始幀率 %1$s</string>
+    <!-- %1$s = 採集開始時間 -->
+    <string name="frame_captured_at">採集於 %1$s</string>
+    <string name="frame_not_found">記錄不存在或已被刪除</string>
+    <!-- 分享：詳情頁頂欄 → Kite 相容 xlsx（系統分享介面） -->
+    <string name="frame_share">分享資料</string>
+    <string name="frame_share_empty">沒有可分享的資料</string>
+    <string name="frame_share_failed">分享失敗，請重試</string>
+    <!-- 詳情頁重構（Kite 報告版式）：頂部統計網格 / 幀率與溫度卡 / 卡頓口徑 -->
+    <string name="frame_detail_fps_temp">幀率與溫度</string>
+    <string name="frame_energy_per_frame">幀能耗</string>
+    <string name="frame_jank_rate">卡頓率</string>
+    <string name="frame_steady_index">穩幀指數</string>
+    <string name="frame_steady_index_info">穩幀指數＝幀時間標準差（ms），是 PerfDog 穩幀指數（Smooth，綜合幀時間波動評估平穩度）的簡化口徑：數值越小，幀間隔越均勻，畫面越穩。</string>
+    <string name="frame_jank_info">卡頓判定（PerfDog 式口徑，按 1 秒粒度）：幀時間大於前 3 秒均值 2× 記小卡頓；再超過 83ms（兩倍電影幀耗時）記卡頓；大於均值 3× 且超過 125ms 記嚴重卡頓。頂部卡頓率＝卡頓總時長 ÷ 總時長。</string>
+    <string name="frame_variance">變異數</string>
+    <string name="frame_right_axis_switch">切換右軸指標</string>
+
+    <!-- ==================== 幀率監測：錄製懸浮窗 ==================== -->
+
+    <string name="frame_fab_open">顯示幀率懸浮窗</string>
+    <string name="frame_fab_close">關閉幀率懸浮窗</string>
+    <string name="frame_record_duration">錄製時長（分）</string>
+    <string name="frame_overlay_permission_rationale">需要「顯示在其它應用上層」權限，幀率懸浮窗才能蓋在遊戲或影片上方</string>
+    <string name="notify_overlay_title">幀率懸浮窗執行中</string>
+    <!-- %1$s = 剩餘時間 mm:ss -->
+    <string name="frame_record_remaining">剩餘 %1$s</string>
+    <!-- %1$d = 剩餘秒數（限時錄製的倒數） -->
+    <string name="frame_record_countdown">剩餘 %1$d 秒</string>
+    <!-- %1$s = 已錄時長 mm:ss -->
+    <string name="frame_record_elapsed">已錄 %1$s</string>
+    <string name="frame_error_no_access">無可用取數通道：未偵測到 root 授權，也未連上 Shizuku</string>
+    <!-- 通道判定為「有」（Shizuku 已連上 / 有 root）卻仍讀不到：問題在命令本身，詳見 logcat 的 FrameRateSource -->
+    <string name="frame_error_command_failed">取數通道已就緒，但命令執行失敗（詳情見 logcat：FrameRateSource）</string>
+    <string name="frame_error_no_target_app">尚未識別到被測應用：請切到要測試的應用（本應用不計）</string>
+    <string name="frame_error_save_failed">幀率記錄儲存失敗</string>
+
     <!-- ==================== 電池資訊卡 ==================== -->
 
     <string name="title_battery">電池</string>
@@ -92,7 +163,7 @@
     <string name="option_keep_sampling_on_lock_desc">以 CPU 喚醒鎖換取螢幕關閉後持續取樣；關閉時螢幕關閉期間隔放寬到 5s，更省電</string>
 
     <string name="option_charge_monitor">充電功率監測</string>
-    <string name="option_charge_monitor_desc">點擊開始取樣 5s 後關閉螢幕；充電功率低於 1W 且持續超過 5min 時自動儲存 CSV 檔案（不停止取樣）</string>
+    <string name="option_charge_monitor_desc">點擊開始取樣 5s 後關閉螢幕；輸入電池的電流為 0mA 且持續 30s 時自動儲存 CSV 檔案（不停止取樣）</string>
 
     <string name="option_series_dual_battery">串聯雙電池</string>
     <string name="option_series_dual_battery_desc">核心回報單節電壓，串聯機型整組電壓 ×2，功率隨之 ×2（小米機器不需要開啟）</string>
@@ -105,6 +176,14 @@
 
     <!-- ==================== 前台服務：通知 ==================== -->
 
+    <string name="channel_name_frame_record">幀率錄製</string>
+    <string name="channel_desc_frame_record">錄製期間持續採集幀率與裝置溫度，保持行程不被系統凍結</string>
+    <!-- %1$d = 當前幀率 -->
+    <string name="notify_frame_title">幀率錄製中 · %1$s FPS</string>
+    <!-- %1$s = 已錄時長 mm:ss -->
+    <string name="notify_frame_text">已錄 %1$s</string>
+    <string name="notify_frame_no_access">幀率錄製已中止：無可用取數通道</string>
+
     <string name="channel_name_sampling">即時功率取樣</string>
     <string name="channel_desc_sampling">螢幕關閉後持續讀取底層電量節點</string>
     <string name="notify_starting">正在啟動取樣…</string>
@@ -112,7 +191,7 @@
     <string name="notify_title_discharging">放電中 · %1$d%%</string>
     <!-- 實況通知（Live Update）展開態兩行；%1$s / %2$s = 已帶單位的數值（不翻譯數值模板） -->
     <string name="notify_live_row1">電壓 %1$s  電流 %2$s</string>
-    <string name="notify_live_row2">電池溫度 %1$s  充電 IC 溫度 %2$s</string>
+    <string name="notify_live_row2">電池溫度 %1$s</string>
     <string name="notify_auto_saved">已自動儲存 %1$s（%2$d 筆記錄，取樣繼續）</string>
     <string name="notify_auto_save_failed">自動儲存失敗，取樣繼續</string>
 

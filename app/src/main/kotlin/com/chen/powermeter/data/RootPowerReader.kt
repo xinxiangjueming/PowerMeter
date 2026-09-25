@@ -1,6 +1,7 @@
 package com.chen.powermeter.data
 
 import android.content.Context
+import android.util.Log
 import com.chen.powermeter.R
 import com.chen.powermeter.util.ShizukuHelper
 import com.chen.powermeter.util.appString
@@ -8,6 +9,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.TimeUnit
+
+private const val TAG = "PowerMeterRootReader"
 
 /**
  * 读取内核底层电量节点。
@@ -156,6 +159,10 @@ object RootPowerReader {
     @Volatile
     private var suChecked = false
 
+    /** 「exec 因已判定无 su 而短路」的日志是否已打过（只打一次，避免每秒刷屏） */
+    @Volatile
+    private var shortCircuitLogged = false
+
     /**
      * 「这台机器有没有 root」的**独立事实**（[suAvailable] 的唯一存储）。
      *
@@ -213,6 +220,13 @@ object RootPowerReader {
 
         // 1. Shizuku（shell 身份，非 root 机器的主力通道）
         if (ShizukuHelper.serviceBound.value) {
+            // Shizuku 可用 ≠ 没有 root：这里顺手把 su 探测补上（幂等，整进程只探一次）——
+            // ① exec() 的「已判定无 su 就短路」依赖 suChecked 置位。Shizuku-only 机器不探的话，
+            //    每条空输出命令（timestats 未启用时的 -dump 等）都会白 fork 4 次 su，每秒一拍
+            //    的采样循环等于在持续白烧 CPU；
+            // ② [rootAvailable]（电池信息卡 / PMIC tab 的判据）在 root+Shizuku 机器上
+            //    也只有探过 su 才拿得到真值，否则永远 false。
+            ensureSuChecked()
             markPositive(AccessMode.SHIZUKU)
             return true
         }
@@ -241,6 +255,24 @@ object RootPowerReader {
         return false
     }
 
+    /**
+     * 通用特权命令执行（Shizuku → SuSession → fork su 三通道），供帧率取数等模块复用。
+     *
+     * 为什么收口在这里、而不是让各模块自己 fork su：通道判定与 su 输出解析口径
+     * （`id -u` 必须取**最后一行** —— Magisk/KernelSU 的 su 常带额外输出）只该有一份。
+     * 复制出去的版本只要解析口径略偏，就会得到「已授权 root 却报无可用通道」这种症状。
+     *
+     * @param allowBlank 透传给 [exec]：开关型命令（如 timestats 的 `-enable`）正常情况下
+     *   **没有任何输出**，不带这个标记会被误判为失败并回退下一通道。
+     *
+     * ⚠️ 必须在后台线程调用：内部有进程创建与最长 [timeoutMs] 的等待。
+     */
+    fun execPrivileged(
+        cmd: String,
+        timeoutMs: Long = 8_000L,
+        allowBlank: Boolean = false,
+    ): String? = exec(cmd, timeoutMs, allowBlank)
+
     private fun markPositive(mode: AccessMode) {
         accessMode = mode
         hasAccess = true
@@ -255,6 +287,7 @@ object RootPowerReader {
         suAvailable = false
         hasAccess = false
         accessMode = AccessMode.NONE
+        shortCircuitLogged = false
         thermalIndex = emptyMap()
         batteryDir = PS_BATTERY
         batteryDirChecked = false
@@ -767,7 +800,21 @@ object RootPowerReader {
             // 需要区分时由调用方显式声明 —— 此时空串直接返回，不再回退 su
             if (out != null && (allowBlank || out.isNotBlank())) return out
         }
-        if (suChecked && !suAvailable) return null
+        if (suChecked && !suAvailable) {
+            // ⚠️ 这条短路**必须留痕**（2026-09-22 加）：它是完全静默的 —— 命令没执行、
+            // 通道没探测、lastError 也不更新，上游只会看到「读不到数据」。
+            // 事后诊断时它恰恰是最关键的证据：说明本进程早已把 su 判成"无"，而 Shizuku 也没接上。
+            // 只记一次（可能每秒被调用），避免刷屏
+            if (!shortCircuitLogged) {
+                shortCircuitLogged = true
+                Log.w(
+                    TAG,
+                    "exec 短路返回 null：本进程已判定无 su（suChecked=true, suAvailable=false），" +
+                        "且 Shizuku 未绑定 → 命令未执行。cmd=$cmd",
+                )
+            }
+            return null
+        }
         return execRaw(cmd, timeoutMs, allowBlank)
     }
 

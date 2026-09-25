@@ -103,11 +103,25 @@ class SamplingService : Service() {
         /** 充电功率监测：开始采样后多久自动熄屏 */
         private const val SCREEN_OFF_DELAY_MS = 5_000L
 
-        /** 充电功率监测：低功率判定阈值 W（PowerSample.powerW 正 = 充电） */
-        private const val LOW_POWER_THRESHOLD_W = 1.0
+        /**
+         * 充电功率监测：判定「无输入电流」的电流阈值 mA（取绝对值比较）。
+         *
+         * 内核 current_now 在真正停止充电时不一定精确到 0，常见 ±1mA 级抖动
+         * （部分机型在做库仑计校准时会短暂上报 ±1mA），故留 1mA 容差而不是写死 == 0.0。
+         */
+        private const val ZERO_CURRENT_THRESHOLD_MA = 1.0
 
-        /** 充电功率监测：低功率需连续保持多久才触发自动保存 */
-        private const val LOW_POWER_HOLD_MS = 5 * 60 * 1000L
+        /**
+         * 充电功率监测：「正在充电」的武装阈值 mA（取绝对值比较）。
+         *
+         * 本场会话至少出现过一次 ≥ 该值的电流，才认为确实插着充电器在充。
+         * 取 50mA 而非更大值：涓流末段的电流本身就只有几十 mA，阈值太高会把
+         * 「本就在测涓流」的场景挡在门外、永远不武装。
+         */
+        private const val ARM_CURRENT_MA = 50.0
+
+        /** 充电功率监测：输入电流归零需连续保持多久才触发自动保存 */
+        private const val ZERO_CURRENT_HOLD_MS = 30_000L
 
         /** 自动保存的文件名前缀，与手动导出的 powermeter_ 区分开 */
         private const val AUTO_SAVE_PREFIX = "powermeter_charge"
@@ -226,11 +240,11 @@ class SamplingService : Service() {
 
     // ---- 充电功率监测状态（每场采样会话复位一次）----
 
-    /** 本场会话是否出现过正常充电功率（> 阈值），用作低功率判定的「武装」前提 */
-    private var chargeSeen = false
+    /** 本场会话是否出现过正常输入电流（≥ [ARM_CURRENT_MA]），用作归零判定的「武装」前提 */
+    private var currentSeen = false
 
-    /** 当前这段连续低功率区间的起点；功率回升到阈值以上时置 null */
-    private var lowPowerSince: Long? = null
+    /** 当前这段连续「电流为零」区间的起点；电流回升到阈值以上时置 null */
+    private var zeroCurrentSince: Long? = null
 
     /** 本场会话是否已自动保存过 —— 保证一个会话最多自动导出一次 */
     private var autoSaved = false
@@ -303,7 +317,9 @@ class SamplingService : Service() {
         while (true) {
             val raw = withContext(Dispatchers.IO) { RootPowerReader.read() }
             // 串联双电池换算：在**采样入口**统一处理，下游（曲线、统计、常驻通知、手动导出、
-            // 自动保存、充电功率监测的 1W 判定）全部自动同口径，避免各处各算一遍。
+            // 自动保存）全部自动同口径，避免各处各算一遍。
+            // 注：充电功率监测的「电流归零」判定不受这里的换算影响 ——
+            // 串联回路电流处处相等（只有电压与功率翻倍），currentMa 保持原值。
             //
             // ⚠️ powerW 必须跟着一起翻倍：它是 RootPowerReader 里用 V × I 算好后**存进
             // PowerSample 的成品值**，下游不会拿翻倍后的 voltageV 重算。不显式跟上就会同时
@@ -329,7 +345,7 @@ class SamplingService : Service() {
                 SessionRecorder.onSample(sample)
                 _error.value = null
                 maybeNotify(sample)
-                watchChargePower(sample)
+                watchChargeCurrent(sample)
             } else {
                 _error.value = RootPowerReader.lastError ?: getString(R.string.error_read_failed)
             }
@@ -351,8 +367,8 @@ class SamplingService : Service() {
     // ---------- 充电功率监测 ----------
 
     private fun resetChargeWatch() {
-        chargeSeen = false
-        lowPowerSince = null
+        currentSeen = false
+        zeroCurrentSince = null
         autoSaved = false
     }
 
@@ -375,37 +391,45 @@ class SamplingService : Service() {
     }
 
     /**
-     * 充电功率监测判定：功率连续低于 [LOW_POWER_THRESHOLD_W] 满 [LOW_POWER_HOLD_MS]
+     * 充电功率监测判定：输入电流连续为 0（≤ [ZERO_CURRENT_THRESHOLD_MA]）满 [ZERO_CURRENT_HOLD_MS]
      * 即自动导出一次 CSV，**采样本身不打断**。
      *
+     * 判据落在 `current_ma` 而非功率上：充满 / 拔枪时电压还在（功率读数会在零点附近飘），
+     * 而电流是最干脆的那一个量 —— 涓流截止、已充满、充电器断开，输入电流都会塌到 0。
+     *
      * 三道护栏缺一不可：
-     * 1. **武装前提** [chargeSeen] —— 本场会话至少出现过一次 > 阈值的功率才算"正在充电"。
-     *    没插充电器时 powerW 恒为负值（见 PowerSample 的符号约定），不设这道判断会直接
-     *    在"根本没充电"的场景下静默触发；
-     * 2. **连续区间** [lowPowerSince] —— 功率一旦回升到阈值以上就复位，只认连续低功率，
-     *    避免把若干段零散的低功率时间累加成 5 分钟；
-     * 3. **幂等** [autoSaved] —— 命中一次后本场会话不再触发。涓流/已充满阶段功率会长期
-     *    低于 1W，不拦就会每 5 分钟刷出一个新 CSV。
+     * 1. **武装前提** [currentSeen] —— 本场会话至少出现过一次 ≥ [ARM_CURRENT_MA] 的输入电流，
+     *    才算"确实在充电"。这条同时兜住了「电流通道不可用」的机器：binder 通道在部分机型上
+     *    `getLongProperty(CURRENT_NOW)` 恒返回 0，没设这道判断会在"根本没充上电"的场景下
+     *    静默触发一次自动导出；
+     * 2. **连续区间** [zeroCurrentSince] —— 电流一旦回到阈值以上就复位，只认连续归零，
+     *    避免把若干段零散的零电流时间累加成 30 秒；
+     * 3. **幂等** [autoSaved] —— 命中一次后本场会话不再触发。停充以后电流长期为 0，
+     *    不拦就会每 30 秒刷出一个新 CSV。
      */
-    private fun watchChargePower(sample: PowerSample) {
+    private fun watchChargeCurrent(sample: PowerSample) {
         if (autoSaved || !Prefs.getChargeMonitor(this)) return
 
-        if (sample.powerW >= LOW_POWER_THRESHOLD_W) {
-            chargeSeen = true
-            lowPowerSince = null
-            return
-        }
-        if (!chargeSeen) return
+        // 取绝对值：本机充电时 current_now 为负（见 PowerSample 的符号约定），
+        // 「有没有输入电流」只看大小、不看方向。
+        val absCurrentMa = abs(sample.currentMa)
 
-        val since = lowPowerSince
-        if (since == null) {
-            lowPowerSince = sample.timeMillis
+        if (absCurrentMa > ZERO_CURRENT_THRESHOLD_MA) {
+            if (absCurrentMa >= ARM_CURRENT_MA) currentSeen = true
+            zeroCurrentSince = null
             return
         }
-        if (sample.timeMillis - since < LOW_POWER_HOLD_MS) return
+        if (!currentSeen) return
+
+        val since = zeroCurrentSince
+        if (since == null) {
+            zeroCurrentSince = sample.timeMillis
+            return
+        }
+        if (sample.timeMillis - since < ZERO_CURRENT_HOLD_MS) return
 
         autoSaved = true
-        lowPowerSince = null
+        zeroCurrentSince = null
         // NonCancellable：服务可能在写盘途中被销毁（scopeJob.cancel），写一半会留下
         // MediaStore 的 IS_PENDING=1 孤儿记录 —— 让本次导出写完再响应取消
         scope.launch(Dispatchers.IO + NonCancellable) { autoSaveCsv() }
@@ -528,7 +552,7 @@ class SamplingService : Service() {
     /**
      * 构建常驻通知（**实况更新 / Live Update**，机制对齐 SportLink `SportNotificationHelper`）：
      * - **折叠态**：左侧小图标 + 右侧主值（功率）；
-     * - **展开态**（[Notification.BigTextStyle] 两行）：第一行 电压 / 电流，第二行 电池温度 / 充电 IC 温度；
+     * - **展开态**（[Notification.BigTextStyle] 两行）：第一行 电压 / 电流，第二行 电池温度；
      * - **提升为实况更新**：`android.requestPromotedOngoing`（SDK≥36 且系统允许）+ `miui.focus.param`
      *   （MIUI 焦点通知 / 灵动岛），见 [applyLiveUpdateExtras]。
      *
@@ -542,15 +566,13 @@ class SamplingService : Service() {
         } else {
             "${sample.powerW.f3()} W"
         }
-        // 展开态两行（第一行 电压/电流，第二行 电池温度/充电 IC 温度）；
+        // 展开态两行（第一行 电压/电流，第二行 电池温度）；
         // 刚启动（无样本）时留空，BigTextStyle 不挂。
         // 功率只在折叠态右侧主值出现，不再进展开行。
         val liveBody = sample?.let { s ->
-            // 充电 IC 温度可能取不到（非所有机型都有 charger_therm0 温感区）→ 与指标卡同口径显示破折号
-            val chargerIcText = s.tempChargerC?.let { v -> "${v.f3()} ℃" } ?: "—"
             getString(R.string.notify_live_row1, "${s.voltageV.f3()} V", "${s.currentMa.f0()} mA") +
                 "\n" +
-                getString(R.string.notify_live_row2, "${s.tempBatteryC.f1()} ℃", chargerIcText)
+                getString(R.string.notify_live_row2, "${s.tempBatteryC.f1()} ℃")
         }
         val statusText = when {
             sample == null -> getString(R.string.notify_starting)

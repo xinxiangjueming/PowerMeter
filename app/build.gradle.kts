@@ -80,6 +80,14 @@ dependencies {
     // 按上方 backdrop 的写法加同样的 exclude 即可（当前与 SportLink 实测配置一致，未加）。
     implementation(libs.yukonga.miuix.ui)
 
+    // Miuix Icons：右下角悬浮按钮的 Add / Close 图标（与 SportLink 设备管理页 FAB 同源，
+    // 组件本身用 miuix 的 FloatingActionButton，图标也取同一套，避免两套图标风格混用）。
+    // 同是 KMP 库，按 miuix-blur 的写法排除 CMP 版 compose 传递依赖。
+    implementation(libs.yukonga.miuix.icons) {
+        exclude(group = "org.jetbrains.compose.foundation")
+        exclude(group = "org.jetbrains.compose.ui")
+    }
+
     // Miuix Blur：弹窗内部毛玻璃 + 高光描边（textureBlur + Highlight）。与 SportLink 完全一致（0.9.2）。
     // AAR minSdk=33 → 已在 Manifest 用 tools:overrideLibrary 放行，低版本由 isRuntimeShaderSupported
     // 自动失效（textureBlur 退化为无效果，不崩）。同 miuix-ui 一样是 KMP 库，可能传递

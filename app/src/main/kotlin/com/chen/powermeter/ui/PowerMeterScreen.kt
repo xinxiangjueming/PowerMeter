@@ -14,6 +14,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -69,6 +70,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -142,7 +146,7 @@ fun PowerMeterScreen(
     error: String?,
     intervalMs: Long,
     wakeLock: Boolean,
-    /** 充电功率监测：开始采样 5s 后自动熄屏，低功率持续 5min 时自动保存 CSV */
+    /** 充电功率监测：开始采样 5s 后自动熄屏，输入电流为 0 持续 30s 时自动保存 CSV */
     chargeMonitor: Boolean,
     /** 串联双电池：电压按整组（单节读数 ×2）换算，功率同步 ×2 */
     seriesDualBattery: Boolean,
@@ -167,6 +171,8 @@ fun PowerMeterScreen(
     onExport: () -> Unit,
     onClear: () -> Unit,
     onExitImport: () -> Unit,
+    /** 双击顶栏标题：切换到另一个监测模式。入参 = 点击点的窗口 Y（ClipReveal 上下展开的锚点线） */
+    onToggleMode: (Float) -> Unit,
 ) {
     val corner = LocalCornerRadius.current
     val cardShape = remember(corner) { RoundedCornerShape(corner) }
@@ -328,9 +334,23 @@ fun PowerMeterScreen(
         ) {
             TopAppBar(
                 title = {
-                    Column {
+                    // 标题的窗口坐标：双击时把点击点换算成窗口 Y，作为模式切换
+                    // ClipReveal 上下展开的锚点线（见 ModeRevealOverlay）
+                    var titleCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+                    Column(
+                        // 双击标题 = 切换监测模式（功率监测 ↔ 帧率监测）。
+                        // 手势只挂在标题这一列上：顶栏其余区域（尤其右侧「设置」按钮）
+                        // 不该被双击误触，也不必为整条顶栏多加一层手势节点。
+                        Modifier
+                            .onGloballyPositioned { titleCoords = it }
+                            .pointerInput(Unit) {
+                                detectTapGestures(onDoubleTap = { offset ->
+                                    onToggleMode(titleCoords?.localToWindow(offset)?.y ?: 0f)
+                                })
+                            },
+                    ) {
                         Text(
-                            stringResource(R.string.app_name),
+                            stringResource(R.string.mode_power),
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                         )
@@ -875,7 +895,9 @@ internal fun TrendCard(
             // 卡片内嵌：不可缩放（state = null），读数走长按拖动
             // —— 单指直接拖动会与页面竖直滚动抢手势
             TrendChart(
-                samples = samples,
+                // 绘图只需要时间轴：帧率监测页复用了同一个 TrendChart，故入参是「时间戳列表」
+                // 而非 PowerSample 列表（见 TrendChartView 的 times 参数）
+                times = remember(samples) { samples.map { it.timeMillis } },
                 series = listOf(metric.toSeries(samples, metricColor, metric.label())),
                 // 图表自身仍按 16dp 内缩 —— 外层 Column 已改为只留垂直 padding，故在此补齐
                 modifier = Modifier
@@ -1195,6 +1217,16 @@ private fun SettingsSheet(
             },
         ),
         containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        // ⚠️ 必须显式去掉 Bottom，否则本面板**永远不沉浸**（已核 material3 1.5.0-alpha27 源码）：
+        //  · M3 默认 contentWindowInsets = BottomSheetDefaults.modalWindowInsets
+        //      = WindowInsets.safeDrawing.only(Bottom + Top)        （SheetDefaults.kt:553-555）
+        //  · 它被加在 **Surface 内部的 Column** 上（BottomSheet.kt:350-353），
+        //    相当于替我们把内容底部抬高一个导航栏高度 → 滚动视口到不了屏幕底 →
+        //    内容滚不穿手势小白条（「滑动也不沉浸」）；且该 insets 被消费后，
+        //    内容末尾的 windowInsetsBottomHeight(WindowInsets.safeDrawing) 只能取到 0。
+        // 去掉 Bottom 后：Surface 背景照旧铺满到屏幕底（背景沉浸），
+        // 底部避让由内容末尾那个 Spacer 自己负责（此时它能读到真值）。
+        contentWindowInsets = { WindowInsets.safeDrawing.only(WindowInsetsSides.Top) },
         // 自定义拖拽横条已移入 sheet 内容区（见下方 Column 首项），此处 dragHandle = null，
         // 彻底规避 M3 默认 SheetDefaults.DragHandle 长按弹出的"拖动手柄" tooltip；
         // 纯绘制横条，无 clickable/ripple/文本；面板拖拽由 sheet 容器自身手势处理，不受影响

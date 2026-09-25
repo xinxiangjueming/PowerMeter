@@ -13,6 +13,11 @@
     <string name="action_authorize">Authorize</string>
     <string name="empty_no_samples">No samples yet</string>
 
+    <!-- ==================== Monitor modes (switch by double-tapping the top bar title) ==================== -->
+
+    <string name="mode_power">Power Monitor</string>
+    <string name="mode_frame">Frame Rate Monitor</string>
+
     <!-- ==================== Top bar / home status ==================== -->
 
     <string name="status_sampling">Sampling · every %1$dms</string>
@@ -67,6 +72,72 @@
 
     <!-- ==================== Battery info card ==================== -->
 
+    <!-- ==================== Frame rate monitor: history ==================== -->
+
+    <string name="frame_history_title">History</string>
+    <!-- %1$d = number of records -->
+    <string name="frame_history_count">%1$d records</string>
+    <string name="frame_history_empty">No frame rate records</string>
+    <string name="frame_history_empty_desc">Records appear here once you capture a frame rate session</string>
+    <!-- Delete: manage mode in the history list (Delete icon in the title row → red box on the card → confirm dialog) -->
+    <string name="frame_delete">Delete record</string>
+    <string name="frame_delete_confirm_title">Delete this frame rate record?</string>
+
+    <!-- ==================== Frame rate monitor: metrics ==================== -->
+
+    <string name="frame_fps">Frame rate</string>
+    <string name="frame_fps_avg">Average FPS</string>
+    <string name="frame_fps_min">Min FPS</string>
+    <string name="frame_fps_max">Max FPS</string>
+    <!-- 1% / 5% Low: average FPS of the worst 1%/5% of frames (CapFrameX convention, frame-weighted).
+         Bare % is not a format placeholder, formatted="false" is required -->
+    <string name="frame_fps_low_1" formatted="false">1% Low</string>
+    <string name="frame_fps_low_5" formatted="false">5% Low</string>
+    <string name="frame_space">Frame time</string>
+    <string name="frame_jank">Dropped</string>
+    <string name="frame_refresh_rate">Refresh rate</string>
+    <string name="frame_cpu_clock">CPU clock</string>
+    <string name="frame_cpu_usage">CPU usage</string>
+    <string name="frame_temp_virtual">Virtual temp</string>
+    <string name="unit_fps">FPS</string>
+    <!-- Badge at the bottom-right of the floating tab: %1$s = FPS at the start of this recording -->
+    <string name="frame_start_fps">Start %1$s</string>
+    <!-- %1$s = capture start time -->
+    <string name="frame_captured_at">Captured %1$s</string>
+    <string name="frame_not_found">This record no longer exists</string>
+    <!-- Share: detail top bar → Kite-compatible xlsx (system share sheet) -->
+    <string name="frame_share">Share data</string>
+    <string name="frame_share_empty">Nothing to share</string>
+    <string name="frame_share_failed">Share failed, please try again</string>
+    <!-- Detail rebuild (Kite report layout): summary grid / FPS & temperature card / jank policy -->
+    <string name="frame_detail_fps_temp">FPS &amp; Temperature</string>
+    <string name="frame_energy_per_frame">Energy/Frame</string>
+    <string name="frame_jank_rate">Jank Rate</string>
+    <string name="frame_steady_index">Steady Index</string>
+    <string name="frame_steady_index_info">Steady index = standard deviation of frame time (ms) — a simplified take on PerfDog\'s Smooth metric (overall smoothness from frame-time fluctuation). Lower is steadier.</string>
+    <string name="frame_jank_info">Jank policy (PerfDog-style, per second): frame time over 2× the previous 3-second average counts as small jank; over 83 ms (two movie-frame times) as jank; over 3× and 125 ms as big jank. Stutter rate = stutter duration ÷ total duration.</string>
+    <string name="frame_variance">Variance</string>
+    <string name="frame_right_axis_switch">Switch right axis</string>
+
+    <!-- ==================== Frame rate monitor: recording overlay ==================== -->
+
+    <string name="frame_fab_open">Show frame rate overlay</string>
+    <string name="frame_fab_close">Hide frame rate overlay</string>
+    <string name="frame_record_duration">Duration (min)</string>
+    <string name="frame_overlay_permission_rationale">The "Display over other apps" permission is required for the frame rate overlay to appear above games or videos</string>
+    <string name="notify_overlay_title">Frame rate overlay running</string>
+    <!-- %1$s = remaining time mm:ss -->
+    <string name="frame_record_remaining">%1$s left</string>
+    <!-- %1$d = seconds left (countdown for timed recordings) -->
+    <string name="frame_record_countdown">%1$ds left</string>
+    <!-- %1$s = elapsed time mm:ss -->
+    <string name="frame_record_elapsed">%1$s elapsed</string>
+    <string name="frame_error_no_access">No data source available: root is not authorized and Shizuku is not connected</string>
+    <!-- The data source is judged "ready" (Shizuku bound / root granted) yet reads still fail: the command itself failed, see FrameRateSource in logcat -->
+    <string name="frame_error_command_failed">Data source is ready, but the sampling command failed (see logcat: FrameRateSource)</string>
+    <string name="frame_error_no_target_app">No target app detected yet — switch to the app you want to measure (this app does not count)</string>
+    <string name="frame_error_save_failed">Failed to save the frame rate record</string>
+
     <string name="title_battery">Battery</string>
     <string name="battery_type">Type</string>
     <string name="battery_soh">SOH</string>
@@ -92,7 +163,7 @@
     <string name="option_keep_sampling_on_lock_desc">Hold a CPU wake lock so sampling continues after the screen turns off; when disabled the screen-off interval widens to 5s for better battery life</string>
 
     <string name="option_charge_monitor">Charge power monitor</string>
-    <string name="option_charge_monitor_desc">Turns the screen off 5s after sampling starts; when charge power stays below 1W for more than 5min a CSV is saved automatically (sampling keeps running)</string>
+    <string name="option_charge_monitor_desc">Turns the screen off 5s after sampling starts; when the battery input current stays at 0mA for 30s a CSV is saved automatically (sampling keeps running)</string>
 
     <string name="option_series_dual_battery">Series dual battery</string>
     <string name="option_series_dual_battery_desc">The kernel reports single-cell voltage; on series packs the whole-pack voltage is ×2 and power follows ×2 (not needed on Xiaomi devices)</string>
@@ -105,6 +176,14 @@
 
     <!-- ==================== Foreground service: notifications ==================== -->
 
+    <string name="channel_name_frame_record">Frame rate recording</string>
+    <string name="channel_desc_frame_record">Samples frame rate and device temperature while recording so the process is never frozen</string>
+    <!-- %1$d = current frame rate -->
+    <string name="notify_frame_title">Recording · %1$s FPS</string>
+    <!-- %1$s = elapsed time mm:ss -->
+    <string name="notify_frame_text">%1$s elapsed</string>
+    <string name="notify_frame_no_access">Frame rate recording stopped: no data source available</string>
+
     <string name="channel_name_sampling">Live power sampling</string>
     <string name="channel_desc_sampling">Keeps reading low-level battery nodes while the screen is off</string>
     <string name="notify_starting">Starting sampling…</string>
@@ -112,7 +191,7 @@
     <string name="notify_title_discharging">Discharging · %1$d%%</string>
     <!-- Live Update expanded rows; %1$s / %2$s = values with units (numeric templates not translated) -->
     <string name="notify_live_row1">Voltage %1$s  Current %2$s</string>
-    <string name="notify_live_row2">Battery %1$s  Charger IC %2$s</string>
+    <string name="notify_live_row2">Battery %1$s</string>
     <string name="notify_auto_saved">Auto-saved %1$s (%2$d records, sampling continues)</string>
     <string name="notify_auto_save_failed">Auto-save failed, sampling continues</string>
 

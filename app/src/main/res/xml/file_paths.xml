@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 可共享路径：帧率 xlsx 分享前先写入 cacheDir/share/（每次分享前清空重建） -->
+<paths>
+    <cache-path
+        name="share"
+        path="share/" />
+</paths>

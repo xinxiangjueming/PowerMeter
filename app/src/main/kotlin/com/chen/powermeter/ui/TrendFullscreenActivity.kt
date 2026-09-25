@@ -454,7 +454,7 @@ private fun TrendFullscreenScreen(
                         }
                     } else {
                         TrendChart(
-                            samples = samples,
+                            times = remember(samples) { samples.map { it.timeMillis } },
                             series = seriesList,
                             modifier = Modifier
                                 .fillMaxWidth()

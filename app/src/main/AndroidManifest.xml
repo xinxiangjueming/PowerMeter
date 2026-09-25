@@ -18,6 +18,10 @@
     <!-- 锁屏后保持 CPU 运行 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- 帧率悬浮窗：TYPE_APPLICATION_OVERLAY 需要「显示在其它应用上层」特殊权限
+         （非运行时权限，需用户在系统设置页显式开启，见 FrameMeterScreen 的授权引导） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <!-- Shizuku：非 root 机器经 adb（无线调试）授权后，以 shell 身份读取 /sys 电量节点。
          权限名固定为 API_V3，与 fold 同口径 -->
     <uses-permission android:name="rikka.shizuku.permission.API_V3" />
@@ -44,6 +48,19 @@
             android:enabled="true"
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- FileProvider：帧率记录 xlsx 的系统分享（ACTION_SEND + EXTRA_STREAM）。
+             ⚠️ exported 必须为 false、grantUriPermissions 必须为 true（安全披露临时读权限）；
+             可共享路径在 res/xml/file_paths.xml（cache-path share/） -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- configChanges 与两个参照实现同口径：fold 的 MainActivity（app/src/main/AndroidManifest.xml:82-116）
              与 sportlink 的 DeviceManageActivity（AndroidManifest.xml:330-332）都保留 orientation|screenSize
@@ -134,6 +151,29 @@
             android:theme="@style/Theme.PowerMeter"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale" />
 
+        <!-- 帧率记录详情页：从「帧率监测」的历史列表点进单条记录。
+             不声明 android:label —— 多任务卡片沿用 application 的 label，避免再引一份
+             会随语言变化的字符串（Manifest 引用的资源不允许按配置变化）。 -->
+        <activity
+            android:name=".ui.FrameDetailActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PowerMeter"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale" />
+
+        <!-- 帧率录制的前台服务外壳：只负责把进程提到前台 + 常驻通知，采集循环在同进程的
+             FrameRecordController 里。不加它的话，用户切到被测应用（游戏/视频）后进程会被
+             Android 12+ 冻结，长时录制直接断在半路。 -->
+        <service
+            android:name=".service.FrameRecordService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <!-- ⚠️ 与 SamplingService 同口径：android:value 必须写字面量，不能引用 @string
+                 （Manifest 引用的资源不允许随配置变化，lintVitalRelease 会直接报错） -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="持续采集屏幕合成帧率与设备温度，用于排查卡顿；录制期间保持进程不被系统冻结" />
+        </service>
+
         <service
             android:name=".service.SamplingService"
             android:exported="false"
@@ -147,6 +187,19 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="读取 /sys/class/power_supply 与燃料计底层节点，持续监测充放电功率、电压、电流与温度" />
+        </service>
+
+        <!-- 帧率悬浮窗的前台服务：用 TYPE_APPLICATION_OVERLAY 把帧率 tab 盖在其它应用上方，
+             息屏/切应用都不消失。挂前台服务是因为悬浮窗本身不能阻止 Android 12+ 冻结缓存进程 ——
+             进程一冻结，悬浮窗里的预览采样循环就停了，帧率会变成一个再也不动的死数字。 -->
+        <service
+            android:name=".service.FrameOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <!-- ⚠️ 与 SamplingService 同口径：android:value 必须写字面量，不能引用 @string -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="在其它应用上方持续显示实时帧率悬浮窗，供用户在游戏或视频中监控卡顿" />
         </service>
     </application>
 

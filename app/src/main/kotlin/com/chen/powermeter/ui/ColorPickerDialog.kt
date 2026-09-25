@@ -204,6 +204,18 @@ internal fun ColorPickerSheet(
             },
         ),
         containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        // ⚠️ 必须显式去掉 Bottom，否则本面板**永远不沉浸**（已核 material3 1.5.0-alpha27 源码）：
+        //  · M3 默认 contentWindowInsets = BottomSheetDefaults.modalWindowInsets
+        //      = WindowInsets.safeDrawing.only(Bottom + Top)        （SheetDefaults.kt:553-555）
+        //  · 它被加在 **Surface 内部的 Column** 上，不是 Surface 外面：
+        //      Surface(...) { Column(Modifier.windowInsetsPadding(contentWindowInsets())) }
+        //                                                          （BottomSheet.kt:350-353）
+        //    相当于替我们把内容底部抬高一个导航栏高度 → 滚动视口到不了屏幕底 →
+        //    内容滚不穿手势小白条（「滑动也不沉浸」）；且该 insets 被此处消费后，
+        //    内容末尾的 windowInsetsBottomHeight(WindowInsets.safeDrawing) 只能取到 0。
+        // 去掉 Bottom 后：Surface 背景照旧铺满到屏幕底（背景沉浸），
+        // 底部避让由内容末尾那个 Spacer 自己负责（此时它能读到真值）。
+        contentWindowInsets = { WindowInsets.safeDrawing.only(WindowInsetsSides.Top) },
         // 与 SettingsSheet 同口径：dragHandle = null，改用自绘横条，
         // 彻底规避 M3 默认手柄长按弹出的「拖动手柄」tooltip
         dragHandle = null,
