@@ -1,7 +1,5 @@
 package com.chen.powermeter.ui
 
-import android.app.Activity
-import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -42,6 +40,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +50,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -104,12 +105,12 @@ private const val ORIENTATION_SETTLE_TIMEOUT_MS = 250L
  * 含 `orientation|screenSize` 的（不重建）。因此直接 `finish()` 会出现：本页滑出的同时显示才转回
  * 竖屏，主页先按**横屏两列**画出来、随后再翻回竖屏单列 —— 趋势卡宽度与位置同时改变，
  * 观感就是"返回主页闪一下"。关闭必须走 [requestClose]：
- * 内容先淡到主题底色（纯色屏没有可重排的内容）→ 解锁方向（旋转发生在纯色之下）→
- * 等方向落地（`onConfigurationChanged` 或超时兜底）→ 才 `finish()` 交给关闭收缩动画
- * （`anim/trend_*`，见 onCreate ⑤；2026-09-26 起进入方向为从 `< >` 按钮的 clip-reveal 展开，
- * 见 [launch]，均覆盖主题的四向滑动）。
- * 打开方向不需要这套处理：本页是**独立窗口**，`setRequestedOrientation` 的效果在启动窗口
- * （StartingWindow）底下就生效了，首帧即横屏。
+ * **覆盖层先收回到锚点矩形（一镜到底）** → 恢复系统栏 + 解锁方向（旋转发生在纯色屏之下）→
+ * 等方向落地（`onConfigurationChanged` 或超时兜底）→ `finish()`（无过渡，主页已是正确的
+ * 竖屏单列）。进入/退出的转场都由 [ClipReveal] 覆盖层承担（2026-09-26 一镜到底 Container
+ * Transform 口径），主题窗口动画不再参与。
+ * 打开方向不需要淡出铺底处理：本页是**独立窗口**，`setRequestedOrientation` 的效果在启动
+ * 窗口（StartingWindow）底下就生效了，首帧即横屏。
  */
 class TrendFullscreenActivity : ComponentActivity() {
 
@@ -117,40 +118,58 @@ class TrendFullscreenActivity : ComponentActivity() {
         /** 进入时的指标选择（Metric.name）；缺省回退 POWER */
         const val EXTRA_METRIC = "extra_metric"
 
+        /** 源页（竖屏窗口）里 `< >` 按钮的窗口矩形 + 源窗口宽高，供锚点跨方向换算（见 [mapPortraitRectToWindow]） */
+        const val EXTRA_SOURCE_BOUNDS = "extra_source_bounds"
+
         /**
          * 打开趋势全屏页。
          *
-         * 进入动画优先 **clip-reveal**（[revealBounds] = `< >` 按钮的窗口矩形，
-         * `ActivityOptions.makeClipRevealAnimation` 让新页从该矩形长大铺满 —— 与
-         * 模式切换的 ClipReveal 同观感的系统级实现），覆盖主题 activityOpenEnter 的
-         * 四向滑动；拿不到 source/矩形时回落主题滑动。退出方向的收缩动画见 onCreate。
+         * 进入动画 = **ClipReveal 一镜到底**：本页首帧把整页内容放进 [ClipReveal] 覆盖层，
+         * 从 [revealBounds]（`< >` 按钮在**源页竖屏窗口**里的矩形）换算出的横屏锚点矩形
+         * 四边同步撑开铺满（见 [mapPortraitRectToWindow] 与 onCreate 的 PreDraw 时序），
+         * 不用系统 ActivityOptions（无圆角、无内容交叉淡变、退出无法收回锚点）。
          *
-         * @param context 调用方 Context（需要 Activity 才能拿 decorView 做 options 源）
+         * @param revealBounds `< >` 按钮矩形（源页窗口坐标）；null = 退化为过屏幕中心的
+         *   全宽线展开（兜底，仍是一镜到底）
          */
         // internal：签名含 internal 的 Metric，public 会触发「public function exposes
         // its internal parameter type」；调用方（PowerMeterScreen）同模块，可见性足够
         internal fun launch(context: Context, metric: Metric, revealBounds: Rect? = null) {
-            val options = (context as? Activity)?.window?.decorView?.let { source ->
-                revealBounds?.takeIf { it.width() > 0 && it.height() > 0 }?.let { r ->
-                    ActivityOptions.makeClipRevealAnimation(source, r.left, r.top, r.width(), r.height())
-                }
+            val i = Intent(context, TrendFullscreenActivity::class.java)
+                .putExtra(EXTRA_METRIC, metric.name)
+            revealBounds?.takeIf { it.width() > 0 && it.height() > 0 }?.let { r ->
+                i.putExtra(
+                    EXTRA_SOURCE_BOUNDS,
+                    intArrayOf(r.left, r.top, r.right, r.bottom, sourcePortraitWidth, sourcePortraitHeight),
+                )
             }
-            context.startActivity(
-                Intent(context, TrendFullscreenActivity::class.java)
-                    .putExtra(EXTRA_METRIC, metric.name),
-                options?.toBundle(),
-            )
+            context.startActivity(i)
         }
+
+        // 源页竖屏窗口宽高：调用方（PowerMeterScreen）同进程直接写 —— 竖屏窗口 metrics
+        // 在本页（横屏窗口）里无法再拿到，extra 带过来最直接
+        var sourcePortraitWidth = 0
+        var sourcePortraitHeight = 0
     }
 
     /**
      * 正在关闭（Compose 可读的 state）。
      *
-     * true = 已解除方向锁定、内容已/正在淡到主题底色，等显示方向转回落地后再真正 `finish()`。
+     * true = 覆盖层已/正在收回锚点矩形，收拢结束后恢复系统栏 + 解锁方向，等显示方向
+     * 转回落地后再真正 `finish()`。
      * 同时作为**幂等护栏**：✕ 与系统返回手势可能在极短时间内都触发一次，重复执行会让
      * 超时兜底与 `onConfigurationChanged` 两条路径各调一次 `finish()`。
      */
     private var closing by mutableStateOf(false)
+
+    /** ClipReveal 覆盖层会话句柄：requestClose 收回、onClosed 接续关闭时序都经它 */
+    private var revealHolder: ClipReveal.Holder? = null
+
+    /** 覆盖层底色 = Compose 主题底色（空壳 setContent 的 SideEffect 写入，PreDraw 启动转场时读） */
+    private var pageBackground = android.graphics.Color.WHITE
+
+    /** 关闭收尾（恢复系统栏 + 解锁方向）是否已启动：onClosed 与超时兜底双路径幂等 */
+    private var closeSequenceStarted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -185,11 +204,13 @@ class TrendFullscreenActivity : ComponentActivity() {
 
         setContent {
             PowerMeterTheme {
-                TrendFullscreenScreen(
-                    initialMetric = initialMetric,
-                    closing = closing,
-                    onFinish = { requestClose() },
-                )
+                // 空壳：真正的全屏页 UI 渲染在 ClipReveal 覆盖层里（见 startReveal）——
+                // 覆盖层展开完成后它**就是**全屏页本体（驻留整个 Activity 生命周期），
+                // 收拢时收回锚点矩形后露出的就是这层空壳纯底色，旋转无内容闪动。
+                // 这里只铺主题底色 + 把底色交给 View 层（覆盖层 background 同色）。
+                val bg = MaterialTheme.colorScheme.background
+                SideEffect { pageBackground = bg.toArgb() }
+                Box(Modifier.fillMaxSize().background(bg))
             }
         }
 
@@ -197,49 +218,127 @@ class TrendFullscreenActivity : ComponentActivity() {
         // 本页会在显示仍是横屏的状态下被移除 → 主页先按横屏两列画出来再翻回竖屏（返回瞬闪）
         onBackPressedDispatcher.addCallback(this) { requestClose() }
 
-        // ⑤ 关闭过渡：向后收缩（本页中心缩退淡出 + 底页浮现，res/anim/trend_*），覆盖主题
-        //    activityClose* 的四向滑动 —— 与进入的 clip-reveal 展开呼应。
-        //    API 34+ 在此一次性注册（预测性返回也走它）；更早版本在 finish() 处挂同一对。
-        //    OVERRIDE_TRANSITION_CLOSE 是编译期内联的 int 常量，低版本引用安全（有 SDK 分支）。
+        // ⑤ 关闭过渡：整条交给覆盖层收回（[revealHolder.close] → onClosed →
+        //    [finishClosingSequence]），finish() 本身不再播任何窗口动画 —— 此刻窗口只剩
+        //    空壳纯底色，滑出/淡出只会多露一拍底色块。挂 0 = 显式禁用主题 activityClose*。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            overrideActivityTransition(
-                OVERRIDE_TRANSITION_CLOSE,
-                R.anim.trend_underlay_enter,
-                R.anim.trend_collapse_exit,
-            )
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
+        }
+
+        // ⑥ 进入转场 = ClipReveal 一镜到底：等本页首帧 PreDraw（此刻窗口已按横屏布局、
+        //    display.rotation 已落到横屏值、空壳的 SideEffect 已交出主题底色）再挂覆盖层 ——
+        //    锚点矩形需要从源页竖屏坐标换算成横屏窗口坐标，换算依赖横屏 rotation。
+        //    返回 true：空壳正常绘制（无内容，纯底色），下一帧起覆盖层接管。
+        window.decorView.viewTreeObserver.addOnPreDrawListener(
+            object : android.view.ViewTreeObserver.OnPreDrawListener {
+                override fun onPreDraw(): Boolean {
+                    window.decorView.viewTreeObserver.removeOnPreDrawListener(this)
+                    if (!closing && !isFinishing && !isDestroyed) startReveal(initialMetric)
+                    return true
+                }
+            },
+        )
+    }
+
+    /**
+     * 挂 ClipReveal 覆盖层（首帧 PreDraw 里调用）：
+     * 锚点 = `< >` 按钮矩形（源页竖屏坐标，extra 带入）换算到本页横屏窗口坐标；
+     * 内容 = 本页完整 UI（[TrendFullscreenScreen]，与原 setContent 同一棵树）。
+     * 展开完成（onOpened）后覆盖层就是全屏页本体；收拢（[requestClose] → close）
+     * 结束（onClosed）接续 [finishClosingSequence]。
+     */
+    private fun startReveal(initialMetric: Metric) {
+        val source = intent?.getIntArrayExtra(EXTRA_SOURCE_BOUNDS)
+        val anchorRect = source?.takeIf { it.size >= 6 }
+            ?.let { mapPortraitRectToWindow(it, display?.rotation ?: android.view.Surface.ROTATION_0) }
+        val hostHeight = window.decorView.height
+        revealHolder = ClipReveal.openRevealAt(
+            activity = this,
+            anchorYInWindow = anchorRect?.exactCenterY() ?: (hostHeight / 2f),
+            backgroundColor = pageBackground,
+            // 收拢结束（onClosed）= 转场动画播完 → 接系统栏/方向/finish 收尾时序
+            onClosed = { finishClosingSequence() },
+            anchorRectInWindow = anchorRect,
+            createContent = { ctx, _ ->
+                ComposeView(ctx).apply {
+                    setContent {
+                        PowerMeterTheme {
+                            TrendFullscreenScreen(
+                                initialMetric = initialMetric,
+                                closing = closing,
+                                onFinish = { requestClose() },
+                            )
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    /**
+     * 源页（竖屏窗口）矩形 → 本页（横屏窗口）窗口坐标。
+     * 两侧窗口都全屏 edge-to-edge、原点都落在物理屏左上（按各自 orientation 解读），
+     * 纯旋转映射（[pw] = 源竖屏窗口宽、[ph] = 源竖屏窗口高，extra 带入）：
+     * - ROTATION_90（设备逆时针、顶朝左）：x' = y，y' = x → Rect(t, l, b, r)；
+     * - ROTATION_270（设备顺时针、顶朝右）：x' = ph - y，y' = pw - x；
+     * - 其他（直角屏 / 尚未落向横屏）：原样使用，退化为中心线兜底也不穿帮。
+     * ⚠️ 映射方向若装机后锚点飘到对角，优先交换两个 rotation 分支再查其他。
+     */
+    private fun mapPortraitRectToWindow(src: IntArray, rotation: Int): Rect {
+        val (l, t, r, b) = src
+        val pw = src[4]
+        val ph = src[5]
+        return when (rotation) {
+            android.view.Surface.ROTATION_90 -> Rect(t, l, b, r)
+            android.view.Surface.ROTATION_270 -> Rect(ph - b, pw - r, ph - t, pw - l)
+            else -> Rect(l, t, r, b)
         }
     }
 
     /**
-     * 关闭全屏页 —— C+ 时序，四步缺一不可（原因见类注释）：
+     * 关闭全屏页 —— 一镜到底时序：
      *
-     * ① 先恢复系统栏（[NavigationBarHelper.exitImmersive]）；
-     * ② 再解除横屏锁定，让显示在"纯色屏"之下转回竖屏；
-     * ③ 等方向落地：`onConfigurationChanged` 接住；设备本就横握时不会触发 → 超时兜底；
-     * ④ 方向落地后才 `finish()`，此时交给主题的四向滑窗动画，主页已是正确的竖屏单列。
-     *
-     * t=0 就有可见反馈（第 ①+② 步同时触发内容淡出），不会让 ✕ 看起来点了没反应。
+     * ① [closing] = true（覆盖层里的内容同步淡出，[TrendFullscreenScreen] 的 closing 淡出
+     *    与 ClipReveal 收拢的内容淡出时间窗叠加，t=0 立即有可见反馈）；
+     * ② [revealHolder.close] 把覆盖层**收回到 `< >` 按钮矩形**（一镜到底的收拢半程）；
+     * ③ 收拢结束（ClipReveal onClosed → [finishClosingSequence]）：恢复系统栏 + 解除横屏
+     *    锁定 —— 旋转发生在空壳纯色屏之下，没有内容可重排；
+     * ④ 等方向落地：`onConfigurationChanged` 接住；设备本就横握时不会触发 → 超时兜底；
+     * ⑤ 方向落地后才 `finish()`（已禁用窗口过渡，见 onCreate ⑤），主页已是正确的竖屏单列。
      */
     private fun requestClose() {
         if (closing) return
         closing = true
+        // 覆盖层收回：holder 已建立时 onClosed 必达（含未 beginOpen 的兜底路径）；
+        // holder 尚未建立（极端：PreDraw 前就要求关闭）→ 直接走收尾
+        val holder = revealHolder
+        if (holder != null) holder.close() else finishClosingSequence()
+    }
+
+    /** 收拢动画播完后的收尾（原 requestClose 的 ①+②+③ 步）：系统栏 → 解锁方向 → 超时兜底 */
+    private fun finishClosingSequence() {
+        // closing 统一在此置位：requestClose 路径已提前设过（幂等）；返回键直接走
+        // holder.close() 的路径到这里才设 —— onConfigurationChanged 的关闭分支、
+        // onWindowFocusChanged 的防重放都依赖它
+        closing = true
+        if (closeSequenceStarted) return
+        closeSequenceStarted = true
         // ① 系统栏恢复要在主页被绘制之前完成：主页顶栏高度 = safeDrawing 顶部 inset + 64dp
         //    （PowerMeterScreen 的 topBarHeight），若等窗口销毁才恢复，主页首帧会先按
         //    "无系统栏"排一次、再跳一次 —— 这是返回瞬闪的第二个来源
         NavigationBarHelper.exitImmersive(this)
-        // ② 解锁方向 → 显示开始转回。旋转发生在上一步那块纯色屏之下，没有内容可重排
+        // ② 解锁方向 → 显示开始转回。旋转发生在空壳纯色屏之下，没有内容可重排
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         // ③ 兜底：解锁不产生旋转（设备本就横握）时不会有 onConfigurationChanged
         window.decorView.postDelayed({ finishIfClosing() }, ORIENTATION_SETTLE_TIMEOUT_MS)
     }
 
-    /** 方向已落地（或超时）→ 真正 finish()。API 34+ 的收缩过渡已在 onCreate 注册；
-     *  更早版本在此 overridePendingTransition 挂同一对动画（覆盖主题四向滑动） */
+    /** 方向已落地（或超时）→ 真正 finish()：转场已由覆盖层收拢播完，窗口过渡显式禁用 */
     private fun finishIfClosing() {
         if (closing && !isFinishing && !isDestroyed) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 @Suppress("DEPRECATION")
-                overridePendingTransition(R.anim.trend_underlay_enter, R.anim.trend_collapse_exit)
+                overridePendingTransition(0, 0)
             }
             finish()
         }

@@ -202,18 +202,28 @@ fun PowerMeterScreen(
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val context = LocalContext.current
     val metricColor = rememberMetricColor(metric)
-    // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + clip-reveal 展开
-    // 过渡：新页从 `< >` 按钮的窗口矩形长大铺满，系统级 ActivityOptions；退出收缩动画在
-    // 全屏页侧配 anim/trend_*）。采样数据无需跨页传递：全屏页直接读 SampleStore（实时
-    // 环形缓冲）/ ImportedSeries 两个单例。
+    // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + **ClipReveal 一镜
+    // 到底转场**：全屏页把自身 UI 渲染进 ClipReveal 覆盖层，从 `< >` 按钮矩形四边同步撑开
+    // 铺满、退出收回到按钮矩形 —— 锚点跨"竖屏源窗口 → 横屏目标窗口"的坐标换算在目标页做，
+    // 这里只负责把按钮矩形（源窗口坐标）与源窗口宽高一起传过去）。
+    // 采样数据无需跨页传递：全屏页直接读 SampleStore（实时环形缓冲）/ ImportedSeries 两个单例。
     val openTrendFullscreen: (Rect) -> Unit = { bounds ->
-        // Compose 侧全程 geometry.Rect，launch 的 View 层边界吃 android.graphics.Rect —— 换算一次
-        TrendFullscreenActivity.launch(
-            context, metric,
-            android.graphics.Rect(
-                bounds.left.toInt(), bounds.top.toInt(), bounds.right.toInt(), bounds.bottom.toInt(),
-            ),
-        )
+        val dm = context.resources.displayMetrics
+        if (dm.widthPixels <= dm.heightPixels) {
+            // 竖屏源窗口：锚点矩形换算的前提成立（mapPortraitRectToWindow）
+            TrendFullscreenActivity.sourcePortraitWidth = dm.widthPixels
+            TrendFullscreenActivity.sourcePortraitHeight = dm.heightPixels
+            TrendFullscreenActivity.launch(
+                context, metric,
+                android.graphics.Rect(
+                    bounds.left.toInt(), bounds.top.toInt(), bounds.right.toInt(), bounds.bottom.toInt(),
+                ),
+            )
+        } else {
+            // 横握设备下的主页（源窗口已是横屏）：跨方向换算不适用 → 不带锚点，
+            // 全屏页退化为过中心的全宽线展开（仍是一镜到底，只是无矩形本体）
+            TrendFullscreenActivity.launch(context, metric, null)
+        }
     }
 
     // 内容区水平 insets：**只避挖孔，不避导航栏**
