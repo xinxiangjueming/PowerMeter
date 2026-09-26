@@ -1,9 +1,13 @@
 package com.chen.powermeter.ui
 
+import android.app.Activity
+import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -101,7 +105,9 @@ private const val ORIENTATION_SETTLE_TIMEOUT_MS = 250L
  * 竖屏，主页先按**横屏两列**画出来、随后再翻回竖屏单列 —— 趋势卡宽度与位置同时改变，
  * 观感就是"返回主页闪一下"。关闭必须走 [requestClose]：
  * 内容先淡到主题底色（纯色屏没有可重排的内容）→ 解锁方向（旋转发生在纯色之下）→
- * 等方向落地（`onConfigurationChanged` 或超时兜底）→ 才 `finish()` 交给主题的滑窗动画。
+ * 等方向落地（`onConfigurationChanged` 或超时兜底）→ 才 `finish()` 交给关闭收缩动画
+ * （`anim/trend_*`，见 onCreate ⑤；2026-09-26 起进入方向为从 `< >` 按钮的 clip-reveal 展开，
+ * 见 [launch]，均覆盖主题的四向滑动）。
  * 打开方向不需要这套处理：本页是**独立窗口**，`setRequestedOrientation` 的效果在启动窗口
  * （StartingWindow）底下就生效了，首帧即横屏。
  */
@@ -114,19 +120,25 @@ class TrendFullscreenActivity : ComponentActivity() {
         /**
          * 打开趋势全屏页。
          *
-         * 过渡动画由**主题**的 `android:windowAnimationStyle` 提供（四向水平滑动，
-         * 见 res/values/themes.xml 的 ActivitySlideWindowAnimation），此处不再调
-         * overrideActivityTransition / overridePendingTransition ——
-         * 主题声明一处即覆盖新旧 API，也省掉两套分支。
+         * 进入动画优先 **clip-reveal**（[revealBounds] = `< >` 按钮的窗口矩形，
+         * `ActivityOptions.makeClipRevealAnimation` 让新页从该矩形长大铺满 —— 与
+         * 模式切换的 ClipReveal 同观感的系统级实现），覆盖主题 activityOpenEnter 的
+         * 四向滑动；拿不到 source/矩形时回落主题滑动。退出方向的收缩动画见 onCreate。
          *
-         * @param context 调用方 Context（仅用于 startActivity）
+         * @param context 调用方 Context（需要 Activity 才能拿 decorView 做 options 源）
          */
         // internal：签名含 internal 的 Metric，public 会触发「public function exposes
         // its internal parameter type」；调用方（PowerMeterScreen）同模块，可见性足够
-        internal fun launch(context: Context, metric: Metric) {
+        internal fun launch(context: Context, metric: Metric, revealBounds: Rect? = null) {
+            val options = (context as? Activity)?.window?.decorView?.let { source ->
+                revealBounds?.takeIf { it.width() > 0 && it.height() > 0 }?.let { r ->
+                    ActivityOptions.makeClipRevealAnimation(source, r.left, r.top, r.width(), r.height())
+                }
+            }
             context.startActivity(
                 Intent(context, TrendFullscreenActivity::class.java)
                     .putExtra(EXTRA_METRIC, metric.name),
+                options?.toBundle(),
             )
         }
     }
@@ -184,6 +196,18 @@ class TrendFullscreenActivity : ComponentActivity() {
         // 系统返回手势 / 返回键必须走同一套关闭时序：放行给默认实现（直接 finish()）时，
         // 本页会在显示仍是横屏的状态下被移除 → 主页先按横屏两列画出来再翻回竖屏（返回瞬闪）
         onBackPressedDispatcher.addCallback(this) { requestClose() }
+
+        // ⑤ 关闭过渡：向后收缩（本页中心缩退淡出 + 底页浮现，res/anim/trend_*），覆盖主题
+        //    activityClose* 的四向滑动 —— 与进入的 clip-reveal 展开呼应。
+        //    API 34+ 在此一次性注册（预测性返回也走它）；更早版本在 finish() 处挂同一对。
+        //    OVERRIDE_TRANSITION_CLOSE 是编译期内联的 int 常量，低版本引用安全（有 SDK 分支）。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(
+                OVERRIDE_TRANSITION_CLOSE,
+                R.anim.trend_underlay_enter,
+                R.anim.trend_collapse_exit,
+            )
+        }
     }
 
     /**
@@ -209,9 +233,16 @@ class TrendFullscreenActivity : ComponentActivity() {
         window.decorView.postDelayed({ finishIfClosing() }, ORIENTATION_SETTLE_TIMEOUT_MS)
     }
 
-    /** 方向已落地（或超时）→ 真正 finish()，交给主题的 activityClose* 滑窗动画 */
+    /** 方向已落地（或超时）→ 真正 finish()。API 34+ 的收缩过渡已在 onCreate 注册；
+     *  更早版本在此 overridePendingTransition 挂同一对动画（覆盖主题四向滑动） */
     private fun finishIfClosing() {
-        if (closing && !isFinishing && !isDestroyed) finish()
+        if (closing && !isFinishing && !isDestroyed) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                @Suppress("DEPRECATION")
+                overridePendingTransition(R.anim.trend_underlay_enter, R.anim.trend_collapse_exit)
+            }
+            finish()
+        }
     }
 
     /**
@@ -357,7 +388,8 @@ private fun TrendFullscreenScreen(
                     // SegmentFullscreenActivity.kt:221-235）+ 居中标题 + 右侧颜色胶囊
                     Box(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
                         Box(modifier = Modifier.align(Alignment.CenterStart)) {
-                            FullscreenPillButton(text = "✕", onClick = onFinish)
+                            // 回调携带按钮矩形参数，但关闭页不需要展开起点，忽略之
+                            FullscreenPillButton(text = "✕", onClick = { _ -> onFinish() })
                         }
                         Box(
                             modifier = Modifier.align(Alignment.Center),
@@ -370,14 +402,15 @@ private fun TrendFullscreenScreen(
                             )
                         }
                         Box(modifier = Modifier.align(Alignment.CenterEnd)) {
-                            // 颜色胶囊底色固定为淡紫，与竖屏趋势卡同一口径（PowerMeterScreen.TrendCard）：
-                            // 不再跟随首条曲线色。曲线色改由 tab 上的色点表达 —— 见下方 FilterChip 的 leadingIcon。
-                            // 文字色仍按亮度反算，保留"底浅则字深"的自适应能力。
+                            // 颜色胶囊底色走莫奈取色（2026-09-26，与竖屏趋势卡同一口径
+                            // PowerMeterScreen.colorButtonBackground）：支持莫奈的机器 =
+                            // Material You secondaryContainer（随壁纸），否则回落固定淡紫；
+                            // 不随首条曲线色。曲线色改由 tab 上的色点表达 —— 见下方 FilterChip 的 leadingIcon。
                             val primary = metrics.first()
                             ChartPillButton(
                                 text = stringResource(R.string.action_color),
-                                background = ColorButtonLilac,
-                                contentColor = onColorFor(ColorButtonLilac),
+                                background = colorButtonBackground(),
+                                contentColor = colorButtonContent(),
                                 // 多曲线叠加：先弹「选曲线」列表，挑完再开颜色面板；
                                 // 仅一条曲线：直接开颜色面板（对齐 SportLink showColorPickerForSelection）
                                 onClick = {

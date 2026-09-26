@@ -202,9 +202,19 @@ fun PowerMeterScreen(
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val context = LocalContext.current
     val metricColor = rememberMetricColor(metric)
-    // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + 缩放淡入过渡）。
-    // 采样数据无需跨页传递：全屏页直接读 SampleStore（实时环形缓冲）/ ImportedSeries 两个单例。
-    val openTrendFullscreen = { TrendFullscreenActivity.launch(context, metric) }
+    // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + clip-reveal 展开
+    // 过渡：新页从 `< >` 按钮的窗口矩形长大铺满，系统级 ActivityOptions；退出收缩动画在
+    // 全屏页侧配 anim/trend_*）。采样数据无需跨页传递：全屏页直接读 SampleStore（实时
+    // 环形缓冲）/ ImportedSeries 两个单例。
+    val openTrendFullscreen: (Rect) -> Unit = { bounds ->
+        // Compose 侧全程 geometry.Rect，launch 的 View 层边界吃 android.graphics.Rect —— 换算一次
+        TrendFullscreenActivity.launch(
+            context, metric,
+            android.graphics.Rect(
+                bounds.left.toInt(), bounds.top.toInt(), bounds.right.toInt(), bounds.bottom.toInt(),
+            ),
+        )
+    }
 
     // 内容区水平 insets：**只避挖孔，不避导航栏**
     // （口径对齐 sportlink 历史列表 ui/HistoryScreen.kt:313：
@@ -797,13 +807,35 @@ internal fun rememberAvailableMetrics(): List<Metric> {
 }
 
 /**
- * 「颜色」胶囊的固定底色（Material Purple 200 的淡紫）。
+ * 「颜色」胶囊的**回落底色**（Material Purple 200 的淡紫）。
  *
- * 有意**不随昼夜主题与曲线色变化**：它是一枚功能按钮（点开颜色选择面板），
- * 不是颜色指示器。固定色让标题行右侧的视觉权重稳定；浅紫底 + 亮度反算出的深色文字
- * 在明暗两种主题下都有足够对比度。
+ * 2026-09-26 起仅在**不支持莫奈取色**的机器（API 30-）上使用：支持莫奈的机器走
+ * [colorButtonBackground] 的 Material You 动态取色。有意的原约定不变：按钮色
+ * **不随曲线色变化**——它是一枚功能按钮（点开颜色选择面板），不是颜色指示器。
  */
 internal val ColorButtonLilac = Color(0xFFB39DDB)
+
+/**
+ * 「颜色」胶囊底色（2026-09-26 莫奈取色口径）：
+ * - **支持莫奈取色**的机器（Android 12+，[com.chen.powermeter.ui.theme.PowerMeterTheme]
+ *   默认走 dynamicColorScheme）→ Material You **secondaryContainer**（随壁纸取色），
+ *   文字配对角色 [colorButtonContent] 的 onSecondaryContainer（M3 标准容器/内容对，
+ *   深浅主题与动态取色自动适配，无需再亮度反算）；
+ * - **不支持**的机器（API 30-）→ 固定淡紫 [ColorButtonLilac]，文字色走亮度反算
+ *   （口径不变）。
+ * 判定用 SDK 版本而非尝试性取色：dynamicColorScheme 在 API 31+ 恒可得，主题侧
+ * `dynamicColor = true` 无条件开（调用处从不覆写），两者一致。
+ */
+@Composable
+internal fun colorButtonBackground(): Color =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MaterialTheme.colorScheme.secondaryContainer
+    else ColorButtonLilac
+
+/** 「颜色」胶囊文字色：与 [colorButtonBackground] 同口径取配对角色（见其 KDoc） */
+@Composable
+internal fun colorButtonContent(): Color =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MaterialTheme.colorScheme.onSecondaryContainer
+    else onColorFor(ColorButtonLilac)
 
 @Composable
 internal fun TrendCard(
@@ -816,8 +848,8 @@ internal fun TrendCard(
     /** 点击标题行右侧的颜色胶囊：打开该指标的颜色选择面板 */
     onColorClick: () -> Unit,
     shape: RoundedCornerShape,
-    /** 点击标题行右侧的 `< >` 胶囊：把本卡片放大到全屏（隐藏状态栏与小白条） */
-    onFullscreenClick: () -> Unit,
+    /** 点击标题行右侧的 `< >` 胶囊：把本卡片放大到全屏。入参 = 按钮窗口矩形（clip-reveal 展开起点） */
+    onFullscreenClick: (Rect) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -846,16 +878,16 @@ internal fun TrendCard(
                     modifier = Modifier.align(Alignment.CenterEnd),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    // 底色固定为淡紫，**不再跟随曲线色**（2026-09-21 用户约定）：
-                    // 跟随曲线色时，用户把线调成黄/白等浅色后按钮会跟着变浅，既让标题行右侧
-                    // 两枚胶囊的视觉权重随数据漂移，也和"这是按钮、不是色块"的语义打架。
-                    // 曲线色改由 tab 上的色点表达（见下方 FilterChip 的 leadingIcon）——
-                    // 色点紧贴指标名，位置唯一、不会被误读成按钮底纹。
-                    // 文字色仍按亮度反算，保留"底浅则字深"的自适应能力。
+                    // 底色**不随曲线色**（2026-09-21 用户约定）：跟随曲线色时，用户把线调成
+                    // 黄/白等浅色后按钮会跟着变浅，既让标题行右侧两枚胶囊的视觉权重随数据漂移，
+                    // 也和"这是按钮、不是色块"的语义打架。曲线色改由 tab 上的色点表达（见下方
+                    // FilterChip 的 leadingIcon）——色点紧贴指标名，位置唯一、不会被误读成按钮底纹。
+                    // 底色本身走莫奈取色（2026-09-26）：支持莫奈的机器 = Material You
+                    // secondaryContainer（随壁纸），否则回落固定淡紫，见 colorButtonBackground。
                     ChartPillButton(
                         text = stringResource(R.string.action_color),
-                        background = ColorButtonLilac,
-                        contentColor = onColorFor(ColorButtonLilac),
+                        background = colorButtonBackground(),
+                        contentColor = colorButtonContent(),
                         onClick = onColorClick,
                     )
                     FullscreenPillButton(onClick = onFullscreenClick)
@@ -957,20 +989,29 @@ internal fun ChartPillButton(
 /**
  * 全屏胶囊按钮（`< >`），样式对齐 SportLink `ChartSection.SmallPillButton`：
  * 深色底 #2E7D32 / 浅色底 #C8E6C9，13sp 加粗，圆角走 [LocalCornerRadius]。
+ *
+ * 点击回调携带**按钮自身的窗口矩形**：主界面趋势卡用它作全屏 Activity 的
+ * clip-reveal 展开起点（新页从按钮矩形长大铺满，见 TrendFullscreenActivity.launch）；
+ * 其他调用方（全屏页 ✕）不关心该参数。坐标用 localToWindow + size 手动拼 ——
+ * 本 Compose 版本的 LayoutCoordinates 没有 boundsInWindow。
  */
 @Composable
 internal fun FullscreenPillButton(
-    onClick: () -> Unit,
+    onClick: (Rect) -> Unit,
     text: String = "< >",
     modifier: Modifier = Modifier,
 ) {
     val isDark = isSystemInDarkTheme()
+    var bounds by remember { mutableStateOf(Rect.Zero) }
     ChartPillButton(
         text = text,
         background = if (isDark) Color(0xFF2E7D32) else Color(0xFFC8E6C9),
         contentColor = if (isDark) Color.White else Color.Black,
-        onClick = onClick,
-        modifier = modifier,
+        onClick = { onClick(bounds) },
+        modifier = modifier.onGloballyPositioned { c ->
+            val pos = c.localToWindow(Offset.Zero)
+            bounds = Rect(pos.x, pos.y, pos.x + c.size.width, pos.y + c.size.height)
+        },
     )
 }
 
