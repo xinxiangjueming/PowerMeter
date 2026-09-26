@@ -1,5 +1,6 @@
 package com.chen.powermeter.ui
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -7,6 +8,7 @@ import android.content.res.Configuration
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
@@ -144,6 +146,16 @@ class TrendFullscreenActivity : ComponentActivity() {
                 )
             }
             context.startActivity(i)
+            // 压制本次启动的窗口滑动动画（同 SportLink AppTransitions.launchWithTransform）：
+            // 主题 activityOpen* 的整窗滑入会与目标窗口内 ClipReveal 的四向撑开**叠播**，
+            // ClipReveal 的前半段被整窗滑入吞掉 —— 用户只会看到一次普通滑入，
+            // 一镜到底完全不可见（2026-09-26 装机实测）。窗口动画全交给覆盖层。
+            (context as? Activity)?.let { src ->
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    @Suppress("DEPRECATION")
+                    src.overridePendingTransition(0, 0)
+                }
+            }
         }
 
         // 源页竖屏窗口宽高：调用方（PowerMeterScreen）同进程直接写 —— 竖屏窗口 metrics
@@ -221,7 +233,11 @@ class TrendFullscreenActivity : ComponentActivity() {
         // ⑤ 关闭过渡：整条交给覆盖层收回（[revealHolder.close] → onClosed →
         //    [finishClosingSequence]），finish() 本身不再播任何窗口动画 —— 此刻窗口只剩
         //    空壳纯底色，滑出/淡出只会多露一拍底色块。挂 0 = 显式禁用主题 activityClose*。
+        //    open 方向同理压 0：主题 activityOpen* 的整窗滑入会与覆盖层 ClipReveal 的四向
+        //    撑开叠播，一镜到底完全不可见（2026-09-26 装机实测）。API 34+ 在此注册两个方向；
+        //    更早版本由源页 overridePendingTransition(0,0)（launch 内）+ finish 处兜底。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, 0, 0)
             overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
         }
 
@@ -249,8 +265,15 @@ class TrendFullscreenActivity : ComponentActivity() {
      */
     private fun startReveal(initialMetric: Metric) {
         val source = intent?.getIntArrayExtra(EXTRA_SOURCE_BOUNDS)
+        val rotation = display?.rotation ?: android.view.Surface.ROTATION_0
         val anchorRect = source?.takeIf { it.size >= 6 }
-            ?.let { mapPortraitRectToWindow(it, display?.rotation ?: android.view.Surface.ROTATION_0) }
+            ?.let { mapPortraitRectToWindow(it, rotation) }
+        // 锚点换算留痕：装机若"展开起点不在按钮位置"，先看这条日志的 rotation 与
+        // 前后矩形对不对（错位最常见原因 = 设备旋转方向与映射分支相反，交换即可）
+        Log.d(
+            "TrendReveal",
+            "rotation=$rotation source=${source?.toList()} anchor=$anchorRect bg=$pageBackground",
+        )
         val hostHeight = window.decorView.height
         revealHolder = ClipReveal.openRevealAt(
             activity = this,
