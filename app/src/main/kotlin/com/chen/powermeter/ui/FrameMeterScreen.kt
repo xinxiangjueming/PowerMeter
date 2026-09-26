@@ -63,6 +63,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -128,8 +130,8 @@ fun FrameMeterScreen(
     onOpenSession: (Long) -> Unit,
     /** 确认删除某条记录：落库删除后列表自动收窄（样本随外键级联清理，见 [FrameHistoryStore.delete]） */
     onDeleteSession: (Long) -> Unit,
-    /** 双击顶栏标题：切回功率监测。入参 = 点击点的窗口 Y（ClipReveal 上下展开的锚点线） */
-    onToggleMode: (Float) -> Unit,
+    /** 双击顶栏标题：切回功率监测。入参 = 标题栏的窗口矩形（ClipReveal 锚点展开的起点） */
+    onToggleMode: (Rect) -> Unit,
 ) {
     val corner = LocalCornerRadius.current
     val cardShape = remember(corner) { RoundedCornerShape(corner) }
@@ -243,16 +245,25 @@ fun FrameMeterScreen(
         ) {
             TopAppBar(
                 title = {
-                    // 标题的窗口坐标：双击时把点击点换算成窗口 Y，作为模式切换
-                    // ClipReveal 上下展开的锚点线（见 ModeRevealOverlay）
+                    // 标题的窗口矩形：双击时把标题本体换成窗口坐标，作为模式切换
+                    // ClipReveal 锚点展开的起点（展开从标题矩形长大，见 ModeRevealOverlay）
                     var titleCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
                     Column(
                         // 双击标题 = 切回功率监测（与功率监测页同一手势、同一位置的对称入口）
                         Modifier
                             .onGloballyPositioned { titleCoords = it }
                             .pointerInput(Unit) {
-                                detectTapGestures(onDoubleTap = { offset ->
-                                    onToggleMode(titleCoords?.localToWindow(offset)?.y ?: 0f)
+                                detectTapGestures(onDoubleTap = {
+                                    // boundsInWindow() 在本 Compose 版本不可用 → positionInWindow + size 手动拼
+                                    val c = titleCoords?.takeIf { it.isAttached }
+                                    val pos = c?.localToWindow(Offset.Zero) ?: Offset.Zero
+                                    onToggleMode(
+                                        Rect(
+                                            pos.x, pos.y,
+                                            pos.x + (c?.size?.width ?: 0),
+                                            pos.y + (c?.size?.height ?: 0),
+                                        ),
+                                    )
                                 })
                             },
                     ) {

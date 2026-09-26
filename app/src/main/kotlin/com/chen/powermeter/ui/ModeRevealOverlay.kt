@@ -4,32 +4,37 @@ import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalContext
 import android.content.Context
 import android.content.ContextWrapper
 import com.chen.powermeter.ui.theme.PowerMeterTheme
 
-/** 一次监测模式切换转场的参数（ClipReveal 上下展开，见 [ClipReveal]） */
+/** 一次监测模式切换转场的参数（ClipReveal 锚点卡片展开，见 [ClipReveal]） */
 class ModeSwitchArgs(
     /** 切换目标模式（覆盖层里渲染的屏） */
     val target: MonitorMode,
-    /** 双击标题处的窗口 Y（上下展开的锚点线；ClipReveal 会钳回屏内） */
-    val anchorYInWindow: Float,
+    /**
+     * 双击标题处标题栏的**窗口矩形**：展开窗口的四边与四角圆角都从它起算——视觉上是
+     * "标题本体"在向外长大铺满全屏（SportLink 新版 Container Transform 形态，
+     * Compose 侧用 `LayoutCoordinates.boundsInWindow()` 采集）。
+     */
+    val anchorRectInWindow: Rect,
 )
 
 /**
- * 监测模式切换的 **ClipReveal 上下展开**覆盖层（口径对齐 SportLink 的 DeviceDetailOverlay：
+ * 监测模式切换的 **ClipReveal 锚点展开**覆盖层（口径对齐 SportLink 的 DeviceDetailOverlay：
  * 同一套 View 层 [ClipReveal] + ComposeView 承载新屏的接入形态）。
  *
  * 交互全貌（2026-09-25 用户口径：功率 ↔ 帧率的切换动画 = sportlink 最新的 ClipReveal）：
- * - 双击顶栏标题 → 全屏覆盖层插入到整棵界面之上，初始被裁剪成落在点击点、高度为 0 的
- *   "线"，向上下两个方向同时撑开铺满，露出目标模式的完整界面；
- * - 内容延迟 100ms 淡入 + 12dp 上移归位（ClipReveal 内建）；
+ * - 双击顶栏标题 → 全屏覆盖层插入到整棵界面之上，初始被裁剪成**标题矩形本体**（四角
+ *   圆角 = 屏幕物理圆角），随后四边同时向外撑开铺满全屏，露出目标模式的完整界面；
+ * - 详情内容在展开中段（f 0.48→0.88）淡入 + 12dp 上移归位（ClipReveal 内建）；
  * - **展开完成（onOpened）即落地 mode / Prefs 并撤掉覆盖层**：一次双击 = 完整切换，
  *   底层同帧换成目标模式、两层内容一致无缝交接。⚠️ 落地不能挂在收拢结束 —— 那是
  *   "预览后确认"的两段式语义，用户实测就是"第一次双击不切换、必须点第二次"
- *   （2026-09-25 反馈）；预览期（展开的 420ms 内）返回键 = 放弃切换（onCancel）。
+ *   （2026-09-25 反馈）；展开期（580ms 内）返回键 = 放弃切换（onCancel）。
  *
  * 覆盖层是独立 ComposeView（新组合），MaterialTheme 不会从外层组合继承 —— 必须自带
  * [PowerMeterTheme]；弹窗玻璃路径（稳帧指数 ⓘ / 删除确认等）也自带一套
@@ -46,24 +51,33 @@ fun ModeRevealOverlay(
     backgroundColor: Int,
     /** 展开完成：落地 mode / Prefs（MainActivity 侧幂等守卫） */
     onCommit: () -> Unit,
-    /** 预览期被收回（返回键）：放弃本次切换 */
+    /** 展开期被收回（返回键）：放弃本次切换 */
     onCancel: () -> Unit,
-    /** 渲染目标模式屏；入参 onToggleMode = 覆盖层内的切换入口（预览期收拢，见下） */
-    screen: @Composable (onToggleMode: (Float) -> Unit) -> Unit,
+    /** 渲染目标模式屏；入参 onToggleMode = 覆盖层内的切换入口（展开期收拢，见下） */
+    screen: @Composable (onToggleMode: (Rect) -> Unit) -> Unit,
 ) {
     val context = LocalContext.current
     val activity = remember(context) { context.findComponentActivity() }
 
     DisposableEffect(activity, args) {
         val holder = activity?.let { act ->
+            // Compose 侧全程用 geometry.Rect（positionInWindow 口径），openRevealAt 的
+            // View 层边界吃 android.graphics.Rect —— 在这里一次性换算（px 值一致）
+            val r = args.anchorRectInWindow
+            val anchorRect = android.graphics.Rect(
+                r.left.toInt(), r.top.toInt(), r.right.toInt(), r.bottom.toInt(),
+            )
             ClipReveal.openRevealAt(
                 activity = act,
-                anchorYInWindow = args.anchorYInWindow,
+                anchorYInWindow = r.center.y,
                 backgroundColor = backgroundColor,
                 // 展开完成 = 切换落地（一次双击完整切换，2026-09-25 用户口径）
                 onOpened = onCommit,
-                // 预览期收拢（返回键）= 放弃切换
+                // 展开期收拢（返回键）= 放弃切换
                 onClosed = onCancel,
+                // 锚点矩形：展开窗口从标题本体起算（buildRevealGeometry 对退化矩形
+                // 自动回落"过中心线的全宽线"，Rect.Zero 等异常值不会崩）
+                anchorRectInWindow = anchorRect,
                 createContent = { ctx, _ ->
                     ComposeView(ctx).apply {
                         setContent {

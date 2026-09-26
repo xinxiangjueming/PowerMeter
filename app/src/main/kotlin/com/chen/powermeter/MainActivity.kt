@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -123,7 +124,7 @@ class MainActivity : ComponentActivity() {
                 var mode by remember {
                     mutableStateOf(MonitorMode.of(Prefs.getMonitorMode(this@MainActivity)))
                 }
-                // 进行中的模式切换转场（ClipReveal 上下展开，见 ModeRevealOverlay）；null = 无转场。
+                // 进行中的模式切换转场（ClipReveal 锚点展开，见 ModeRevealOverlay）；null = 无转场。
                 // 双击标题 → 先起覆盖层（底层旧屏保持原样），收拢动画结束（onCommit）才落地 mode / Prefs
                 var modeReveal by remember { mutableStateOf<ModeSwitchArgs?>(null) }
                 val sessions by FrameHistoryStore.sessions.collectAsState()
@@ -168,8 +169,8 @@ class MainActivity : ComponentActivity() {
                 // 此前只有全屏趋势页挂了宿主，主页面的弹窗会静默降级实色卡（2026-09-25 接入，
                 // 口径对齐 SportLink：弹窗三件套 = 外部 haze 模糊 + 内部 miuix 模糊 + 高光描边）。
                 // 双模式屏的统一渲染入口：底屏（当前模式）与转场覆盖层（目标模式）共用
-                // 同一套参数与回调（2026-09-25 切换动画 = ClipReveal 上下展开，见 ModeRevealOverlay）
-                val monitorScreen: @Composable (MonitorMode, (Float) -> Unit) -> Unit = { m, onToggle ->
+                // 同一套参数与回调（2026-09-25 切换动画 = ClipReveal 锚点展开，见 ModeRevealOverlay）
+                val monitorScreen: @Composable (MonitorMode, (Rect) -> Unit) -> Unit = { m, onToggle ->
                     when (m) {
                         MonitorMode.POWER -> PowerMeterScreen(
                             running = running,
@@ -233,8 +234,8 @@ class MainActivity : ComponentActivity() {
                 }
 
                 DialogBackdropHost {
-                    monitorScreen(mode) { anchorY ->
-                        // 双击标题 = 起转场：目标模式在覆盖层里上下展开，**展开完成即落地**
+                    monitorScreen(mode) { titleRect ->
+                        // 双击标题 = 起转场：目标模式在覆盖层里从标题矩形本体展开，**展开完成即落地**
                         // mode / Prefs —— 一次双击完整切换（见 ModeRevealOverlay 的类 KDoc）。
                         // 动画期 ClipReveal 已吞掉全部触摸（第一道防线），已有转场在途时
                         // 这里再兜一道：在途转场的重入会抹掉/覆盖在途状态。
@@ -245,7 +246,7 @@ class MainActivity : ComponentActivity() {
                                 } else {
                                     MonitorMode.POWER
                                 },
-                                anchorYInWindow = anchorY,
+                                anchorRectInWindow = titleRect,
                             )
                         }
                     }
