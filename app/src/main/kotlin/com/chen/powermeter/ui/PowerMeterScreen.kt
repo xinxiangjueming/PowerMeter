@@ -1,6 +1,9 @@
 package com.chen.powermeter.ui
 
 import android.content.res.Configuration
+import android.app.Activity
+import androidx.compose.ui.graphics.toArgb
+import com.chen.powermeter.util.AppTransitions
 import android.os.Build
 import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedContent
@@ -202,27 +205,19 @@ fun PowerMeterScreen(
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val context = LocalContext.current
     val metricColor = rememberMetricColor(metric)
-    // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + **ClipReveal 一镜
-    // 到底转场**：全屏页把自身 UI 渲染进 ClipReveal 覆盖层，从 `< >` 按钮矩形四边同步撑开
-    // 铺满、退出收回到按钮矩形 —— 锚点跨"竖屏源窗口 → 横屏目标窗口"的坐标换算在目标页做，
-    // 这里只负责把按钮矩形（源窗口坐标）与源窗口宽高一起传过去）。
+    // 页面底色（Compose 主题）：转场 Handoff 里带给目标页当裁剪容器底色 —— 保证展开/
+    // 收拢窗口内的底色与主页连续（View 层主题的 colorBackground 深色模式下不符，不能用）
+    val pageBackgroundArgb = MaterialTheme.colorScheme.background.toArgb()
+    // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + **AppTransitions
+    // 一镜到底转场**，SportLink 运动选择 → 室内跑步同款：点击时按钮已经 register 锚点，
+    // 这里截图 + 经 Handoff 交接，目标页把页面根包进 ClipRevealLayout 从按钮矩形四向
+    // 撑开；退出收回到按钮矩形）。锚点矩形与截图全在 AppTransitions 内流转，此处不传参。
     // 采样数据无需跨页传递：全屏页直接读 SampleStore（实时环形缓冲）/ ImportedSeries 两个单例。
-    val openTrendFullscreen: (Rect) -> Unit = { bounds ->
-        val dm = context.resources.displayMetrics
-        if (dm.widthPixels <= dm.heightPixels) {
-            // 竖屏源窗口：锚点矩形换算的前提成立（mapPortraitRectToWindow）
-            TrendFullscreenActivity.sourcePortraitWidth = dm.widthPixels
-            TrendFullscreenActivity.sourcePortraitHeight = dm.heightPixels
-            TrendFullscreenActivity.launch(
-                context, metric,
-                android.graphics.Rect(
-                    bounds.left.toInt(), bounds.top.toInt(), bounds.right.toInt(), bounds.bottom.toInt(),
-                ),
-            )
-        } else {
-            // 横握设备下的主页（源窗口已是横屏）：跨方向换算不适用 → 不带锚点，
-            // 全屏页退化为过中心的全宽线展开（仍是一镜到底，只是无矩形本体）
-            TrendFullscreenActivity.launch(context, metric, null)
+    val openTrendFullscreen: () -> Unit = {
+        val act = context as? Activity
+        if (act != null) {
+            val capture = AppTransitions.capture(act.window.decorView, pageBackgroundArgb)
+            TrendFullscreenActivity.launch(act, metric, capture)
         }
     }
 
@@ -858,8 +853,8 @@ internal fun TrendCard(
     /** 点击标题行右侧的颜色胶囊：打开该指标的颜色选择面板 */
     onColorClick: () -> Unit,
     shape: RoundedCornerShape,
-    /** 点击标题行右侧的 `< >` 胶囊：把本卡片放大到全屏。入参 = 按钮窗口矩形（clip-reveal 展开起点） */
-    onFullscreenClick: (Rect) -> Unit,
+    /** 点击标题行右侧的 `< >` 胶囊：把本卡片放大到全屏（锚点由按钮经 AppTransitions 登记） */
+    onFullscreenClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -1000,28 +995,28 @@ internal fun ChartPillButton(
  * 全屏胶囊按钮（`< >`），样式对齐 SportLink `ChartSection.SmallPillButton`：
  * 深色底 #2E7D32 / 浅色底 #C8E6C9，13sp 加粗，圆角走 [LocalCornerRadius]。
  *
- * 点击回调携带**按钮自身的窗口矩形**：主界面趋势卡用它作全屏 Activity 的
- * clip-reveal 展开起点（新页从按钮矩形长大铺满，见 TrendFullscreenActivity.launch）；
- * 其他调用方（全屏页 ✕）不关心该参数。坐标用 localToWindow + size 手动拼 ——
- * 本 Compose 版本的 LayoutCoordinates 没有 boundsInWindow。
+ * **容器变换源条目**（2026-09-26 对齐 SportLink）：自身登记为 [AppTransitions.Source]
+ * （窗口矩形经 [Modifier.containerSource] 采集），点击时 [AppTransitions.register] 登记
+ * 锚点 —— 趋势卡用它作全屏 Activity 的展开起点（截图 + 矩形，见 TrendFullscreenActivity
+ * 的 onPostCreate 装配）；其余调用方（✕）也 register，无消费者时锚点按 TTL 过期丢弃。
  */
 @Composable
 internal fun FullscreenPillButton(
-    onClick: (Rect) -> Unit,
+    onClick: () -> Unit,
     text: String = "< >",
     modifier: Modifier = Modifier,
 ) {
     val isDark = isSystemInDarkTheme()
-    var bounds by remember { mutableStateOf(Rect.Zero) }
+    val source = rememberContainerSource()
     ChartPillButton(
         text = text,
         background = if (isDark) Color(0xFF2E7D32) else Color(0xFFC8E6C9),
         contentColor = if (isDark) Color.White else Color.Black,
-        onClick = { onClick(bounds) },
-        modifier = modifier.onGloballyPositioned { c ->
-            val pos = c.localToWindow(Offset.Zero)
-            bounds = Rect(pos.x, pos.y, pos.x + c.size.width, pos.y + c.size.height)
+        onClick = {
+            AppTransitions.register(source)
+            onClick()
         },
+        modifier = modifier.containerSource(source),
     )
 }
 

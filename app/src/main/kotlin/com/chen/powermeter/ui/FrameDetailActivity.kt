@@ -355,8 +355,8 @@ private fun FrameDetailScreen(
                 },
                 navigationIcon = {
                     // 与趋势全屏页同一枚胶囊（✕）：本页由主题提供水平滑入 / 滑出过渡，
-                    // 返回手势与这里都只做 finish()。回调携带按钮矩形参数，本页不需要，忽略之
-                    FullscreenPillButton(text = "✕", onClick = { _ -> onBack() })
+                    // 返回手势与这里都只做 finish()（按钮会 register 转场锚点，无消费者自动过期）
+                    FullscreenPillButton(text = "✕", onClick = onBack)
                 },
                 actions = {
                     // Kite 兼容 xlsx 分享：无样本（理论不可达）时 Activity 侧 toast 兜底
