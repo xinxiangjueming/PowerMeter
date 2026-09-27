@@ -29,7 +29,7 @@ import com.chen.powermeter.ui.theme.screenCornerRadiusPx
  * （[TouchBlockingHost] > [ClipRevealLayout] > 详情内容），初始被裁剪成**锚点卡片
  * 矩形本体**——窗口矩形/四角圆角都与卡片一致，窗口内铺卡片截图（像素级连续，
  * 见 [RevealGeometry]），随后卡片四边同时向外撑开铺满全屏；卡片截图与详情内容在
- * 展开中段交叉淡变（截图淡出 / 内容淡入 + 上移归位）。收拢反向：
+ * 展开中段交叉淡变（截图淡出 / 内容淡入，均钉在屏幕坐标无位移）。收拢反向：
  * 内容淡出 / 截图淡回，窗口收回卡片矩形后移除覆盖层，与真卡片无缝衔接。
  * 四角圆角从锚点控件实际显示圆角插值到屏幕物理圆角（小米系 = HyperOS
  * rounded_corner_radius_top，与系统显示遮罩同源，收尾无缝）。
@@ -104,9 +104,6 @@ object ClipReveal {
     /** 收拢侧：列表文字（卡片截图）从 raw 45% 之后才淡回（用户反馈：出现太早要晚点） */
     internal const val ANCHOR_IN_START = 0.45f
 
-    /** 内容浮现的初始下沉量（px 按 12dp 换算）：淡入同时轻微上移归位（AppTransitions 进场共用） */
-    internal const val CONTENT_SLIDE_DP = 12f
-
     /** 同一时刻只允许一个展开会话（窗口里只能有一层覆盖层） */
     private var current: Holder? = null
 
@@ -179,6 +176,14 @@ object ClipReveal {
         anchorRectInWindow: Rect? = null,
         anchorCornerRadiusPx: Float? = null,
         anchorBitmap: android.graphics.Bitmap? = null,
+        /**
+         * 锚点内部文字截图 + 其窗口矩形（可选，列表行类锚点）：传入时卡片本体钉在
+         * 原始矩形不动、仅文字随窗口上边滑移渐隐（2026-09-27 SportLink 新版分层绘制，
+         * 见 [ClipRevealLayout.setAnchorTextBitmap]）；null = 整卡一起滑移（紧凑按钮类）。
+         * 注意：文字矩形只在源/目标**同方向**时可直接使用（跨方向页需另行换算）。
+         */
+        anchorTextBitmap: android.graphics.Bitmap? = null,
+        anchorTextRectInWindow: Rect? = null,
     ): Holder {
         current?.let {
             Log.w(TAG, "已有一个展开会话，忽略本次 openReveal")
@@ -250,6 +255,20 @@ object ClipReveal {
                         )
                     } else {
                         clip.setAnchorBitmap(null, 0f, 0f, 0f, 0f)
+                    }
+                    // 卡片截图交给裁剪容器：有文字截图时本体钉在原位（卡片不动、只有内部
+                    // 文字随窗口上边滑移渐隐，2026-09-27 用户定稿）；无文字截图 = 整卡一起
+                    // 滑移（紧凑按钮类锚点既有行为，见 ClipRevealLayout.onDraw）
+                    if (anchorTextBitmap != null && anchorTextRectInWindow != null) {
+                        clip.setAnchorTextBitmap(
+                            anchorTextBitmap,
+                            (anchorTextRectInWindow.left - clipLoc[0]).toFloat(),
+                            (anchorTextRectInWindow.top - clipLoc[1]).toFloat(),
+                            (anchorTextRectInWindow.right - clipLoc[0]).toFloat(),
+                            (anchorTextRectInWindow.bottom - clipLoc[1]).toFloat(),
+                        )
+                    } else {
+                        clip.setAnchorTextBitmap(null, 0f, 0f, 0f, 0f)
                     }
                     holder.beginOpen(geometry)
                     return false
@@ -358,8 +377,12 @@ object ClipReveal {
         )
     }
 
-    /** 锚点圆角缺省值 = 全 App 控件实际显示圆角（LocalCornerRadius 同源）：小米系 = 屏幕物理圆角，其余 28dp */
-    private fun defaultAnchorRadiusPx(activity: Activity): Float =
+    /**
+     * 锚点圆角缺省值 = 全 App 控件实际显示圆角（LocalCornerRadius 同源）：小米系 = 屏幕物理圆角，其余 28dp。
+     * internal：AppTransitions.installWindowTransform 也用它给本体截图设圆角
+     * （ClipRevealLayout.drawAnchorBody 的圆角绘制与 buildRevealGeometry 的 startRadius 同源）。
+     */
+    internal fun defaultAnchorRadiusPx(activity: Activity): Float =
         getScreenCornerRadius(activity).value * activity.resources.displayMetrics.density
 
     /**
@@ -405,7 +428,9 @@ object ClipReveal {
     ) {
         /**
          * 详情内容 View。[openRevealAt] 在 [openReveal]、工厂闭包（需要先拿到 close）
-         * 执行完之后注入，进场动画对它做延迟淡入 + 上移。
+         * 执行完之后注入，进场动画对它做延迟淡入（钉死屏幕坐标，无位移——滑移渐隐
+         * 只属于锚点行"列表文字"，内容层整体位移会被用户看成"按钮/页面在滑动"，
+         * 2026-09-27 用户否决，同 SportLink 8452508）。
          */
         internal var content: View? = null
 
@@ -422,7 +447,6 @@ object ClipReveal {
 
         /** 展开几何（锚点矩形 + 圆角插值）；null = beginOpen 尚未执行（PreDraw 还没跑） */
         private var geometry: RevealGeometry? = null
-        private var contentSlidePx = 0f
 
         /**
          * 进场（PreDraw 里调用：此刻覆盖层已布局完成）。
@@ -431,7 +455,6 @@ object ClipReveal {
          */
         internal fun beginOpen(geometry: RevealGeometry) {
             this.geometry = geometry
-            contentSlidePx = CONTENT_SLIDE_DP * host.resources.displayMetrics.density
             applyProgress(0f)
             // 内容初始态必须在动画启动前置好：内容淡入窗口从 f=0.48 才开始，不预置的话
             // 首 48% 内容以 alpha=1 全量出现在展开中的裁剪窗口里，随后才被动画首帧拉回 0
@@ -503,11 +526,8 @@ object ClipReveal {
                     progress = f
                     geometry?.applyTo(clip, f)
                     clip.setAnchorAlpha(maxOf(anchorAlphaAt(f), anchorAlphaIn(c)))
-                    val ca = minOf(contentAlphaAt(f), contentAlphaOut(c))
-                    content?.let {
-                        it.alpha = ca
-                        it.translationY = contentSlidePx * (1f - ca)
-                    }
+                    // 纯交叉淡变、无位移（2026-09-27 内容层 12dp 位移撤除，同 SportLink）
+                    content?.alpha = minOf(contentAlphaAt(f), contentAlphaOut(c))
                 }
                 addListener(object : AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: Animator) = finishImmediately()
@@ -532,11 +552,8 @@ object ClipReveal {
             progress = f
             geometry?.applyTo(clip, f)
             clip.setAnchorAlpha(anchorAlphaAt(f))
-            val ca = contentAlphaAt(f)
-            content?.let {
-                it.alpha = ca
-                it.translationY = contentSlidePx * (1f - ca)
-            }
+            // 纯交叉淡变、无位移（2026-09-27 内容层 12dp 位移撤除，同 SportLink）
+            content?.alpha = contentAlphaAt(f)
         }
 
         private fun finishImmediately(runCallbacks: Boolean = true) {

@@ -85,15 +85,7 @@
 
     <string name="frame_fps">幀率</string>
     <string name="frame_fps_avg">平均幀率</string>
-    <string name="frame_fps_min">最低幀率</string>
-    <string name="frame_fps_max">最高幀率</string>
-    <!-- 1% / 5% Low：最差 1%/5% 幀的平均幀率（CapFrameX 口徑，幀加權）。業界通名，各語言同形；
-         裸 % 不是格式化佔位，必須 formatted="false" 否則 aapt2 拒編譯 -->
-    <string name="frame_fps_low_1" formatted="false">1% Low</string>
-    <string name="frame_fps_low_5" formatted="false">5% Low</string>
     <string name="frame_space">幀間隔</string>
-    <string name="frame_jank">掉幀</string>
-    <string name="frame_refresh_rate">刷新率</string>
     <string name="frame_cpu_clock">CPU 頻率</string>
     <string name="frame_cpu_usage">CPU 使用率</string>
     <string name="frame_temp_virtual">虛擬溫度</string>
@@ -115,6 +107,20 @@
     <string name="frame_steady_index_info">穩幀指數＝幀時間標準差（ms），是 PerfDog 穩幀指數（Smooth，綜合幀時間波動評估平穩度）的簡化口徑：數值越小，幀間隔越均勻，畫面越穩。</string>
     <string name="frame_jank_info">卡頓判定（PerfDog 式口徑，按 1 秒粒度）：幀時間大於前 3 秒均值 2× 記小卡頓；再超過 83ms（兩倍電影幀耗時）記卡頓；大於均值 3× 且超過 125ms 記嚴重卡頓。頂部卡頓率＝卡頓總時長 ÷ 總時長。</string>
     <string name="frame_variance">變異數</string>
+    <!-- 詳情頁卡片標題 / 圖例 / 右軸選項（2026-09-27 多語言化，原先硬編碼英文） -->
+    <string name="frame_card_power">功率(W)</string>
+    <string name="frame_card_power_name">功率</string>
+    <string name="frame_card_capacity">電量</string>
+    <string name="frame_card_capacity_pct">電量 %</string>
+    <string name="frame_card_temperature">溫度(°C)</string>
+    <string name="frame_card_temperature_name">溫度</string>
+    <string name="frame_card_temp" formatted="false">溫度(°C)</string>
+    <string name="frame_card_battery" formatted="false">電量(%)</string>
+    <string name="frame_card_cpu_usage" formatted="false">CPU 使用率(%)</string>
+    <string name="frame_card_cpu_frequency" formatted="false">CPU 頻率(MHz)</string>
+    <string name="frame_card_frame_time" formatted="false">幀時間(ms)</string>
+    <string name="frame_right_cpu_load" formatted="false">CPU 負載(%)</string>
+    <string name="frame_right_gpu_load" formatted="false">GPU 負載(%)</string>
     <string name="frame_right_axis_switch">切換右軸指標</string>
 
     <!-- ==================== 幀率監測：錄製懸浮窗 ==================== -->

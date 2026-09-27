@@ -2,15 +2,15 @@
 <resources>
     <!--
         仅用于主题的 android:windowBackground（窗口首帧底色 + MIUI/HyperOS 判窗口明暗），
-        **不是** Compose 页面的实际底色——页面底色由 PowerMeterTheme 的 dynamic color
-        在运行时算出（见 ui/theme/Theme.kt 的 withDeeperBackground）。
+        **不是** Compose 页面的实际底色——页面底色由 PowerMeterTheme 的固定中性色给出
+        （见 ui/theme/Theme.kt 的 withSportLinkSurfaces）。
 
-        取值对齐 Theme.kt 的推算结果：
-        - 日间 = surfaceContainerHighest 再压暗 8% ≈ #D4CED6
-        - 夜间 = surfaceContainerLowest ≈ #0F0D13（实测截图里应用底色为 #0E0D12，吻合）
-
-        壁纸取色会让实际值略有差异，这里只要求「明暗方向正确、与首帧接近」，
-        避免开屏瞬间出现明显色差。
+        取值必须与 Theme.kt 的 background **逐字一致**（2026-09-27 中性色钉成 SportLink
+        固定值后不再随壁纸/压暗推算）：
+        - 日间 = #E0E0E0，夜间 = #2A2A2A（见 values-night）。
+        此前 #D4CED6/#0F0D13 是旧动态底色（withDeeperBackground 时代）的推算值，已过期：
+        跨 Activity 一镜到底转场中裁剪窗口外露出的正是 windowBackground，色值不一致
+        会在展开/收拢全程看到一圈紫灰底（2026-09-27 用户截图实锤）。
     -->
-    <color name="background">#D4CED6</color>
+    <color name="background">#E0E0E0</color>
 </resources>

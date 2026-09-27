@@ -87,15 +87,7 @@
 
     <string name="frame_fps">Frame rate</string>
     <string name="frame_fps_avg">Average FPS</string>
-    <string name="frame_fps_min">Min FPS</string>
-    <string name="frame_fps_max">Max FPS</string>
-    <!-- 1% / 5% Low: average FPS of the worst 1%/5% of frames (CapFrameX convention, frame-weighted).
-         Bare % is not a format placeholder, formatted="false" is required -->
-    <string name="frame_fps_low_1" formatted="false">1% Low</string>
-    <string name="frame_fps_low_5" formatted="false">5% Low</string>
     <string name="frame_space">Frame time</string>
-    <string name="frame_jank">Dropped</string>
-    <string name="frame_refresh_rate">Refresh rate</string>
     <string name="frame_cpu_clock">CPU clock</string>
     <string name="frame_cpu_usage">CPU usage</string>
     <string name="frame_temp_virtual">Virtual temp</string>
@@ -117,6 +109,20 @@
     <string name="frame_steady_index_info">Steady index = standard deviation of frame time (ms) — a simplified take on PerfDog\'s Smooth metric (overall smoothness from frame-time fluctuation). Lower is steadier.</string>
     <string name="frame_jank_info">Jank policy (PerfDog-style, per second): frame time over 2× the previous 3-second average counts as small jank; over 83 ms (two movie-frame times) as jank; over 3× and 125 ms as big jank. Stutter rate = stutter duration ÷ total duration.</string>
     <string name="frame_variance">Variance</string>
+    <!-- Detail card titles / legends / right-axis options (localized 2026-09-27, was hardcoded English) -->
+    <string name="frame_card_power">Power(W)</string>
+    <string name="frame_card_power_name">Power</string>
+    <string name="frame_card_capacity">Capacity</string>
+    <string name="frame_card_capacity_pct">Capacity %</string>
+    <string name="frame_card_temperature">Temperature(°C)</string>
+    <string name="frame_card_temperature_name">Temperature</string>
+    <string name="frame_card_temp" formatted="false">TEMP(°C)</string>
+    <string name="frame_card_battery" formatted="false">Battery(%)</string>
+    <string name="frame_card_cpu_usage" formatted="false">CPU Usage(%)</string>
+    <string name="frame_card_cpu_frequency" formatted="false">CPU Frequency(MHz)</string>
+    <string name="frame_card_frame_time" formatted="false">Frame Time(ms)</string>
+    <string name="frame_right_cpu_load" formatted="false">CPU Load(%)</string>
+    <string name="frame_right_gpu_load" formatted="false">GPU Load(%)</string>
     <string name="frame_right_axis_switch">Switch right axis</string>
 
     <!-- ==================== Frame rate monitor: recording overlay ==================== -->

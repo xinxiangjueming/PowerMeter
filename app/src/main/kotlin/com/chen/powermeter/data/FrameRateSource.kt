@@ -59,6 +59,13 @@ object FrameRateSource {
          * 差分侧另有「超刷新率即拒绝 + 留痕」的物理上限守卫兜底 ROM 私改（同文件）。
          */
         val perLayerFrames: Map<String, Long> = emptyMap(),
+        /**
+         * 全局 presentToPresent 直方图（桶 = 整毫秒 → 帧数；**自 -clear 起累计**）。
+         * ⚠️ 上层对相邻快照做**直方图差分**才得到「当秒」帧间隔 —— 累计值是一条衰减收敛
+         * 曲线（开局加载的大间隔被逐渐稀释），既读不出当秒、也判不了短谷真假
+         * （2026-09-27 帧时间卡改差分口径的根由，见 FrameRecordController.p2pDeltaFrameSpace）。
+         */
+        val p2pHistogram: Map<Int, Long> = emptyMap(),
     )
 
     /**
@@ -161,14 +168,24 @@ object FrameRateSource {
      * 拿到空输出时**自愈重试一次**（重新 `-enable` 再 dump）—— SurfaceFlinger 重启 /
      * stats 被 `statsd` 拉走清空后，`statsStartLegacy` 会归零导致 dump 变空，
      * 不重试的话用户只能重启 App 才能恢复（2026-09-22 实测）。
+     *
+     * ⚠️ ROM 不认 `-maxlayers` 的降级判定（2026-09-27 加，动机与口径见
+     * [timestatsDumpCmd] 上方注释）：输出**非空却不含 `totalFrames`** = 拿到的是
+     * usage/错误文本而非统计 —— 拉黑后换全量命令立即重读一次。正常 dump（哪怕刚
+     * clear 完一帧还没渲）的全局段恒有 totalFrames（0 也打印），不会误入此分支；
+     * 误拉黑的代价只是退回全量 dump（慢/噪，功能无损）。
      */
     fun readTimestats(pkg: String): Timestats? {
         ensureTimestatsReady()
-        val out = exec(timestatsDumpCmd(pkg))?.takeIf { it.isNotBlank() }
+        var out = exec(timestatsDumpCmd(pkg))?.takeIf { it.isNotBlank() }
             ?: exec("dumpsys SurfaceFlinger --timestats -enable", allowBlank = true)
                 .let { exec(timestatsDumpCmd(pkg)) }
                 ?.takeIf { it.isNotBlank() }
             ?: return null
+        if (!timestatsMaxLayersDead && !out.contains("totalFrames")) {
+            timestatsMaxLayersDead = true
+            out = exec(timestatsDumpCmd(pkg))?.takeIf { it.isNotBlank() } ?: return null
+        }
         return parseTimestats(out, pkg)
     }
 
@@ -204,9 +221,42 @@ object FrameRateSource {
     // - awk 不命中也不非零退出，无需 `; true` 兜底退出码；
     //   读到 EOF 才结束（无 early exit），不碰 grep -m1 的 SIGPIPE 老坑。
     // - root（su）通道同一命令同样受益：awk 在 /system/bin/awk，且省去逐层管道体积。
+    // ── `-dump -maxlayers` 截断（2026-09-27 加，真机 24031PN0DC 实测）──────────
+    //
+    // ⚠️⚠️ 动机 = 差分 dt 的**计时噪声**：帧数快照在 SF 内部完成，时间戳却打在 dump
+    // 传回之后，中间隔着「dumpsys 拼整份文本 → 管道 → awk」。图层数随开机只增不减
+    // （几百个、~700KB），这条尾巴实测 145~200ms、拍间抖动 ±20-40ms —— dt 误差在
+    // 120Hz 下就是 ±2.9fps 的读数噪声（30 拍审计实测单拍 σ=2.4%），再叠加
+    // FPS_LIVE_CEILING_TOLERANCE 拒收式守卫砍掉噪声高侧，实时/落库读数的重心被
+    // 系统性压低 ~1.5fps（用户实测"Scene 120 本应用 115"的构成之一）。
+    //
+    // 修法 = `-dump -maxlayers 8`：**SF 侧**只拼 totalFrames 降序前 8 个图层的文本，
+    // 尾巴实测降到 53~79ms，每拍仍是独立的 1s 测量（不是平滑，是量得更准）。正确性：
+    // - 条目全局按 totalFrames 降序，resetTimestats 后前台目标涨得最快、必然第一；
+    // - updateFpsFromDiff 逐图层取 max，只要「主导表面」在列读数就正确 —— 而主导表面
+    //   恰是目标名下帧数最多的条目，8 槽内必含它；
+    // - 语义损失：目标某低帧率条目被挤出 8 槽会读不到 → totalFrames=0 → NaN（「—」）。
+    //   需要 ≥8 个非目标条目比目标主导表面累计帧数更多才触发，clear 后实际不可达；
+    // - 全局段（presentToPresent / frameSpaceMs）在图层段之前，不受截断影响。
+    //
+    // ⚠️ 兼容性兜底（timestatsMaxLayersDead）：AOSP parseArgs 自 timestats 引入起支持
+    // `-maxlayers`，但 ROM 私改不认参数时会输出 usage/错误文本 —— 特征是**输出非空却
+    // 不含 totalFrames**（正常 dump 的全局段恒有它，0 也打印）。命中即拉黑、本进程
+    // 回落全量命令（退回旧行为：慢/噪，功能无损）。判定在 readTimestats。
+    private const val TIMESTATS_MAX_LAYERS = 8
+
+    /** ROM 不认 `-maxlayers` 的拉黑标记（判定口径见上方注释）；false = 用截断命令 */
+    @Volatile
+    private var timestatsMaxLayersDead = false
+
     private fun timestatsDumpCmd(pkg: String): String {
         val needle = pkg.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }
-        return "dumpsys SurfaceFlinger --timestats -dump 2>/dev/null | awk -v pkg='$needle' '" +
+        val dumpArgs = if (timestatsMaxLayersDead) {
+            "--timestats -dump"
+        } else {
+            "--timestats -dump -maxlayers $TIMESTATS_MAX_LAYERS"
+        }
+        return "dumpsys SurfaceFlinger $dumpArgs 2>/dev/null | awk -v pkg='$needle' '" +
             "BEGIN{havePkg=(pkg!=\"\")} " +
             "/layerName/{inLayer=1; keep=(havePkg && index(\$0,pkg)>0)} " +
             "keep && /layerName|totalFrames|droppedFrames|missedFrames/{print;next} " +
@@ -277,26 +327,33 @@ object FrameRateSource {
             }
         }
 
+        val (frameSpaceMs, p2p) = parseP2pHistogram(out)
         return Timestats(
             totalFrames = matchedFrames,
             missedFrames = matchedMissed,
-            frameSpaceMs = parseFrameSpace(out),
+            frameSpaceMs = frameSpaceMs,
             perLayerFrames = perLayer,
+            p2pHistogram = p2p,
             ).also {
             if (!sawAny) Log.w(TAG, "timestats 未解析到任何 totalFrames 字段")
         }
     }
 
     /**
-     * 从全局 presentToPresent 直方图算加权平均帧间隔。
+     * 解析全局 presentToPresent 直方图：返回（累计加权平均帧间隔 ms，逐桶计数）。
      *
      * 直方图行形如 `8ms=593 16ms=6 ...`（也可能跨多行），加权平均比"取众数档位"
      * 更能反映长尾卡顿 —— Kite 的 FrameSpace 也是同一个量。
+     *
+     * ⚠️ 返回的平均值是**自 -clear 起的累计口径**（桶按整毫秒取整，低估真实间隔）；
+     * 逐桶计数（[Timestats.p2pHistogram]）供上层做相邻快照差分，得到真正的「当秒」
+     * 帧间隔 —— 判别"FPS 低谷是真实掉帧还是计时伪差"只有差分口径能做。
      */
-    private fun parseFrameSpace(out: String): Double {
+    private fun parseP2pHistogram(out: String): Pair<Double, Map<Int, Long>> {
         var weighted = 0.0
         var total = 0L
         var inHistogram = false
+        val buckets = HashMap<Int, Long>()
         for (rawLine in out.lineSequence()) {
             val line = rawLine.trim()
             if (line.contains("presentToPresent", ignoreCase = true)) {
@@ -307,13 +364,15 @@ object FrameRateSource {
             }
             if (!inHistogram) continue
             for (m in HISTOGRAM_RE.findAll(line)) {
-                val ms = m.groupValues[1].toLongOrNull() ?: continue
+                val ms = m.groupValues[1].toIntOrNull() ?: continue
                 val count = m.groupValues[2].toLongOrNull() ?: continue
                 weighted += ms.toDouble() * count
                 total += count
+                buckets[ms] = (buckets[ms] ?: 0L) + count
             }
         }
-        return if (total > 0) weighted / total else 0.0
+        val avg = if (total > 0) weighted / total else 0.0
+        return avg to buckets
     }
 
     // ── CPU 快样（/proc/stat 差分 + 逐核频率，250ms 级，2026-09-25 重构）──────
@@ -387,7 +446,8 @@ object FrameRateSource {
      * ⚠️ 必须在后台线程调用（内部起进程）。
      */
     fun readCpuFastSample(): CpuFastSample? {
-        val out = exec(CPU_FAST_CMD) ?: return null
+        // awk 单进程版优先；个别 ROM 裁剪 awk 时退回逐核 shell 循环（见 CPU_FAST_CMD 注释）
+        val out = exec(CPU_FAST_CMD) ?: exec(CPU_FAST_CMD_LEGACY) ?: return null
         var totalNow: Pair<Long, Long>? = null
         val coresNow = HashMap<Int, Pair<Long, Long>>()
         val mhzNow = ArrayList<Double?>(8)
@@ -435,14 +495,28 @@ object FrameRateSource {
     private val FREQ_LINE_RE = Regex("""freq(\d+)\s+(\d+)""")
 
     /**
-     * CPU 快样命令：/proc/stat 与逐核频率**一次 exec 取回**（拆成两条的话 250ms 子拍里
-     * fork 次数翻倍）。两段输出靠行首形态区分：/proc/stat 行都有标签（cpu/cpuN/intr/ctxt…），
-     * 频率段每核先 echo 出 `freqN` 前缀再接节点值 —— 某核节点读不到时该行只有前缀没有
-     * 数字，解析按序号入位，后续核不会错位。
+     * CPU 快样命令（**单进程 awk**，2026-09-26 改）：/proc/stat 的 cpu 行与逐核频率一次
+     * exec 取回。旧写法 `cat /proc/stat` + 每核一次 `$(cat ...)` 命令替换 = 每子拍 9 次
+     * 进程创建、每秒 36 次，游戏满载时每次 fork 都被排队，一个子拍就要 200~600ms ——
+     * 250ms 子拍名存实亡、完整拍被整体拖长（真机 xlsx 实测平均 5.45s/条的主因之一）。
+     * awk 版 fork 数从 9 → 1，输出格式与旧命令逐行兼容（cpu 行原样、freq 行 `freqN <值>`）。
      *
-     * `\$i` / `\$(` 是 shell 变量与命令替换，在 Kotlin 字符串里必须转义（见旧 CPU_CMD 注释）。
+     * 输出两段靠行首形态区分：/proc/stat 行以 `cpu` 开头（`cpu` 合计行与 `cpuN` 逐核行），
+     * 频率段每核一行 `freqN`；节点读不到时该行只有前缀没有数字，解析按序号留空位，
+     * 后续核心不会错位。
      */
     private val CPU_FAST_CMD: String =
+        "awk 'BEGIN{" +
+            "while((getline l < \"/proc/stat\")>0)if(l ~ /^cpu/)print l;" +
+            "for(i=0;i<8;i++){" +
+            "f=\"/sys/devices/system/cpu/cpu\" i \"/cpufreq/scaling_cur_freq\";v=\"\";" +
+            "getline v < f;print \"freq\" i \" \" v}}'"
+
+    /**
+     * CPU 快样旧命令（awk 不可用时的兜底）：每核一次命令替换，9 fork/子拍。
+     * `\$i` / `\$(...)` 是 shell 变量与命令替换，在 Kotlin 字符串里必须转义。
+     */
+    private val CPU_FAST_CMD_LEGACY: String =
         "cat /proc/stat; " +
             "for i in 0 1 2 3 4 5 6 7; do " +
             "echo \"freq\$i \$(cat /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_cur_freq 2>/dev/null)\"; " +
@@ -559,12 +633,19 @@ object FrameRateSource {
      *   宽松匹配；一个都没匹配上退回全部温感区的最大值）——"这台机器现在多烫"的代表值；
      * - GPU = type 含 "gpu" 的温感区里最热的那个；机型没有 GPU 温感区时为 null
      *   （Temperature 卡 GPU 线整段缺失，不画成 0）；
-     * - null = 该侧读不到（命令失败 / 一个区段都没解析到），调用方沿用上一次的值。
+     * - null = 该侧读不到（命令失败 / 一个区段都没解析到），调用方沿用上一次的值；
+     *   ROM 裁剪 awk 时自动退回 legacy 逐区循环（见 [VIRTUAL_TEMP_CMD_LEGACY]）。
      *
      * ⚠️ 必须在后台线程调用（内部起进程）。
      */
     fun readCpuGpuTempsC(): Pair<Double?, Double?> {
-        val out = exec(VIRTUAL_TEMP_CMD) ?: return null to null
+        // awk 单进程版优先；个别 ROM 裁剪 awk 时退回逐区 shell 循环（兜底口径同 readCpuFastSample）
+        var out = exec(VIRTUAL_TEMP_CMD)
+        if (out == null && !virtualTempLegacyDead) {
+            out = exec(VIRTUAL_TEMP_CMD_LEGACY)
+            if (out == null && ShizukuHelper.serviceBound.value) virtualTempLegacyDead = true
+        }
+        out ?: return null to null
         val zones = out.lineSequence().mapNotNull { line ->
             val m = THERMAL_ZONE_RE.find(line.trim()) ?: return@mapNotNull null
             val milliC = m.groupValues[2].toDoubleOrNull() ?: return@mapNotNull null
@@ -581,26 +662,42 @@ object FrameRateSource {
     }
 
     /**
-     * GPU 占用率 %（FPS 卡右轴可切换的 GPU(%) 线）：高通 kgsl 的 gpu_busy_percentage，
-     * 节点内容形如 "42 %"。内容异常时返回 null（断线处理）。
+     * GPU 占用率 %（FPS 卡右轴可切换的 GPU Load(%) 线）。
      *
-     * ⚠️ 实机验证（24031PN0DC / HyperOS V816，2026-09-25）：shell 对 /sys/class/kgsl
-     * **全目录 Permission denied**（SELinux 策略，同 power_supply 节点），Shizuku 模式
-     * 在该机型恒 null——UI 侧按"整场无数据即隐藏选项"处理；root 身份可读（未验证）。
-     * 系统内也无其它可读的 GPU 利用率节点（tracing events 除外）。
-     * GPU **温度**不受影响：gpuss-0..4 温感区 shell 可读（readCpuGpuTempsC 正常出数）。
+     * ⚠️ 节点**按厂商分叉**，[GPU_LOAD_CMD] 单进程 awk 按候选序探测、读到第一个非空即回：
+     * ① `/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage` —— 高通经典节点（内容形如 "42 %"，
+     *    驱动内部 ~359ms 窗口自刷新，读不改写）；
+     * ② `/sys/kernel/gpu/gpu_busy` —— 通用 GPU sysfs（本机存在但被拦；Exynos 常见可读）；
+     * ③ `/sys/class/kgsl/kgsl-3d0/gpu_load` —— 新版 kgsl 累计口径（读后 acc 复位，
+     *    按拍读恰好就是"距上次读取的负载"）；
+     * ④ `/sys/kernel/ged/hal/gpu_utilization` —— MTK GED（首数字 = 利用率）；
+     * ⑤ `/sys/class/misc/mali0/device/utilisation` —— Mali。
+     * 解析取**首个非空行的第一个数字**（"42 %" / "42" / "24 604000" 通吃），
+     * 内容异常时返回 null（断线处理）。
+     *
+     * ⚠️⚠️ 实机验证（24031PN0DC / HyperOS V816）：**本机 Shizuku（shell 身份）恒 null** ——
+     * 2026-09-27 全量复测：`/sys/class/kgsl` 与 `/sys/kernel/gpu` 两目录 SELinux 全拦
+     * （cat / ls -Z 都 Permission denied）、`/sys/class/devfreq` 目录本身不可列、
+     * tracefs 只读但事件 enable 文件拒访问（tracing_on=0 也无法置位）、
+     * `dumpsys gpu`/game/perfservice/powerkeeper 等 9 个服务均无利用率、/proc 无 gpu 节点。
+     * ⇒ 本机 Shizuku 模式 GPU Load(%) 选项照旧自动隐藏；**root 模式可读 kgsl**、
+     * 节点可读的机型/ROM（部分 Exynos / MTK / Mali 机器 shell 可读）自动亮起。
      *
      * ⚠️ **allowBlank 必须为 true**（2026-09-25 修）：本函数**每拍**都在跑，而节点不可读时
-     * `cat` rc=0 但无输出是这台机器的**常态结论**——按失败处理会让空输出走完整个通道回退链
-     * （Shizuku → su 再试一轮）且 [exec] 每秒刷一条 warning，白白拖长每拍耗时、刷屏日志。
-     * 空输出在此处本来就是"无 GPU 占用数据"的有效结论，返回 "" → 解析为 null 即可。
+     * awk 空输出是这台机器的**常态结论**——按失败处理会让空输出走完整个通道回退链
+     * （Shizuku → su 再试一轮）且 [exec] 每秒刷一条 warning。空输出在此处本来就是
+     * "无 GPU 占用数据"的有效结论，返回 "" → 解析为 null 即可。
+     *
+     * ⚠️ 无 legacy 兜底（对比温度/CPU 快样）：awk 单进程读 5 个文件成本可忽略，真缺 awk 的
+     * ROM 连 CPU 快样都死了，GPU 这条辅助线跟着 null（UI 隐藏选项）是可接受的一致降级，
+     * 不值得为它养 5 fork/拍的 shell 循环。
      *
      * ⚠️ 必须在后台线程调用（内部起进程）。
      */
     fun readGpuLoadPct(): Double? {
         val out = exec(GPU_LOAD_CMD, allowBlank = true) ?: return null
-        val digits = out.trim().takeWhile { it.isDigit() }
-        return digits.ifEmpty { null }?.toDoubleOrNull()
+        val line = out.lineSequence().firstOrNull { it.isNotBlank() } ?: return null
+        return Regex("""\d+""").find(line)?.value?.toDoubleOrNull()
     }
 
     private val THERMAL_ZONE_RE = Regex("""^(\S+)\s+(-?\d+)$""")
@@ -608,16 +705,71 @@ object FrameRateSource {
     private val CPU_ZONE_KEYWORDS = arrayOf("cpu", "soc", "cluster", "ap")
 
     /**
-     * 温感区 type/temp 一把读。`$z` / `$(cat ...)` 都是 **shell 变量与命令替换**，
-     * 在 Kotlin 字符串里必须转义成 `\$`，否则会被当成 Kotlin 模板引用不存在的变量。
+     * 温感区 type/temp 一把读（**单进程 awk**，2026-09-26 改）。
+     * `$z` / `$(cat ...)` 都是 **shell 变量与命令替换**，在 Kotlin 字符串里必须转义成 `\$`，
+     * 否则会被当成 Kotlin 模板引用不存在的变量。
+     *
+     * ⚠️ 旧写法 `for z in thermal_zone*; do echo "$(cat type) $(cat temp)"; done` 每区 fork
+     * 两次：本机 **105 个温感区 = 210 次进程创建**，空载实测 **4.78s**（RootPowerReader.
+     * probeThermal 同款实测，awk 单进程 0.02s）——游戏满载时更慢，是录制慢速拍被拖到
+     * 9~14s、平均 5.45s/条的直接主因（2026-09-26 xlsx 实测定案），必须单进程一次读完。
+     *
+     * 实现：type 与 temp 两段 glob 按序作 awk 的文件参数（shell 展开序一致，前半 type 后半
+     * temp），`FNR==1` 按 FILENAME 结尾区分；type 按 zone 编号入表，读到 temp 段时配对输出
+     * `type temp`。type 读不到的 zone 不输出，与旧写法一致。
+     * ⚠️⚠️ `${'$'}0` 必须写成 `\$0`（2026-09-27 真机定案）：`\$` 已经是字面 `$`，再跟
+     * `{'$'}` 不是转义而是**普通文本**，字符串里会原样留下 `${'$'}0` → awk 语法错误
+     * rc=2、空输出（stderr 被 2>/dev/null 吞掉）→ 温度恒 null。该坑存活于 09-26/27
+     * 两个装机批次，详情页 CPU/GPU 温度线整场缺失即此根因。
      */
     private val VIRTUAL_TEMP_CMD: String =
-        "for z in /sys/class/thermal/thermal_zone*; do " +
+        "awk 'FNR==1{isTemp=(FILENAME ~ /\\/temp\$/)}" +
+            " !isTemp{z=FILENAME;sub(/.*thermal_zone/,\"\",z);sub(/\\/.*/,\"\",z);type[z]=\$0}" +
+            " isTemp{z=FILENAME;sub(/.*thermal_zone/,\"\",z);sub(/\\/.*/,\"\",z);" +
+            "if(z in type)print type[z] \" \" \$0}' " +
+            "$THERMAL_ZONE_DIR/thermal_zone*/type $THERMAL_ZONE_DIR/thermal_zone*/temp 2>/dev/null"
+
+    /**
+     * 温感区旧命令（ROM 裁剪 awk 时的兜底，取舍同 [CPU_FAST_CMD_LEGACY]）：每区一次 echo、
+     * 两次命令替换 = 每区 2 次 fork —— 本机 105 个温感区空载实测 4.78s，满载更慢。
+     * 输出与 awk 版逐行同构（`type temp`），共用同一段解析。
+     * `\$z` / `\$(...)` 是 shell 变量与命令替换，在 Kotlin 字符串里必须转义。
+     */
+    private val VIRTUAL_TEMP_CMD_LEGACY: String =
+        "for z in $THERMAL_ZONE_DIR/thermal_zone*; do " +
             "echo \"\$(cat \$z/type 2>/dev/null) \$(cat \$z/temp 2>/dev/null)\"; done"
 
-    /** GPU 占用率节点（高通 kgsl；内容形如 "42 %"，只有主 GPU 一份） */
+    /**
+     * legacy 温度命令的拉黑标记：跑过仍拿不到输出（典型 = 温感区被 SELinux 拦截 + 无 root，
+     * 空输出是常态结论）就置位，进程重启前不再重试 —— 否则这台机器每 5s 白跑 210 fork
+     * （4.78s/次），慢速拍被拖回 awk 版要治的 9~14s 病。⚠️ 拉黑前提是命令真跑过
+     * （Shizuku 在位）：重绑窗口期的 null 是通道问题而非命令问题，误拉黑会让 awk 缺失的
+     * 机器在 Shizuku 恢复后永远失去温度兜底。
+     */
+    @Volatile
+    private var virtualTempLegacyDead = false
+
+    /** 温感区根目录（本文件多处命令共用） */
+    private const val THERMAL_ZONE_DIR = "/sys/class/thermal"
+
+    /** GPU 占用率候选节点（[readGpuLoadPct] 的探测序，厂商分叉见该函数注释） */
+    private const val GPU_BUSY_NODES: String =
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage " +
+            "/sys/kernel/gpu/gpu_busy " +
+            "/sys/class/kgsl/kgsl-3d0/gpu_load " +
+            "/sys/kernel/ged/hal/gpu_utilization " +
+            "/sys/class/misc/mali0/device/utilisation"
+
+    /**
+     * GPU 占用率命令：**单进程 awk** 依次 getline 各候选节点，读到第一个非空即 print+exit
+     * （全部不可读 = 空输出，就是"无 GPU 数据"的常态结论）。不可读文件 getline 返回 -1、
+     * 可读空文件返回 0，两种都落 v="" 继续下一个，不会误回空串。
+     * ⚠️ 命令里全是字面路径，无 shell 变量/命令替换，不踩 `\$` 双重转义的坑（批次十七教训）。
+     */
     private val GPU_LOAD_CMD: String =
-        "cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null"
+        "awk 'BEGIN{n=split(\"$GPU_BUSY_NODES\",a,\" \");" +
+            "for(i=1;i<=n;i++){v=\"\";getline v < a[i];" +
+            "if(v!=\"\"){print v;exit}}}' 2>/dev/null"
 
     /** 整数帧率格式化（Locale.US：小数点是点，不受系统语言影响） */
     internal fun formatFps(fps: Double): String = String.format(Locale.US, "%.0f", fps)

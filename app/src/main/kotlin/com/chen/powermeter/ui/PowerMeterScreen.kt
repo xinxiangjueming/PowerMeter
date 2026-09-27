@@ -74,10 +74,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.LayoutCoordinates
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -95,6 +91,7 @@ import com.chen.powermeter.data.PowerSample
 import com.chen.powermeter.data.RootPowerReader
 import com.chen.powermeter.data.SampleStore
 import com.chen.powermeter.data.SessionStats
+import com.chen.powermeter.ui.common.AppCard
 import com.chen.powermeter.ui.common.BlurTopBar
 import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.kyant.backdrop.backdrops.layerBackdrop
@@ -176,8 +173,8 @@ fun PowerMeterScreen(
     onExport: () -> Unit,
     onClear: () -> Unit,
     onExitImport: () -> Unit,
-    /** 双击顶栏标题：切换到另一个监测模式。入参 = 标题栏的窗口矩形（ClipReveal 锚点展开的起点） */
-    onToggleMode: (Rect) -> Unit,
+    /** 双击顶栏标题：切换到另一个监测模式（圆形揭露切换，圆孔从右下角展开，见 [ModeTransition]） */
+    onToggleMode: () -> Unit,
 ) {
     val corner = LocalCornerRadius.current
     val cardShape = remember(corner) { RoundedCornerShape(corner) }
@@ -351,29 +348,14 @@ fun PowerMeterScreen(
         ) {
             TopAppBar(
                 title = {
-                    // 标题的窗口矩形：双击时把标题本体换成窗口坐标，作为模式切换
-                    // ClipReveal 锚点展开的起点（展开从标题矩形长大，见 ModeRevealOverlay）
-                    var titleCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
                     Column(
                         // 双击标题 = 切换监测模式（功率监测 ↔ 帧率监测）。
                         // 手势只挂在标题这一列上：顶栏其余区域（尤其右侧「设置」按钮）
                         // 不该被双击误触，也不必为整条顶栏多加一层手势节点。
-                        Modifier
-                            .onGloballyPositioned { titleCoords = it }
-                            .pointerInput(Unit) {
-                                detectTapGestures(onDoubleTap = {
-                                    // boundsInWindow() 在本 Compose 版本不可用 → positionInWindow + size 手动拼
-                                    val c = titleCoords?.takeIf { it.isAttached }
-                                    val pos = c?.localToWindow(Offset.Zero) ?: Offset.Zero
-                                    onToggleMode(
-                                        Rect(
-                                            pos.x, pos.y,
-                                            pos.x + (c?.size?.width ?: 0),
-                                            pos.y + (c?.size?.height ?: 0),
-                                        ),
-                                    )
-                                })
-                            },
+                        // 圆形揭露转场固定从屏幕右下角展开，无需采集标题矩形（见 ModeTransition）
+                        Modifier.pointerInput(Unit) {
+                            detectTapGestures(onDoubleTap = { onToggleMode() })
+                        },
                     ) {
                         Text(
                             stringResource(R.string.mode_power),
@@ -548,11 +530,8 @@ private fun HeroPowerCard(
     } else {
         MaterialTheme.colorScheme.tertiary
     }
-    Surface(
+    AppCard(
         shape = shape,
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        tonalElevation = 3.dp,
-        shadowElevation = 1.dp,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(20.dp)) {
@@ -693,11 +672,8 @@ private fun MetricCard(
     shape: RoundedCornerShape,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
+    AppCard(
         shape = shape,
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        tonalElevation = 2.dp,
-        shadowElevation = 1.dp,
         modifier = modifier,
     ) {
         Column(Modifier.padding(16.dp)) {
@@ -857,11 +833,8 @@ internal fun TrendCard(
     onFullscreenClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
+    AppCard(
         shape = shape,
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        tonalElevation = 2.dp,
-        shadowElevation = 1.dp,
         modifier = modifier.fillMaxWidth(),
     ) {
         // ⚠️ 外层**只留垂直 padding**，水平内边距下放到各子节点 —— 目的是让指标 tab 行的
@@ -1078,11 +1051,8 @@ private fun computeStats(samples: List<PowerSample>): SessionStats {
 
 @Composable
 private fun StatsCard(stats: SessionStats, shape: RoundedCornerShape) {
-    Surface(
+    AppCard(
         shape = shape,
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        tonalElevation = 2.dp,
-        shadowElevation = 1.dp,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(16.dp)) {
@@ -1147,11 +1117,8 @@ private fun formatDuration(ms: Long): String {
 
 @Composable
 private fun BatteryInfoCard(info: BatteryInfo, shape: RoundedCornerShape) {
-    Surface(
+    AppCard(
         shape = shape,
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        tonalElevation = 2.dp,
-        shadowElevation = 1.dp,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(16.dp)) {

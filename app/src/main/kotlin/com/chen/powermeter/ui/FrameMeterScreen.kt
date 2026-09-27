@@ -1,6 +1,8 @@
 package com.chen.powermeter.ui
 
+import android.app.Activity
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -16,9 +18,11 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -38,12 +42,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -51,6 +55,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,11 +66,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.LayoutCoordinates
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.state.ToggleableState
@@ -75,12 +81,18 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import com.chen.powermeter.R
 import com.chen.powermeter.data.db.FrameSession
 import com.chen.powermeter.service.FrameOverlayService
 import com.chen.powermeter.service.FrameRecordController
+import com.chen.powermeter.ui.common.AppCard
 import com.chen.powermeter.ui.common.BlurTopBar
 import com.chen.powermeter.ui.theme.LocalCornerRadius
+import com.chen.powermeter.util.AppTransitions
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import dev.chrisbanes.haze.HazeState
@@ -98,6 +110,8 @@ import top.yukonga.miuix.kmp.basic.Button as MiuixButton
 import top.yukonga.miuix.kmp.basic.ButtonDefaults as MiuixButtonDefaults
 import top.yukonga.miuix.kmp.basic.Text as MiuixText
 import top.yukonga.miuix.kmp.basic.TextButton as MiuixTextButton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 /** 数字 / 单位统一等宽字体（口径同 PowerMeterScreen.NumericFontFamily） */
@@ -105,11 +119,10 @@ private val FrameNumericFont = FontFamily.Monospace
 
 private fun Double.f1(): String = String.format(Locale.US, "%.1f", this)
 
-/** 可空帧率的一位小数；null = 旧会话未计算 1% / 5% Low（破折号，不谎报 0） */
-private fun Double?.f1OrDash(): String = this?.f1() ?: "—"
-
 /**
- * 帧率监测页 —— 顶栏标题「帧率监测」，下方是历史记录列表；右下角 + 按钮开关**系统悬浮窗**。
+ * 帧率监测页 —— 顶栏标题「帧率监测」+ 副标题「历史记录 共x条」（同功率页「已停止」的
+ * 副标题位），顶栏右侧 Delete 图标 = 管理模式开关（对应功率页的「设置」按钮位）；
+ * 下方是历史记录列表；右下角 + 按钮开关**系统悬浮窗**。
  *
  * ⚠️ 帧率 tab 本体已从应用内 Compose 悬浮层迁到 [FrameOverlayService]（TYPE_APPLICATION_OVERLAY）：
  * tab 要盖在**其它应用**上方、切走应用也常显实时帧率 —— Compose 的悬浮层做不到（只活在自家窗口里）。
@@ -126,15 +139,35 @@ private fun Double?.f1OrDash(): String = this?.f1() ?: "—"
 @Composable
 fun FrameMeterScreen(
     sessions: List<FrameSession>,
-    /** 点击某条记录：进入该条记录的详情页 */
-    onOpenSession: (Long) -> Unit,
     /** 确认删除某条记录：落库删除后列表自动收窄（样本随外键级联清理，见 [FrameHistoryStore.delete]） */
     onDeleteSession: (Long) -> Unit,
-    /** 双击顶栏标题：切回功率监测。入参 = 标题栏的窗口矩形（ClipReveal 锚点展开的起点） */
-    onToggleMode: (Rect) -> Unit,
+    /** 双击顶栏标题：切回功率监测（圆形揭露切换，圆孔从右下角展开，见 [ModeTransition]） */
+    onToggleMode: () -> Unit,
 ) {
     val corner = LocalCornerRadius.current
     val cardShape = remember(corner) { RoundedCornerShape(corner) }
+    val context = LocalContext.current
+    // 横屏两列（口径同 PowerMeterScreen 的横屏分支）：历史卡是窄信息卡，半宽可读
+    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    // 页面底色（Compose 主题）：转场 Handoff 里带给详情页当裁剪容器底色 —— 保证展开/
+    // 收拢窗口内的底色与主页连续（同 PowerMeterScreen.pageBackgroundArgb）
+    val pageBackgroundArgb = MaterialTheme.colorScheme.background.toArgb()
+
+    // 列表卡片 → 详情页：卡片本体已在 FrameSessionCard 内 register 转场锚点，这里消费
+    // 锚点截图 + 登记 Handoff。与趋势全屏页（launchWithTransform）不同口径：详情页进场
+    // 走主题侧边滑入，截图只供**退场**收拢一镜到底（2026-09-27 用户定稿：大场次整页
+    // 图表卡首帧组合重，进场展开会卡）；截图失败 / 非 Activity 容器 → capture = null 普通启动
+    val openSession: (Long) -> Unit = { sessionId ->
+        val act = context as? Activity
+        // keepPageSnapshot=false（2026-09-28 二改）：详情页已改**半透明窗口主题** →
+        // 收拢期间裁剪窗口外直接露出**真实列表**（实时、已跟主题重绘），不再需要整窗
+        // 冻结截图；留着它反而有害——不透明整窗图会把底下的真实列表盖住，且进场侧滑时
+        // 整窗带着"列表像素"滑入（观感错）。整窗图不截也省下 ~18MB 峰值内存。
+        val capture = act?.let {
+            AppTransitions.capture(it.window.decorView, pageBackgroundArgb)
+        }
+        FrameDetailActivity.launch(act ?: context, sessionId, capture)
+    }
 
     // 内容区水平 insets：只避挖孔，不避导航栏（口径同 PowerMeterScreen）
     val sideInsets = WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)
@@ -173,7 +206,12 @@ fun FrameMeterScreen(
             if (sessions.isEmpty()) {
                 FrameHistoryEmpty(topBarHeight = topBarHeight)
             } else {
-                LazyColumn(
+                // 横屏两列 / 竖屏单列共用同一套 LazyVerticalGrid：列数按方向切换，
+                // item key 保持条目身份，旋转不打断滚动位置。
+                // （「历史记录 共x条」表头 + 删除开关原是这里的跨整行表头 item，2026-09-27
+                // 按用户反馈搬进顶栏 —— 副标题位 + 右侧 Delete 按钮，不再随列表滚动）
+                LazyVerticalGrid(
+                    columns = if (landscape) GridCells.Fixed(2) else GridCells.Fixed(1),
                     modifier = Modifier
                         .fillMaxSize()
                         .windowInsetsPadding(sideInsets),
@@ -185,52 +223,14 @@ fun FrameMeterScreen(
                             .calculateBottomPadding(),
                     ),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    item {
-                        Row(
-                            Modifier.fillMaxWidth().padding(start = 4.dp, bottom = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                stringResource(R.string.frame_history_title),
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                // ⚠️ 必须显式给色：不传 color 会落到 LocalContentColor 的默认值黑色
-                                // （同 FrameHistoryEmpty 的教训），深色模式下"黑底黑字"；
-                                // onSurface 随深浅主题自动切换
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-                            Spacer(Modifier.size(8.dp))
-                            Text(
-                                stringResource(R.string.frame_history_count, sessions.size),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontFamily = FrameNumericFont,
-                            )
-                            Spacer(Modifier.weight(1f))
-                            // 管理模式开关：激活态点亮成红色。⚠️ 必须用固定的 DeleteRed 而非
-                            // colorScheme.error —— 本项目走 Material You 动态取色，本机壁纸
-                            // 派生的 error 是粉色档，和 SportLink（主题覆盖 error = 正红、
-                            // 无动态取色）的观感差一截；DeleteRed 与红框 / 确认键同色三处统一
-                            IconButton(onClick = { deleteMode = !deleteMode }) {
-                                Icon(
-                                    imageVector = MiuixIcons.Delete,
-                                    contentDescription = stringResource(R.string.frame_delete),
-                                    tint = if (deleteMode) {
-                                        DeleteRed
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    },
-                                )
-                            }
-                        }
-                    }
                     items(items = sessions, key = { it.id }) { session ->
                         FrameSessionEntry(
                             session = session,
                             deleteMode = deleteMode,
                             shape = cardShape,
-                            onClick = { onOpenSession(session.id) },
+                            onClick = { openSession(session.id) },
                             onDeleteClick = { deleteTarget = session },
                         )
                     }
@@ -245,32 +245,52 @@ fun FrameMeterScreen(
         ) {
             TopAppBar(
                 title = {
-                    // 标题的窗口矩形：双击时把标题本体换成窗口坐标，作为模式切换
-                    // ClipReveal 锚点展开的起点（展开从标题矩形长大，见 ModeRevealOverlay）
-                    var titleCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
                     Column(
-                        // 双击标题 = 切回功率监测（与功率监测页同一手势、同一位置的对称入口）
-                        Modifier
-                            .onGloballyPositioned { titleCoords = it }
-                            .pointerInput(Unit) {
-                                detectTapGestures(onDoubleTap = {
-                                    // boundsInWindow() 在本 Compose 版本不可用 → positionInWindow + size 手动拼
-                                    val c = titleCoords?.takeIf { it.isAttached }
-                                    val pos = c?.localToWindow(Offset.Zero) ?: Offset.Zero
-                                    onToggleMode(
-                                        Rect(
-                                            pos.x, pos.y,
-                                            pos.x + (c?.size?.width ?: 0),
-                                            pos.y + (c?.size?.height ?: 0),
-                                        ),
-                                    )
-                                })
-                            },
+                        // 双击标题 = 切回功率监测（与功率监测页同一手势、同一位置的对称入口）。
+                        // 圆形揭露转场固定从屏幕右下角展开，无需采集标题矩形（见 ModeTransition）
+                        Modifier.pointerInput(Unit) {
+                            detectTapGestures(onDoubleTap = { onToggleMode() })
+                        },
                     ) {
                         Text(
                             stringResource(R.string.mode_frame),
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
+                        )
+                        // 副标题 = 历史记录概要（口径同功率页「已停止/采样中」的副标题位：
+                        // labelMedium + 弱化色，跟随条目数实时变化）
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                stringResource(R.string.frame_history_title),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                stringResource(R.string.frame_history_count, sessions.size),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontFamily = FrameNumericFont,
+                            )
+                        }
+                    }
+                },
+                // 管理模式开关（2026-09-27 从滚播列表表头搬进顶栏：表头会随列表滚走，
+                // 盖在毛玻璃顶栏下穿帮；交互口径本就应对齐 SportLink 设备管理页的
+                // 「顶栏 Delete 开关」，对应功率页顶栏右侧的「设置」按钮位）。
+                // ⚠️ 激活态必须用固定的 DeleteRed 而非 colorScheme.error —— 本项目走
+                // Material You 动态取色，本机壁纸派生的 error 是粉色档，和 SportLink
+                // （主题覆盖 error = 正红）的观感差一截；DeleteRed 与红框/确认键三处统一
+                actions = {
+                    IconButton(onClick = { deleteMode = !deleteMode }) {
+                        Icon(
+                            imageVector = MiuixIcons.Delete,
+                            contentDescription = stringResource(R.string.frame_delete),
+                            tint = if (deleteMode) {
+                                DeleteRed
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
                         )
                     }
                 },
@@ -283,7 +303,6 @@ fun FrameMeterScreen(
         }
 
         // ── 右下角 FAB：帧率悬浮窗的开关（+ 开 / × 关）──
-        val context = LocalContext.current
         val overlayRunning by FrameOverlayService.running.collectAsState()
         val overlayPermissionLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.StartActivityForResult(),
@@ -520,12 +539,79 @@ private fun FrameSessionEntry(
     }
 }
 
+/** 被测应用的身份（显示名 + 图标）：PackageManager 现场解析，两项都可能为 null（未解析到） */
+private data class AppIdentity(
+    val label: String?,
+    val icon: ImageBitmap?,
+)
+
+/**
+ * 现场解析被测应用身份（IO 线程，按包名缓存到组合）。
+ *
+ * 需要 Manifest 声明 `QUERY_ALL_PACKAGES`：Android 11+ 的包可见性过滤下，未声明的包
+ * `getApplicationInfo` 直接 NameNotFoundException（旧会话 appLabel 回落成包名的根因）。
+ */
+@Composable
+private fun rememberAppIdentity(packageName: String): AppIdentity {
+    val context = LocalContext.current
+    var identity by remember(packageName) { mutableStateOf(AppIdentity(null, null)) }
+    LaunchedEffect(packageName) {
+        identity = withContext(Dispatchers.IO) {
+            runCatching {
+                val pm = context.packageManager
+                val info = pm.getApplicationInfo(packageName, 0)
+                AppIdentity(
+                    label = pm.getApplicationLabel(info).toString(),
+                    icon = pm.getApplicationIcon(info).toIconBitmap(),
+                )
+            }.getOrDefault(AppIdentity(null, null))
+        }
+    }
+    return identity
+}
+
+/**
+ * Drawable → 方形位图。自适应图标（AdaptiveIconDrawable 等）画到画布上；
+ * BitmapDrawable 直接复用原位图（Image 侧按 ContentScale 缩放）。失败返回 null。
+ */
+private fun Drawable.toIconBitmap(sizePx: Int = 128): ImageBitmap? = runCatching {
+    (this as? BitmapDrawable)?.bitmap?.asImageBitmap()
+        ?: Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888).also { bmp ->
+            val canvas = Canvas(bmp)
+            setBounds(0, 0, canvas.width, canvas.height)
+            draw(canvas)
+        }.asImageBitmap()
+}.getOrNull()
+
+/** 历史卡片的应用图标：40dp 圆角块；解析失败 / 未就绪时灰底占位（不闪空、不崩） */
+@Composable
+private fun AppIconBadge(icon: ImageBitmap?, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(8.dp)
+    if (icon != null) {
+        Image(
+            bitmap = icon,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = modifier
+                .size(40.dp)
+                .clip(shape),
+        )
+    } else {
+        Box(
+            modifier
+                .size(40.dp)
+                .clip(shape)
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        )
+    }
+}
+
 /**
  * 单条帧率记录卡。
  *
- * 右端主值是**平均帧率**（这条记录最想回答的问题就是"跑得动吗"），
- * 副信息给时长 / 最低帧率 / 最高帧率 / 丢帧 / 刷新率 —— 读一条记录要能在不点进去的情况下判断
- * 值不值得细看。
+ * 右端主值是**平均帧率**（这条记录最想回答的问题就是"跑得动吗"）。时长 / 最低 / 最高 /
+ * 丢帧 / 刷新率 / 1% / 5% Low 统计格已按用户要求（2026-09-27）从卡片移除，
+ * 全量指标点进详情页看。
  */
 @Composable
 private fun FrameSessionCard(
@@ -534,23 +620,59 @@ private fun FrameSessionCard(
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
-    ElevatedCard(
+    // 容器变换源条目（同 PowerMeterScreen.FullscreenPillButton 口径）：登记自身窗口矩形，
+    // 点击先 register 锚点再回调 —— 详情页一镜到底的展开起点/收拢终点（AppTransitions 链路）。
+    // containerSource 挂卡片本体（含四角圆角的完整矩形，SportLink DeviceItemCard 同位）；
+    // textSource 挂 padding 内全部内容 —— 分层动画"卡片底面钉在原位、全部内容（图标+
+    // 文字+统计）随窗口边滑移渐隐"（2026-09-27 用户定稿：不只左侧文本列，卡片内所有
+    // 东西一起上滑/落回；SportLink 原版挂左侧文本列，本项目扩成全内容）
+    val source = rememberContainerSource()
+    val textSource = rememberContainerTextSource(source)
+    // 容器统一走 AppCard（全 App 唯一卡片实现）：此前这里用 ElevatedCard，其内部 Surface
+    // 不传 tonalElevation（=0）→ 不吃 surfaceTint，与功率页 2dp 的卡片同色号却不同观感
+    AppCard(
         shape = shape,
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-        ),
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .containerSource(source),
     ) {
         Column(
             Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onClick)
+                // ⚠️ indication = null（全 app 去水波纹口径，2026-09-25 起）：默认 Material 波纹
+                // 在按下瞬间就开始扩散，而 AppTransitions.capture 恰在此刻截取整窗 —— 波纹的
+                // 灰色圆形斑块（被卡片圆角裁剪）会被烤进锚点截图、跟着一镜到底全程走
+                // （2026-09-27 用户截图实锤：卡片右端出现波纹形状的灰斑）。点击反馈由转场承担
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) {
+                    AppTransitions.register(source)
+                    onClick()
+                }
                 .padding(16.dp)
         ) {
+            // 滑移层 = 16dp padding **内**的全部内容（图标 + 应用名/包名/时间 + 右侧帧率 +
+            // 统计格，2026-09-27 用户定稿：卡片内所有东西一起随窗口边上滑/落回，不只左侧
+            // 文本列——SportLink 是挂左侧文本列，本项目按用户要求扩成全内容）。
+            // ⚠️ 必须套在 padding 之内：textBounds 若取到含 padding 的整卡矩形，抹字留白带
+            // <8px 会拒绝抹除 → 钉住的本体带着全部文字 → 滑移层与本体双重出现
+            Column(Modifier.then(textSource)) {
+            // 顶行 = 应用图标 + 应用显示名（2026-09-27 用户指定）。
+            // 显示名优先用落库的 appLabel（记录时刻的事实，应用改名/卸载后不变）；
+            // ⚠️ 旧会话落库时 Manifest 还没声明 QUERY_ALL_PACKAGES，Android 11+ 包可见性让
+            // getApplicationInfo 抛 NameNotFoundException、resolveAppLabel 回落成了包名 ——
+            // appLabel == packageName 的这批记录现场补解析（现在可见了）；新会话落库已正确。
+            val identity = rememberAppIdentity(session.packageName)
+            val displayName =
+                if (session.appLabel != session.packageName) session.appLabel
+                else identity.label ?: session.appLabel
             Row(verticalAlignment = Alignment.CenterVertically) {
+                AppIconBadge(identity.icon)
+                Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
                     Text(
-                        session.appLabel,
+                        displayName,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
@@ -588,54 +710,7 @@ private fun FrameSessionCard(
                     )
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                FrameStatCell(
-                    stringResource(R.string.stat_duration),
-                    formatFrameDuration(session.durationMs),
-                )
-                FrameStatCell(stringResource(R.string.frame_fps_min), session.minFps.f1())
-                FrameStatCell(stringResource(R.string.frame_fps_max), session.maxFps.f1())
-                FrameStatCell(stringResource(R.string.frame_jank), session.jankCount.toString())
-                FrameStatCell(
-                    stringResource(R.string.frame_refresh_rate),
-                    "${session.refreshRateHz} Hz",
-                )
-            }
-            // 1% / 5% Low（帧加权，CapFrameX 口径）：比 min/max 更能代表"卡不卡"。
-            // 旧会话（v5 前落库）未计算 → 破折号
-            Spacer(Modifier.height(8.dp))
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(48.dp, Alignment.CenterHorizontally),
-            ) {
-                FrameStatCell(stringResource(R.string.frame_fps_low_1), session.lowFps1.f1OrDash())
-                FrameStatCell(stringResource(R.string.frame_fps_low_5), session.lowFps5.f1OrDash())
-            }
+            } // textSource 内层：滑移层到此为止（卡片 16dp padding 环留在钉住的本体上）
         }
     }
 }
-
-@Composable
-private fun FrameStatCell(label: String, value: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(
-            value,
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.Medium,
-            fontFamily = FrameNumericFont,
-        )
-        Text(
-            label,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
-/** 会话时长（末样本时间 - 首样本时间）；异常值兜底为 0，避免出现负时长 */
-private val FrameSession.durationMs: Long
-    get() = (endTime - startTime).coerceAtLeast(0L)

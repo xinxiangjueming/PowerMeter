@@ -19,15 +19,6 @@ private val STAMP_FORMAT = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
  */
 internal fun formatFrameStamp(millis: Long): String = STAMP_FORMAT.format(Date(millis))
 
-/** 时长：>1h 走 h/m/s，>1min 走 m/s，否则只给秒 */
-internal fun formatFrameDuration(ms: Long): String {
-    val totalSec = ms / 1000
-    val h = totalSec / 3600
-    val m = (totalSec % 3600) / 60
-    val s = totalSec % 60
-    return if (h > 0) "${h}h ${m}m ${s}s" else if (m > 0) "${m}m ${s}s" else "${s}s"
-}
-
 /**
  * 实时帧率读数（悬浮 tab / 通知共用）。
  *

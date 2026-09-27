@@ -90,15 +90,7 @@
 
     <string name="frame_fps">帧率</string>
     <string name="frame_fps_avg">平均帧率</string>
-    <string name="frame_fps_min">最低帧率</string>
-    <string name="frame_fps_max">最高帧率</string>
-    <!-- 1% / 5% Low：最差 1%/5% 帧的平均帧率（CapFrameX 口径，帧加权）。业界通名，各语言同形；
-         裸 % 不是格式化占位，必须 formatted="false" 否则 aapt2 拒编译 -->
-    <string name="frame_fps_low_1" formatted="false">1% Low</string>
-    <string name="frame_fps_low_5" formatted="false">5% Low</string>
     <string name="frame_space">帧间隔</string>
-    <string name="frame_jank">丢帧</string>
-    <string name="frame_refresh_rate">刷新率</string>
     <string name="frame_cpu_clock">CPU 频率</string>
     <string name="frame_cpu_usage">CPU 使用率</string>
     <string name="frame_temp_virtual">虚拟温度</string>
@@ -120,6 +112,21 @@
     <string name="frame_steady_index_info">稳帧指数 = 帧时间标准差（ms），是 PerfDog 稳帧指数（Smooth，综合帧时间波动评估平稳度）的简化口径：数值越小，帧间隔越均匀，画面越稳。</string>
     <string name="frame_jank_info">卡顿判定（PerfDog 式口径，按 1 秒粒度）：帧时间大于前 3 秒均值 2× 记小卡顿；再超过 83ms（两倍电影帧耗时）记卡顿；大于均值 3× 且超过 125ms 记严重卡顿。顶部卡顿率 = 卡顿总时长 ÷ 总时长。</string>
     <string name="frame_variance">方差</string>
+    <!-- 详情页卡片标题 / 图例 / 右轴选项（2026-09-27 多语言化，原先硬编码英文） -->
+    <string name="frame_card_power">功率(W)</string>
+    <string name="frame_card_power_name">功率</string>
+    <string name="frame_card_capacity">电量</string>
+    <string name="frame_card_capacity_pct">电量 %</string>
+    <string name="frame_card_temperature">温度(°C)</string>
+    <string name="frame_card_temperature_name">温度</string>
+    <string name="frame_card_temp" formatted="false">温度(°C)</string>
+    <string name="frame_card_battery" formatted="false">电量(%)</string>
+    <string name="frame_card_cpu_usage" formatted="false">CPU 使用率(%)</string>
+    <string name="frame_card_cpu_frequency" formatted="false">CPU 频率(MHz)</string>
+    <string name="frame_card_frame_time" formatted="false">帧时间(ms)</string>
+    <!-- FPS 卡右轴指标选项（Scene 同款命名：CPU/GPU Load，2026-09-27 加 GPU load 切换） -->
+    <string name="frame_right_cpu_load" formatted="false">CPU 负载(%)</string>
+    <string name="frame_right_gpu_load" formatted="false">GPU 负载(%)</string>
     <!-- FPS 卡右上角：切换右轴指标（电量/温度/CPU/GPU load） -->
     <string name="frame_right_axis_switch">切换右轴指标</string>
 

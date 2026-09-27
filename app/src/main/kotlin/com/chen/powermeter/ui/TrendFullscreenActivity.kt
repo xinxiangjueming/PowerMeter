@@ -60,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import com.chen.powermeter.R
 import com.chen.powermeter.data.ImportedSeries
 import com.chen.powermeter.service.SamplingService
+import com.chen.powermeter.ui.common.AppCard
 import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.chen.powermeter.ui.theme.PowerMeterTheme
 import com.chen.powermeter.util.AppTransitions
@@ -113,6 +114,13 @@ private const val ORIENTATION_SETTLE_TIMEOUT_MS = 250L
  * 窗口（StartingWindow）底下就生效了，首帧即横屏。
  */
 class TrendFullscreenActivity : ComponentActivity() {
+
+    /**
+     * 应用当前深浅（2026-09-28 系统深浅色切换动画铺开）：configChanges 含 uiMode 后系统
+     * 切换不再重建，深浅由 onCreate 初值 / onConfigurationChanged / onResume 兜底驱动；
+     * 变化经 PowerMeterTheme 闸门播圆孔揭露动画（ThemeTransition）。
+     */
+    private val darkThemeState by lazy { mutableStateOf(isNightMode()) }
 
     companion object {
         /** 进入时的指标选择（Metric.name）；缺省回退 POWER */
@@ -183,7 +191,7 @@ class TrendFullscreenActivity : ComponentActivity() {
             ?: Metric.POWER
 
         setContent {
-            PowerMeterTheme {
+            PowerMeterTheme(darkTheme = darkThemeState.value) {
                 // 正常渲染全屏页 —— 转场不是覆盖层插入，而是 AppTransitions.installWindowTransform
                 // （onPostCreate）把**这棵页面根**包进 ClipRevealLayout、首帧从按钮矩形撑开
                 // （SportLink TrackActivity 同款结构：包根而非覆盖层，页面即本体）
@@ -302,6 +310,9 @@ class TrendFullscreenActivity : ComponentActivity() {
      * - 其余：方向已落地 → 真正结束（super.finish()，窗口过渡已压 0）。
      */
     override fun finish() {
+        // 退场交棒（2026-09-28 二轮）：把当前深浅留给即将显示的源页（主页），让它在首帧
+        // 绘制之前就切成目标主题（口径同 FrameDetailActivity，消费方 MainActivity.onStart）
+        ThemeTransition.noteExitTheme(isNightMode())
         if (AppTransitions.collapseAndFinish(this)) return
         if (!closeSequenceStarted) {
             finishClosingSequence()
@@ -325,6 +336,16 @@ class TrendFullscreenActivity : ComponentActivity() {
      */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        // 深浅色切换（configChanges 含 uiMode → 不重建）在这里驱动 darkThemeState，
+        // 经 PowerMeterTheme 闸门播圆孔揭露动画（2026-09-28）
+        val dark = (newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        if (darkThemeState.value != dark) {
+            // 送达时本页还没 onStart（后台错过的变化）→ 静默落地（同 MainActivity，
+            // 判据见 ThemeTransition.isHostForeground）
+            if (!ThemeTransition.isHostForeground(this)) ThemeTransition.requestSilent()
+            darkThemeState.value = dark
+        }
         if (closing) {
             NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
             window.decorView.post { finishIfClosing() }
@@ -334,6 +355,17 @@ class TrendFullscreenActivity : ComponentActivity() {
         // 延迟一帧兜底：确保系统重放之后再压一次
         window.decorView.post {
             if (!isFinishing && !isDestroyed) replayImmersive()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 后台切换深浅兜底（configChanges 含 uiMode 的已知坑：后台时 ViewRootImpl 不分发
+        // 配置）——回前台读 Resources 最新值，走**静默通道**：错过的变化立即呈现目标主题、
+        // 不补播圆孔动画（2026-09-28）
+        if (darkThemeState.value != isNightMode()) {
+            ThemeTransition.requestSilent()
+            darkThemeState.value = isNightMode()
         }
     }
 
@@ -437,11 +469,8 @@ private fun TrendFullscreenScreen(
                 .padding(horizontal = 12.dp)
                 .padding(vertical = 12.dp),
         ) {
-            Surface(
+            AppCard(
                 shape = cardShape,
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                tonalElevation = 2.dp,
-                shadowElevation = 1.dp,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),

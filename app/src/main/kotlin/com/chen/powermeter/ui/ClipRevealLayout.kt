@@ -2,14 +2,18 @@ package com.chen.powermeter.ui
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Canvas
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Shader
 import android.util.AttributeSet
 import android.view.View
 import android.view.ViewOutlineProvider
 import android.widget.FrameLayout
+import com.chen.powermeter.util.remapBitmapTone
 import kotlin.math.roundToInt
 
 /**
@@ -57,16 +61,61 @@ class ClipRevealLayout @JvmOverloads constructor(
     private var cornerRadius = 0f
 
     /**
-     * 锚点卡片截图：**整行跟随窗口上边移动**（层级 = 底色之上、子内容之下）——宽高
-     * 恒为原始像素（不拉伸不缩放），顶边钉在窗口上边：展开时随上边上行并渐隐
-     * （"向上移动消失"），收拢时随上边下行归位浮现（"向下移动出现"）。
-     * 是否可见由裁剪窗口与 [setAnchorAlpha] 共同决定。
+     * 内容遮罩（收拢专用，2026-09-28）：详情页整页底色画在 page（ComposeView）**内部**、
+     * 随 page.alpha 一起淡出，交叉期与同时浮起的卡片白底形成"灰 vs 白"的对比 —— 用户
+     * 看到的就是"卡片左右两侧的阴影"（横屏两列窄卡时占比更大，故"横屏更明显"）。
+     * 由 [setContentVeil] 按 (1 - pageAlpha) 驱动，在页面内容之上、锚点卡片之下铺一层
+     * [veilColor]（容器底色 = 卡片表面色）：内容改为"被卡片色收拢"，不再露出页面灰。
+     * 绘制天然落在 [draw] 的 clipRect 之内，窗口外不受影响。
+     */
+    private var veilColor = 0
+    private var veilAlpha = 0f
+    private val veilPaint = Paint()
+
+    /**
+     * 本体纯色模式（2026-09-28）：非 0 时，锚点本体**不再采样位图**，直接用该色填充
+     * 圆角矩形。位图里任何"非表面色"残留（容器色元素、抗锯齿边、阴影过渡带、被
+     * 误烤进去的浅色填充）都会随整段转场全程可见 —— 用户连续多轮反馈的"卡片右侧
+     * 灰块"反复复现即属此类。纯色填充从根上杜绝，内容一律由文字层承载。
+     * 取值 = 容器底色（installWindowTransform 里与 setBackgroundColor/setVeilColor 同源）。
+     */
+    private var anchorSolidColor = 0
+
+    /**
+     * 锚点卡片截图。有 [anchorTextBitmap]（列表行类锚点）时**钉在原始矩形**不动——
+     * "卡片本体留在原地，只有内部文字滑移"（2026-09-27 用户定稿，SportLink 8452508）；
+     * 无文字截图时**整行跟随窗口上边移动**（紧凑按钮类锚点的既有行为）——宽高恒为
+     * 原始像素（不拉伸不缩放）。是否可见由裁剪窗口与 [setAnchorAlpha] 共同决定。
      */
     private var anchorBitmap: Bitmap? = null
     private val anchorRect = RectF()
     private val anchorDst = RectF()
     private var anchorAlpha = 0f
     private val anchorPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
+    /** 本体截图的圆角半径 px（[setAnchorCornerRadiusPx]）：[drawAnchorBody] 据此走圆角绘制 */
+    private var anchorCornerRadiusPx = 0f
+
+    /** 本体截图的 shader（[setAnchorBitmap] 时创建）：圆角绘制的像素源 */
+    private var anchorShader: BitmapShader? = null
+
+    /** shader 采样原点配平矩阵（[drawAnchorBody] 每帧按 dst 左上角平移，复用免分配） */
+    private val anchorShaderMatrix = Matrix()
+
+    /** 圆角绘制专用画笔（与 [anchorPaint] 分开：后者还要画文字层，不挂 shader） */
+    private val anchorBodyPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
+    /**
+     * 锚点内部文字截图（可选）：跟随窗口上边滑移渐隐（滑移时保持它在卡片内的
+     * 横向/纵向偏移，等于"文字从卡片上浮起"）。null = 无分层，整卡一起滑移。
+     */
+    private var anchorTextBitmap: Bitmap? = null
+    private val anchorTextRect = RectF()
+    private val anchorTextDst = RectF()
+
+    /** 主题重映射的原始副本（仅深浅切换后退场使用；二次切换从原始重算，不叠加映射失真） */
+    private var anchorOriginalBitmap: Bitmap? = null
+    private var anchorTextOriginalBitmap: Bitmap? = null
 
     /** 是否带有锚点截图（调用方据此决定是否做内容 ↔ 截图交叉淡变） */
     val hasAnchorBitmap: Boolean
@@ -76,6 +125,42 @@ class ClipRevealLayout @JvmOverloads constructor(
     fun setAnchorBitmap(bitmap: Bitmap?, left: Float, top: Float, right: Float, bottom: Float) {
         anchorBitmap = bitmap
         anchorRect.set(left, top, right, bottom)
+        anchorShader = bitmap?.let { BitmapShader(it, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP) }
+        invalidate()
+    }
+
+    /** 本体截图的圆角半径（锚点控件实际显示圆角，见 [drawAnchorBody]）；0 = 无圆角信息 */
+    fun setAnchorCornerRadiusPx(px: Float) {
+        anchorCornerRadiusPx = px
+    }
+
+    /** 设置锚点内部文字截图及其固定矩形（容器坐标系）；null = 清除分层，整卡一起滑移 */
+    fun setAnchorTextBitmap(bitmap: Bitmap?, left: Float, top: Float, right: Float, bottom: Float) {
+        anchorTextBitmap = bitmap
+        anchorTextRect.set(left, top, right, bottom)
+        invalidate()
+    }
+
+    /**
+     * 主题过期修复（2026-09-28：详情页期间系统深浅变化 → 返回收拢动画里的锚点截图
+     * 还是旧主题像素，用户报"返回动画用旧色"）：把卡片本体 / 文字层截图分段亮度
+     * 重映射到目标深浅体系（口径见 [com.chen.powermeter.util.remapBitmapTone]），
+     * 本体 shader 同步重建。幂等：多次调用恒从原始位图重算，不叠加映射失真。
+     */
+    fun remapAnchorTheme(darkTarget: Boolean) {
+        anchorBitmap?.let { src ->
+            val base = anchorOriginalBitmap ?: src.also { anchorOriginalBitmap = it }
+            val mapped = remapBitmapTone(base, darkTarget)
+            anchorBitmap = mapped
+            anchorShader = BitmapShader(mapped, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+            if (src !== base && src !== mapped) src.recycle()
+        }
+        anchorTextBitmap?.let { src ->
+            val base = anchorTextOriginalBitmap ?: src.also { anchorTextOriginalBitmap = it }
+            val mapped = remapBitmapTone(base, darkTarget)
+            anchorTextBitmap = mapped
+            if (src !== base && src !== mapped) src.recycle()
+        }
         invalidate()
     }
 
@@ -146,25 +231,138 @@ class ClipRevealLayout @JvmOverloads constructor(
     fun clearClip() {
         clipping = false
         clipToOutline = false
+        // 稳态绝不能留遮罩：展开结束/降级路径都经过这里，残留会把整页刷成卡片色
+        veilAlpha = 0f
         invalidateOutline()
         invalidate()
     }
 
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
+    /** 遮罩色（= installWindowTransform 里的容器底色，两者必须同源，过渡才无缝）。 */
+    fun setVeilColor(color: Int) {
+        veilColor = color
+    }
+
+    /** 本体纯色模式的填充色（0 = 关闭，回落到位图绘制）。同源取容器底色。 */
+    fun setAnchorSolidColor(color: Int) {
+        anchorSolidColor = color
+        invalidate()
+    }
+
+    /**
+     * 内容遮罩强度 [0,1]：0 = 不盖（展开/稳态），1 = 完全用遮罩色盖住页面内容。
+     * 收拢时传 `1f - page.alpha`，与页面淡出严格互补 —— 页面内容"被卡片色收拢"，
+     * 而不是"淡出到页面底色"，交叉期不再与浮起的白卡形成灰白对比。
+     */
+    fun setContentVeil(alpha: Float) {
+        val a = alpha.coerceIn(0f, 1f)
+        if (veilAlpha == a) return
+        veilAlpha = a
+        invalidate()
+    }
+
+    /**
+     * 锚点截图层画在 children **之后**（恒盖在页面内容上面）。历史实现放在 [onDraw] =
+     * View.draw 固定顺序（背景 → onDraw → dispatchDraw）里的"子 View 之下"——收拢交叉窗
+     * （页面内容淡出 raw 0→55% ↔ 卡片截图淡入 raw 45%→100%，见 AppTransitions.CollapseHost）
+     * 中详情页的同位卡片边缘/阴影/统计文字以残影叠印在浮现的列表卡片上 = 用户截图
+     * "卡片内部左右两侧黑色阴影"（2026-09-27 真机实锤）。展开侧不受影响：截图
+     * f=0→0.22 已淡出、内容 f=0.48 才淡入，两窗无交叉，锚点永远在空窗期绘制。
+     */
+    override fun dispatchDraw(canvas: Canvas) {
+        super.dispatchDraw(canvas)
+        // 内容遮罩：位置必须在子 View（详情页内容）**之后**、锚点卡片**之前** ——
+        // 盖住页面底色，但不遮卡片本体与文字层
+        if (veilAlpha > 0.001f) {
+            veilPaint.color = veilColor
+            veilPaint.alpha = (veilAlpha * 255f).toInt().coerceIn(0, 255)
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), veilPaint)
+        }
+        drawAnchorLayers(canvas)
+    }
+
+    /** 锚点截图层（卡片本体 + 可选文字层），由 [dispatchDraw] 保证绘制在页面内容之上 */
+    private fun drawAnchorLayers(canvas: Canvas) {
         val bitmap = anchorBitmap
-        // 内容整行跟随窗口上边移动（宽高恒为原始像素，纯位移无形变）：展开时随上边
-        // 上行渐隐、收拢时随上边下行归位；f=0 时与真卡片逐像素重合
-        if (bitmap != null && clipping && anchorAlpha > 0f) {
+        val textBitmap = anchorTextBitmap
+        if (bitmap == null || !clipping || anchorAlpha <= 0f) return
+        anchorPaint.alpha = (anchorAlpha * 255f).toInt().coerceIn(0, 255)
+        if (textBitmap != null) {
+            // 分层模式（列表行类锚点）：卡片本体钉在原始矩形不动（随进度淡变），
+            // 内部文字随窗口上边滑移渐隐——滑移时保持它在卡片内的偏移
+            // （δ = 文字顶边在卡片内的原始偏移），等于"文字从卡片上浮起/落回"
+            anchorDst.set(anchorRect)
+            drawAnchorBody(canvas, bitmap, anchorDst)
+            val dy = anchorTextRect.top - anchorRect.top
+            anchorTextDst.set(
+                anchorTextRect.left,
+                clipTop + dy,
+                anchorTextRect.right,
+                clipTop + dy + anchorTextRect.height(),
+            )
+            canvas.drawBitmap(textBitmap, null, anchorTextDst, anchorPaint)
+        } else {
+            // 整行模式（紧凑按钮类锚点）：整卡跟随窗口上边移动（宽高恒为原始像素，
+            // 纯位移无形变）：展开时随上边上行渐隐、收拢时随上边下行归位；
+            // f=0 时与真卡片逐像素重合
             anchorDst.set(
                 anchorRect.left,
                 clipTop,
                 anchorRect.right,
                 clipTop + anchorRect.height(),
             )
-            anchorPaint.alpha = (anchorAlpha * 255f).toInt().coerceIn(0, 255)
-            canvas.drawBitmap(bitmap, null, anchorDst, anchorPaint)
+            drawAnchorBody(canvas, bitmap, anchorDst)
         }
+    }
+
+    /**
+     * 本体截图按**锚点圆角的抗锯齿圆角矩形**绘制（BitmapShader + drawRoundRect）：
+     * 裁剪矩形四角与卡片圆角之间的月牙区残留着源列表的"页面底色+卡片阴影"像素——
+     * 容器底色还是页面色时它们随底色隐身，底色改成卡片表面色（2026-09-27 批次三十五）
+     * 后就压在浅色底上显形（用户截图："圆角卡片像从方框里裁出来、四角外发黑"）。
+     * 半径超绘制区短边一半时钳半（同 outline 口径，紧凑胶囊类锚点自动回落为胶囊形）；
+     * 未设置半径（0）= 无圆角信息，退化为整矩形绘制（旧行为）。
+     */
+    /**
+     * 本体截图四边的侵蚀量（px）：裁剪位图的最外圈是源窗口里卡片边缘的**抗锯齿过渡带**
+     * （卡片表面与页面底色的混合像素），整卡淡入到不透明后（收拢末段）这条灰边贴在
+     * 同色容器底上显形 = 用户二次反馈的"卡片内部左右黑色阴影"（2026-09-27）。侵蚀后
+     * 绘制区只剩纯卡片表面像素，让出的边缘环由容器底色（采样自同一张卡、颜色一致）
+     * 补齐，视觉无缝；3px 在常见密度下不足 1dp，无感知。
+     */
+    private val EDGE_ERODE_PX = 3f
+
+    private fun drawAnchorBody(canvas: Canvas, bitmap: Bitmap, dst: RectF) {
+        val r = anchorCornerRadiusPx.coerceAtLeast(0f)
+            .coerceAtMost(minOf(dst.width(), dst.height()) / 2f)
+        // 纯色模式：完全不采样位图，直接填锚点表面色（见 anchorSolidColor 注释）。
+        // 不参与 EDGE_ERODE —— 纯色不存在"位图边缘过渡像素"问题
+        if (anchorSolidColor != 0) {
+            anchorBodyPaint.shader = null
+            anchorBodyPaint.color = anchorSolidColor
+            anchorBodyPaint.alpha = anchorPaint.alpha
+            canvas.drawRoundRect(dst, r, r, anchorBodyPaint)
+            return
+        }
+        val shader = anchorShader
+        if (shader == null || r <= 0f) {
+            canvas.drawBitmap(bitmap, null, dst, anchorPaint)
+            return
+        }
+        // 边缘侵蚀（见 EDGE_ERODE_PX）：绘制矩形与圆角半径同步内缩，保持与卡片真实
+        // 圆角形状同心；让出的边缘环由容器底色补齐
+        val l = dst.left + EDGE_ERODE_PX
+        val t = dst.top + EDGE_ERODE_PX
+        val rgt = dst.right - EDGE_ERODE_PX
+        val btm = dst.bottom - EDGE_ERODE_PX
+        // ⚠️ BitmapShader 以**画布坐标**采样（不随 dst 起点平移）：dst 不从 (0,0) 起时
+        // 会整体错位读图、CLAMP 把位图外的边行/边列糊进绘制区，卡片两端烘焙的圆弧
+        // 被错位采进来 = 用户截图"圆框内左右两侧月牙残留"——每次绘制把采样原点平移到
+        // 绘制矩形左上角，与 drawBitmap 逐像素等价（圆角裁剪仍然生效）
+        anchorShaderMatrix.setTranslate(-l, -t)
+        shader.setLocalMatrix(anchorShaderMatrix)
+        anchorBodyPaint.shader = shader
+        anchorBodyPaint.alpha = anchorPaint.alpha
+        canvas.drawRoundRect(l, t, rgt, btm, (r - EDGE_ERODE_PX).coerceAtLeast(0f), (r - EDGE_ERODE_PX).coerceAtLeast(0f), anchorBodyPaint)
     }
 
     override fun draw(canvas: Canvas) {

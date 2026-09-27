@@ -41,6 +41,13 @@ interface FrameDao {
     @Query("SELECT * FROM frame_cpu_samples WHERE sessionId = :sessionId ORDER BY timeMillis ASC")
     suspend fun cpuSamples(sessionId: Long): List<FrameCpuSampleEntity>
 
+    /** 帧率子拍点批量落库（250ms 级差分点，一场录制可达数千行，单事务插入） */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertFpsSamples(samples: List<FrameFpsSampleEntity>)
+
+    @Query("SELECT * FROM frame_fps_samples WHERE sessionId = :sessionId ORDER BY timeMillis ASC")
+    suspend fun fpsSamples(sessionId: Long): List<FrameFpsSampleEntity>
+
     /** 删除会话（frame_samples 走外键级联删除） */
     @Query("DELETE FROM frame_sessions WHERE id = :sessionId")
     suspend fun deleteSession(sessionId: Long)

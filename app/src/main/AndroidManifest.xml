@@ -26,15 +26,30 @@
          权限名固定为 API_V3，与 fold 同口径 -->
     <uses-permission android:name="rikka.shizuku.permission.API_V3" />
 
+    <!-- Android 11+ 包可见性（package visibility）：历史卡片与落库时的被测应用显示名 / 图标
+         都走本进程 PackageManager（getApplicationInfo / getApplicationIcon）。不加声明的包
+         查询直接 NameNotFoundException → resolveAppLabel 回落成包名落库，卡片上出现两行
+         包名（2026-09-27 用户报障的根因）。被测对象可能是任意应用（含无 launcher 入口的
+         side-loaded 应用），queries 声明 launcher intent 覆盖不全 → 用 QUERY_ALL_PACKAGES
+         （个人调试工具，不上架商店，无 Play 政策顾虑）。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
     <!-- Application 需注册自定义类：onCreate 里初始化 ShizukuHelper（注册 binder 监听器） -->
     <application
         android:name=".PowerMeterApp"
         android:allowBackup="true"
+        android:enableOnBackInvokedCallback="false"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@drawable/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.PowerMeter">
+
+        <!-- ⚠️ enableOnBackInvokedCallback=false（2026-09-28）：targetSdk 36 + Android 15+
+             预测性返回默认开启，系统会拦截手势返回并播放自己的跨 Activity 转场——而本项目
+             详情页的关闭转场被压成 0,0、收拢动画在窗口内自绘，被系统拦截时自绘动画整体
+             跳过 = 「返回偶尔闪一下直接结束」。关掉后返回一律走 OnBackPressedDispatcher
+             → finish() → CollapseHost 收拢，行为确定。 -->
 
         <!-- ShizukuProvider：自动初始化与 Shizuku 服务的 binder 连接。
              ⚠️ authority 必须是 `${applicationId}.shizuku`；
@@ -74,7 +89,7 @@
             android:label="@string/app_name"
             android:theme="@style/Theme.PowerMeter"
             android:launchMode="singleTop"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -149,16 +164,22 @@
             android:name=".ui.TrendFullscreenActivity"
             android:exported="false"
             android:theme="@style/Theme.PowerMeter"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale" />
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale|uiMode" />
 
         <!-- 帧率记录详情页：从「帧率监测」的历史列表点进单条记录。
              不声明 android:label —— 多任务卡片沿用 application 的 label，避免再引一份
-             会随语言变化的字符串（Manifest 引用的资源不允许按配置变化）。 -->
+             会随语言变化的字符串（Manifest 引用的资源不允许按配置变化）。
+             ⚠️ configChanges 含 uiMode（2026-09-28）：系统深浅色切换不重建本页（重建会
+             丢滚动位置回到顶部），改由 onConfigurationChanged / onResume 驱动深浅状态
+             （darkThemeState），经 PowerMeterTheme 闸门播圆孔揭露动画。
+             ⚠️ 窗口主题用 **Theme.PowerMeter.Transitions（半透明）**（2026-09-28 二改，
+             对齐 SportLink）：源列表只 onPause 不停 → 全程实时跟主题/重绘，返回时不再
+             "闪一下旧主题缓冲帧"；收拢期间裁剪窗外直接露出真实列表。 -->
         <activity
             android:name=".ui.FrameDetailActivity"
             android:exported="false"
-            android:theme="@style/Theme.PowerMeter"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale" />
+            android:theme="@style/Theme.PowerMeter.Transitions"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale|uiMode" />
 
         <!-- 帧率录制的前台服务外壳：只负责把进程提到前台 + 常驻通知，采集循环在同进程的
              FrameRecordController 里。不加它的话，用户切到被测应用（游戏/视频）后进程会被

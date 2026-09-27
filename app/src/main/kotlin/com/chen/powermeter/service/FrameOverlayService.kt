@@ -51,11 +51,13 @@ import kotlin.math.hypot
  *
  * 结构（原生 View，不用 ComposeView —— 服务 + overlay 场景下原生视图更轻也更稳）：
  * - **帧率 tab**：43×25dp 胶囊，等宽粗体数字，**不论是否录制都恒显实时帧率**；
+ *   底色半透明（[PILL_BG_ALPHA]，2026-09-27 用户口径：透出底下画面、色相不变）；
  *   未录制 = 浅绿底黑字，录制中 = **热烈红底白字**（2026-09-22 用户口径：录制态必须
  *   一眼可辨，底色直接变红，不再做小红点之类的小装饰）；单指拖动（位置不持久化，
  *   每次开窗回到默认位），轻点 = 出面板 / 停止并落库；
  * - **录制时长窗口**：跟在 tab 正下方、左对齐，半透明黑 `0xCC1E1E24`；仅两行（标题 +
- *   5/10/15/30 四个胶囊），**5s 无点击自动隐藏**，挑完立即按该时长开录（录制中挑则改本场
+ *   5/10/15/30 四个胶囊），整体按 [PANEL_SCALE] 缩到 2/3（2026-09-27 用户口径），
+ *   **5s 无点击自动隐藏**，挑完立即按该时长开录（录制中挑则改本场
  *   限时）并收起；**只随轻点 tab 出现**——悬浮窗刚打开时不显示（2026-09-22 用户口径：
  *   开 tab ≠ 挑时长，面板是「点 tab 开始录制」的伴随物）；每次开窗都不预选（见
  *   [FrameRecordController.clearLimit]）
@@ -107,6 +109,19 @@ class FrameOverlayService : Service() {
          * 四个时长胶囊的高亮靠独立的浅绿底，底色本身不做任何额外处理。
          */
         private const val COLOR_PANEL_BG = 0xCC1E1E24.toInt()
+
+        /**
+         * tab 底色的不透明度（2026-09-27 用户指定"改成半透明、颜色还是现在的颜色"）：
+         * 70%（0xB3）——盖在游戏画面上透得出底下内容、状态色又不糊。文字色仍按
+         * **不透明**原色反算（[textColorFor] 收到的是原色），对比度不随透明度变。
+         */
+        private const val PILL_BG_ALPHA = 0xB3
+
+        /**
+         * 时长窗口整体缩放（2026-09-27 用户指定"沿对角线缩小到目前的 2/3"）：对角线
+         * 线性缩放 = 宽高统一乘同一系数 —— 窗口宽度/内边距/字号/胶囊/圆角全部按它走。
+         */
+        private const val PANEL_SCALE = 2f / 3f
 
         /** 未选中胶囊的填充：半透明白，压在半透明黑面板上仍能看出边界 */
         private const val COLOR_CHIP_IDLE = 0x33FFFFFF.toInt()
@@ -214,7 +229,10 @@ class FrameOverlayService : Service() {
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 8.5f)
             includeFontPadding = false
             gravity = Gravity.CENTER
+            // 粗体之上再叠合成粗体（isFakeBoldText）：8.5sp 的数字笔画太细，
+            // 半透明底上要更实才够清楚（2026-09-27 用户口径"字体要加粗"）
             typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            paint.isFakeBoldText = true
             setSingleLine(true)
         }
         pillView = pill
@@ -346,7 +364,9 @@ class FrameOverlayService : Service() {
         pillView?.background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = dp(12.5f).toFloat()
-            setColor(pillBgColor)
+            // 半透明 = 只压 alpha、色相不变（2026-09-27 用户口径）；[pillBgColor] 保持
+            // 不透明原色供文字对比度反算，drawable 里才压 alpha
+            setColor((PILL_BG_ALPHA shl 24) or (pillBgColor and 0x00FFFFFF))
         }
         updatePillText(FrameRecordController.fps.value)
     }
@@ -370,17 +390,22 @@ class FrameOverlayService : Service() {
     private fun buildPanel(): LinearLayout {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14f), dp(10f), dp(14f), dp(12f))
+            setPadding(
+                dp(14f * PANEL_SCALE),
+                dp(10f * PANEL_SCALE),
+                dp(14f * PANEL_SCALE),
+                dp(12f * PANEL_SCALE),
+            )
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(14f).toFloat()
+                cornerRadius = dp(14f * PANEL_SCALE).toFloat()
                 setColor(COLOR_PANEL_BG)
             }
         }
         root.addView(
             TextView(this).apply {
                 text = getString(R.string.frame_record_duration)
-                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f * PANEL_SCALE)
                 setTextColor(0xE6FFFFFF.toInt())
             },
         )
@@ -388,11 +413,11 @@ class FrameOverlayService : Service() {
         chipViews = DURATIONS.map { minutes ->
             TextView(this).apply {
                 text = minutes.toString()
-                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f * PANEL_SCALE)
                 typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
                 gravity = Gravity.CENTER
-                layoutParams = LinearLayout.LayoutParams(0, dp(30f), 1f).apply {
-                    if (minutes != DURATIONS.last()) marginEnd = dp(6f)
+                layoutParams = LinearLayout.LayoutParams(0, dp(30f * PANEL_SCALE), 1f).apply {
+                    if (minutes != DURATIONS.last()) marginEnd = dp(6f * PANEL_SCALE)
                 }
                 setOnClickListener { applyLimit(minutes) }
             }
@@ -409,7 +434,7 @@ class FrameOverlayService : Service() {
             val isSelected = DURATIONS[index] == selected
             chip.background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(15f).toFloat()
+                cornerRadius = dp(15f * PANEL_SCALE).toFloat()
                 setColor(if (isSelected) COLOR_MINT else COLOR_CHIP_IDLE)
             }
             // 选中 = 浅绿底 + miuix 蓝字（用户指定搭配）；两项都不走 [textColorFor] 的反算逻辑，
@@ -431,7 +456,7 @@ class FrameOverlayService : Service() {
                 View.MeasureSpec.UNSPECIFIED,
             )
             val params = WindowManager.LayoutParams(
-                dp(186f),
+                dp(186f * PANEL_SCALE),
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 // 同 tab：允许越过系统条，跟 tab 一起贴到真正的屏幕边缘
@@ -472,7 +497,7 @@ class FrameOverlayService : Service() {
         val view = panelView ?: return
         val params = panelParams ?: return
         val panelW = params.width
-        val panelH = view.measuredHeight.coerceAtLeast(dp(80f))
+        val panelH = view.measuredHeight.coerceAtLeast(dp(80f * PANEL_SCALE))
         // 面板与 tab 同一安全区约束（左上角坐标范围），不得压进系统栏/刘海
         val safe = safeDragBounds(panelW, panelH)
         params.x = clampInt(p.x, safe.left, safe.right)

@@ -54,4 +54,25 @@
         <item name="android:activityCloseEnterAnimation">@anim/slide_in_left</item>
         <item name="android:activityCloseExitAnimation">@anim/slide_out_right</item>
     </style>
+
+    <!--
+        容器变换子页专用主题（2026-09-28，对齐 SportLink 的 Theme.SportLink.Transitions）：
+        **只挂在"进场侧滑 + 退场收拢回卡片"这类二级页上**（当前 = 帧率详情页）。
+
+        windowIsTranslucent + 透明底 ⇒ 源页（帧率列表）只 onPause、**不停** → 它全程可见、
+        跟着系统深浅实时重绘。这修的是「收拢结束后闪一下之前的颜色」（2026-09-28 用户报）：
+        不透明详情窗口会让源页真 onStop，窗口被 setWindowStopped 后**不允许重绘**，
+        而详情窗口消失（= 源页露出）永远早于源页第一帧新内容上屏 —— 那段空档里合成的
+        只能是源页上一次画的那张旧主题帧。
+        副作用（与 SportLink 同观感）：进场侧滑期间能看到底下的列表；收拢期间裁剪窗口外
+        直接露出**真实列表**（因此源页不再需要整窗冻结截图，见 FrameMeterScreen）。
+
+        ⚠️ 只写在 values/：parent Theme.PowerMeter 在 values-night 有深色变体，子样式
+        不重复声明 parent 即可自动随昼夜切换（与上面 ActivitySlideWindowAnimation 的
+        双份声明场景不同——那条是"动画可能取自对方主题"，不写两份会丢动画）。
+    -->
+    <style name="Theme.PowerMeter.Transitions" parent="Theme.PowerMeter">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
 </resources>

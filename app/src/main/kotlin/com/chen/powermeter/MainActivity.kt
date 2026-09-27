@@ -12,9 +12,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -35,13 +32,13 @@ import com.chen.powermeter.data.db.SessionRecorder
 import com.chen.powermeter.service.SamplingService
 import com.chen.powermeter.ui.ChartColors
 import com.chen.powermeter.ui.DialogBackdropHost
-import com.chen.powermeter.ui.FrameDetailActivity
 import com.chen.powermeter.ui.FrameMeterScreen
-import com.chen.powermeter.ui.ModeRevealOverlay
-import com.chen.powermeter.ui.ModeSwitchArgs
+import com.chen.powermeter.ui.ModeTransition
+import com.chen.powermeter.ui.ModeTransitionOverlay
 import com.chen.powermeter.ui.MonitorMode
 import com.chen.powermeter.ui.PowerMeterScreen
 import com.chen.powermeter.ui.theme.PowerMeterTheme
+import com.chen.powermeter.ui.ThemeTransition
 import com.chen.powermeter.util.CsvExporter
 import com.chen.powermeter.util.NavigationBarHelper
 import com.chen.powermeter.util.Prefs
@@ -65,6 +62,14 @@ class MainActivity : ComponentActivity() {
         private const val PROMOTED_NOTIFICATION_PERMISSION =
             "android.permission.POST_PROMOTED_NOTIFICATIONS"
     }
+
+    /**
+     * 应用当前深浅（2026-09-28 系统深浅色切换动画铺开）：本页 configChanges 含 uiMode 后
+     * 系统切换不再重建 Activity，深浅不走 isSystemInDarkTheme() 直读（后台切换时
+     * ViewRootImpl 不分发配置的已知坑），由 onCreate 初值 / onConfigurationChanged /
+     * onResume 兜底三处驱动；变化经 PowerMeterTheme 闸门播圆孔揭露动画（ThemeTransition）。
+     */
+    private val darkThemeState by lazy { mutableStateOf(isNightMode()) }
 
     private val requestNotificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -119,14 +124,11 @@ class MainActivity : ComponentActivity() {
         BatteryInfoStore.loadIfNeeded()
 
         setContent {
-            PowerMeterTheme {
+            PowerMeterTheme(darkTheme = darkThemeState.value) {
                 // 顶栏双击切换的监测模式，持久化在 Prefs（下次冷启动仍停在上次所在的模式）
                 var mode by remember {
                     mutableStateOf(MonitorMode.of(Prefs.getMonitorMode(this@MainActivity)))
                 }
-                // 进行中的模式切换转场（ClipReveal 锚点展开，见 ModeRevealOverlay）；null = 无转场。
-                // 双击标题 → 先起覆盖层（底层旧屏保持原样），收拢动画结束（onCommit）才落地 mode / Prefs
-                var modeReveal by remember { mutableStateOf<ModeSwitchArgs?>(null) }
                 val sessions by FrameHistoryStore.sessions.collectAsState()
                 // 切进帧率监测时拉一次历史列表（冷启动恢复该模式时同样覆盖）
                 LaunchedEffect(mode) {
@@ -168,9 +170,9 @@ class MainActivity : ComponentActivity() {
                 // 内部 miuix textureBlur 采样源，GlassDialog 卡片作为源兄弟渲染（同窗口兄弟铁律）。
                 // 此前只有全屏趋势页挂了宿主，主页面的弹窗会静默降级实色卡（2026-09-25 接入，
                 // 口径对齐 SportLink：弹窗三件套 = 外部 haze 模糊 + 内部 miuix 模糊 + 高光描边）。
-                // 双模式屏的统一渲染入口：底屏（当前模式）与转场覆盖层（目标模式）共用
-                // 同一套参数与回调（2026-09-25 切换动画 = ClipReveal 锚点展开，见 ModeRevealOverlay）
-                val monitorScreen: @Composable (MonitorMode, (Rect) -> Unit) -> Unit = { m, onToggle ->
+                // 双模式屏的统一渲染入口：底屏（当前模式）由它渲染；onToggle = 双击标题的
+                // 切换入口（2026-09-27 切换动画 = 右下角圆孔揭露，见 ModeTransition）
+                val monitorScreen: @Composable (MonitorMode, () -> Unit) -> Unit = { m, onToggle ->
                     when (m) {
                         MonitorMode.POWER -> PowerMeterScreen(
                             running = running,
@@ -222,9 +224,6 @@ class MainActivity : ComponentActivity() {
     
                         MonitorMode.FRAME -> FrameMeterScreen(
                             sessions = sessions,
-                            onOpenSession = { sessionId ->
-                                FrameDetailActivity.launch(this@MainActivity, sessionId)
-                            },
                             onDeleteSession = { sessionId ->
                                 FrameHistoryStore.delete(this@MainActivity, sessionId)
                             },
@@ -234,49 +233,30 @@ class MainActivity : ComponentActivity() {
                 }
 
                 DialogBackdropHost {
-                    monitorScreen(mode) { titleRect ->
-                        // 双击标题 = 起转场：目标模式在覆盖层里从标题矩形本体展开，**展开完成即落地**
-                        // mode / Prefs —— 一次双击完整切换（见 ModeRevealOverlay 的类 KDoc）。
-                        // 动画期 ClipReveal 已吞掉全部触摸（第一道防线），已有转场在途时
-                        // 这里再兜一道：在途转场的重入会抹掉/覆盖在途状态。
-                        if (modeReveal == null) {
-                            modeReveal = ModeSwitchArgs(
-                                target = if (mode == MonitorMode.POWER) {
-                                    MonitorMode.FRAME
-                                } else {
-                                    MonitorMode.POWER
-                                },
-                                anchorRectInWindow = titleRect,
-                            )
+                    monitorScreen(mode) {
+                        // 双击标题 = 圆形揭露切换（ModeTransition，口径对齐 SportLink 深浅色
+                        // 模式切换、圆孔改从右下角展开）：先 PixelCopy 截旧界面，截图完成后
+                        // 同帧落地 mode / Prefs —— 底层立刻换成目标模式，顶层铺「旧快照 +
+                        // 右下角圆孔」覆盖层，孔内露出新界面、孔外仍是旧页面，扫满全屏即
+                        // 完成切换（见 ModeTransition 的类 KDoc）。动画期覆盖层吞掉全部触摸
+                        // （第一道防线），快照在途/在播时这里再兜一道防重入。
+                        if (ModeTransition.snapshot == null) {
+                            val target = if (mode == MonitorMode.POWER) {
+                                MonitorMode.FRAME
+                            } else {
+                                MonitorMode.POWER
+                            }
+                            ModeTransition.begin(this@MainActivity) {
+                                mode = target
+                                Prefs.setMonitorMode(this@MainActivity, target.key)
+                            }
                         }
                     }
                 }
 
-                // 转场覆盖层挂在整棵 compose 树之上 —— 同 SportLink DeviceDetailOverlay 的
-                // 挂载位置（android.R.id.content 的兄弟层）
-                modeReveal?.let { args ->
-                    ModeRevealOverlay(
-                        args = args,
-                        // 覆盖层底色 = 页面真实背景（Compose 主题色，随深浅色/动态取色走；
-                        // View 层主题的 colorBackground 深色下是白的，动画会闪白）
-                        backgroundColor = MaterialTheme.colorScheme.background.toArgb(),
-                        // 展开完成 = 切换落地（一次双击完整切换，见 ModeRevealOverlay 的类 KDoc）
-                        onCommit = {
-                            // 幂等守卫：迟到的收尾回调不得覆盖新转场的在途状态
-                            if (modeReveal === args) {
-                                mode = args.target
-                                Prefs.setMonitorMode(this@MainActivity, args.target.key)
-                                // mode 变化触发上面的 LaunchedEffect(mode) 拉帧率历史（若切到帧率）
-                                modeReveal = null
-                            }
-                        },
-                        // 预览期收回（返回键）= 放弃切换，留在旧模式
-                        onCancel = { if (modeReveal === args) modeReveal = null },
-                    ) { onToggle ->
-                        // 预览期内再双击 = 收回放弃（420ms 窗口，触摸被吞基本不可达）
-                        monitorScreen(args.target, onToggle)
-                    }
-                }
+                // 圆形揭露覆盖层：挂在整棵 compose 树最上层（同 SportLink ThemeTransitionOverlay
+                // 的挂载位置），孔外旧快照 / 孔内新界面，扫满全屏后自行移除
+                ModeTransitionOverlay()
             }
         }
 
@@ -484,8 +464,47 @@ class MainActivity : ComponentActivity() {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
+    /**
+     * 回前台首帧之前吃掉「退场交棒」（2026-09-28 二轮，修"返回瞬间闪回白色"）：
+     * 二级页（帧率详情 / 趋势全屏）收拢退场时把**目标深浅**留给本页
+     * （`ThemeTransition.noteExitTheme`），在这里静默落地。onStart 早于窗口首帧绘制，
+     * 因此返回后画出的第一帧就是目标主题；随后的配置分发因状态已相等，也不会再补播圆孔。
+     */
+    override fun onStart() {
+        super.onStart()
+        applyExitHandoff()
+    }
+
+    /**
+     * 吃掉「退场交棒」（二级页退场时写入，见 `ThemeTransition.noteExitTheme`）：
+     * onStart 与 onResume **两处都调**——帧率详情页已改半透明窗口主题，本页在被它覆盖期间
+     * 只 onPause、**不 onStop**（2026-09-28 实测），onStart 根本不会执行。
+     * **消费即清**：否则残留值会在很久之后的某次 onStart 才被吃掉，那时系统主题可能已再次
+     * 变化 → 把主题改错（随后虽会被 onResume 兜底纠正，但没有理由留这个坑）。
+     */
+    private fun applyExitHandoff(): Boolean? {
+        val handoff = ThemeTransition.consumeExitTheme() ?: return null
+        if (darkThemeState.value != handoff) {
+            ThemeTransition.requestSilent()
+            darkThemeState.value = handoff
+            NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !handoff)
+        }
+        return handoff
+    }
+
     override fun onResume() {
         super.onResume()
+        // 交棒在这里也要消费：半透明二级页路径下本页不 onStop → onStart 不执行（见 applyExitHandoff）
+        applyExitHandoff()
+        // 后台切换深浅兜底（configChanges 含 uiMode 的已知坑：后台时 ViewRootImpl 不分发
+        // 配置，Compose 不跟随）——回前台读 Resources 最新值；走**静默通道**：这类错过的
+        // 变化应立即呈现目标主题、不补播圆孔动画（2026-09-28 用户报"返回列表后颜色还是
+        // 切换前的、要等补播动画才变"）
+        val night = isNightMode()
+        if (darkThemeState.value != night) {
+            ThemeTransition.requestSilent()
+            darkThemeState.value = night
+        }
         // 用户可能刚在 Shizuku 里完成授权，或重启过 Shizuku 服务；回到前台重新探测一次
         // （绑定 UserService 是异步的，recheck 内部会按需重新绑定）
         ShizukuHelper.recheck()
@@ -494,9 +513,19 @@ class MainActivity : ComponentActivity() {
         FrameHistoryStore.refresh(this)
     }
 
-    // 配置变更（旋转/深浅色切换/180° 翻转）后重放透明系统栏设置
+    // 配置变更（旋转/深浅色切换/180° 翻转）后重放透明系统栏设置；
+    // 深浅色切换（configChanges 含 uiMode → 不重建）在这里驱动 darkThemeState，
+    // 经 PowerMeterTheme 闸门播圆孔揭露动画（2026-09-28）
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        val dark = (newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        if (darkThemeState.value != dark) {
+            // 送达时本页还没 onStart（= 后台期间错过的变化，随返回事务补发）→ 静默落地，
+            // 不补播圆孔动画。判据与实测时序见 ThemeTransition.isHostForeground
+            if (!ThemeTransition.isHostForeground(this)) ThemeTransition.requestSilent()
+            darkThemeState.value = dark
+        }
         NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
         window.decorView.post {
             if (!isFinishing && !isDestroyed) {

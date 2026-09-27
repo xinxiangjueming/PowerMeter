@@ -13,6 +13,7 @@ import com.chen.powermeter.data.FrameSample
 import com.chen.powermeter.data.RootPowerReader
 import com.chen.powermeter.data.db.FrameSampleEntity
 import com.chen.powermeter.data.db.FrameCpuSampleEntity
+import com.chen.powermeter.data.db.FrameFpsSampleEntity
 import com.chen.powermeter.data.db.FrameSession
 import com.chen.powermeter.data.db.FrameDatabase
 import com.chen.powermeter.util.ShizukuHelper
@@ -41,17 +42,20 @@ private const val TAG = "FrameRecordController"
  * ⚠️ 本阶段**没有前台服务**：息屏后系统随时可能挂起进程，长时录制请在亮屏下进行。
  * 需要息屏录制时应把它搬进 `SamplingService` 那样的前台服务（下一轮的事）。
  *
- * 采集节奏（2026-09-25 重构为**子拍**制）：
+ * 采集节奏（2026-09-25 重构为**子拍**制；2026-09-27 帧率差分 4Hz 化同日回退 1Hz）：
  * - **每个子拍**（[SUB_TICK_MS] = 250ms）：CPU 快样一条命令（/proc/stat 差分 + 逐核频率，
  *   [FrameRateSource.readCpuFastSample]）—— CPU 使用率/频率是快变量，1s 一点会把真实
  *   抖动与频率升降挡全部摊平（用户对照 Scene 工具箱实测反馈"明显不如"）；
- * - **每个完整拍**（每 [BEAT_SUBTICKS] 个子拍 ≈ 1s）：`dumpsys SurfaceFlinger --timestats`
- *   → 与上一拍做**差分**得到本拍帧率；电量四项（电压 / 电流 / 功率 / 电池温度）同样
- *   每秒一拍，走功率侧同一条取数链 [RootPowerReader.read]（root 机器 sysfs 节点、
- *   Shizuku 机器 BatteryManagerSource 实时电流），与帧率逐秒对齐才能回答
- *   "掉帧的那一刻是不是正好在发热 / 拉电流"；
+ * - **每个完整拍**（每 [BEAT_SUBTICKS] 个子拍 ≈ 1s）：timestats 差分 + 1s 落库样本
+ *   （fps = ΔF ÷ dt，快照实际间隔）。⚠️ 帧率差分曾在 2026-09-27 提到 4Hz 子拍（为抓
+ *   250ms 级短谷、悬浮 tab 4Hz 响应），真机实测帧率读数仍异常，用户定案回退 1Hz 口径；
+ *   frame_fps_samples 表保留、粒度同为 1Hz。电量四项（电压 / 电流 /
+ *   功率 / 电池温度）走功率侧同一条取数链 [RootPowerReader.read]，与帧率逐秒对齐才能
+ *   回答"掉帧的那一刻是不是正好在发热 / 拉电流"；
  * - **每 [SLOW_POLL_EVERY] 个完整拍**：前台应用包名、刷新率、虚拟温度（这几项变化慢、
- *   但每条命令都要起进程）。中间周期沿用上一次的值。
+ *   但每条命令都要起进程），三项**错峰**到相邻三拍、每拍至多多跑一条 —— 曾经同拍执行，
+ *   单拍叠加 dumpsys activity + dumpsys display + 温感区遍历，游戏满载时该拍被拖到
+ *   9~14s（真机 2026-09-26 xlsx 实测平均 5.45s/条）。中间周期沿用上一次的值。
  *
  * 落库路径只有一条 —— [finishAndPersist]，由「限时到点」「通道失效」「用户手动停止」
  * 三种结束方式共用。⚠️ 样本列表因此是**对象字段**而不是循环局部变量：手动停止会
@@ -73,32 +77,25 @@ object FrameRecordController {
     private const val BEAT_SUBTICKS = 4
 
     /**
-     * 帧率汇总的合理上限容差（fps，2026-09-25 加）。
+     * 帧率汇总（avg / min）的合理上限容差（fps，2026-09-27 从 0.5 放宽到 1.0）。
      *
-     * 背景：60Hz 锁帧的游戏，厂商性能面板会按 61Hz 的口径展示、抬高"平均帧率"的观感。
-     * 本应用虽是 timestats 差分自算（不走厂商口径），但差分窗口的**边界效应**同样能给出
-     * 超过刷新率的单点值 —— T 秒窗口内最多合成 refresh×T+1 帧，1s 周期下 fps 估计可到
-     * refresh+1.0。汇总时以「当前刷新率 + 本容差」为上限，超限值不参与 avg / min / max。
+     * 1s 样本的帧数是单窗差分 ΔF ÷ dt（快照实际间隔 ≈ 1s），物理上限 = refresh×dt+1
+     * ≈ refresh+1.0，即 fps 可到 refresh+1.0 —— 这是**窗口相位的合法值**
+     * （120Hz 屏偶发 121），不是虚高。旧容差 0.5 把 (refresh+0.5, refresh+1] 段切掉：
+     * 这些边界样本不参与 avg，均值被系统性压低（「Scene 120 本应用 115」的构成之一）；
+     * 且 max 口径早已保留边界帧（121 如实展示，2026-09-27 用户口径），avg 剔 +0.5
+     * 而 max 不剔，口径自相矛盾。
      *
-     * 取 0.5 的取舍：能拦下"61 on 60Hz"这类虚高（含边界尖峰 60.6+），又不会把正常
-     * 60.0~60.4 的窗口抖动误杀；被丢的只是略高于刷新率的毛刺，对均值影响 <0.1fps。
+     * 取 1.0 = 放宽到 1s 窗口的物理上限，与 max 一致：边界值保留，不再系统性低估。
+     * 真正的虚高（计数污染 / 误认领行）在子拍守卫已被拦（updateFpsFromDiff 的物理上限
+     * 守卫 + FrameRateSource 的行距守卫），到不了 1s 样本层；「60Hz 锁帧被按 61Hz 展示」
+     * 的厂商语义顾虑同样覆盖：60Hz 的 1s 窗合法上限恰为 61.0，剔除条件是
+     * > refresh+1.0，61.0 不会触发。
+     *
+     * ⚠️ **max / 1% / 5% Low 不受本容差影响**（max 全量取；Low 用子拍点源 lowSource），
+     * 见 [finishAndPersist]。
      */
-    private const val FPS_CEILING_TOLERANCE = 0.5
-
-    /**
-     * 实时帧率差分的物理上限容差（fps，2026-09-25 加）。
-     *
-     * 单表面 T 秒窗口内最多呈现 refresh×T + 1 帧（差分窗口边界效应），1s 级 dt 下差分结果
-     * 不可能超过刷新率 +1。**差分超限 = 计数被污染**：AOSP 16 的逐图层计数只随真实呈现递增
-     * （见 FrameRateSource.Timestats.perLayerFrames 的两级 key 说明），能超限只剩 ROM 私改
-     * timestats、或 shell 层收窄把别处的 totalFrames 行误归入目标图层这类非原生因素 ——
-     * 照常出数就是悬浮 tab 冒 1000+ 的假帧率（2026-09-25 用户实测反馈）。
-     *
-     * 超限拍的处理：**拒绝出数**（读数保持上一拍、不产样本），但**基线照常推进** ——
-     * 一次性跳变下一拍自愈；持续性跳变每拍都会走到同一条 warning（tag=FrameRecordController，
-     * 带图层名与 prev/cur 原值），真机 logcat 一眼定位是哪个图层、涨了多少。
-     */
-    private const val FPS_LIVE_CEILING_TOLERANCE = 1.0
+    private const val FPS_CEILING_TOLERANCE = 1.0
 
     /**
      * 单个采样周期的最短等待。补偿式等待的下界 —— 本轮工作耗时逼近 1s 时（
@@ -116,7 +113,8 @@ object FrameRecordController {
      */
     private const val MIN_SUB_TICK_MS = 30L
 
-    /** 慢速采集（前台应用 / 刷新率 / 温度）的抽稀倍率（按**完整拍**计，5 拍 = 5s） */
+    /** 慢速采集（前台应用 / 刷新率 / 温度）的抽稀倍率（按**完整拍**计，5 拍 = 5s）。
+     *  三项**错峰**分布在 0/1/2 拍执行（见 loop 内注释），任何一拍至多多跑一条慢命令 */
     private const val SLOW_POLL_EVERY = 5
 
     /** 错误码：无可用取数通道（既无 Shizuku 也无 root） */
@@ -145,7 +143,9 @@ object FrameRecordController {
     private const val NO_TARGET_HINT_TICKS = 3
 
     /**
-     * 连续多少轮读不到累计帧数才判定**通道真的不可用**并停止录制（1s 一拍 ≈ 6 秒）。
+     * 连续多少轮读不到累计帧数才判定**通道真的不可用**并停止录制
+     * （完整拍 ≈ 1s 一轮 × 6 ≈ 6 秒；2026-09-27 曾随差分 4Hz 化放大到 24 轮以保持
+     * 6 秒宽限，同日差分回退 1Hz 后改回 6 轮）。
      *
      * ⚠️ 为什么不是首轮失败就停（2026-09-22 修）：功率侧的取数循环是「每个采样周期重试一次、
      * 失败不缓存」，所以 Shizuku 的 UserService 绑定晚生效一两秒、su 授权框刚点完这类**暂时**
@@ -185,6 +185,14 @@ object FrameRecordController {
      * （见 [FrameCpuSampleEntity]）。
      */
     private val pendingCpu = ArrayList<FrameCpuSampleEntity>()
+
+    /**
+     * 帧率子拍点缓冲（250ms 差分写入，与 [pending] 同一条落库路径）：FPS 曲线的 4Hz
+     * 数据源 + MIN / 1%/5% Low 的取值源。
+     * ⚠️ 内存里实体的 sessionId=0，finishAndPersist 拿到会话 id 后 copy 补上
+     * （见 [FrameFpsSampleEntity]）。
+     */
+    private val pendingFps = ArrayList<FrameFpsSampleEntity>()
     private var sessionPkg = ""
     private var sessionRefreshHz = 0
     private var sessionStartWall = 0L
@@ -205,11 +213,33 @@ object FrameRecordController {
     private var diffPerLayer: Map<String, Long> = emptyMap()
     /** 上一拍全局 missedFrames（丢帧差分基线） */
     private var diffMissed = 0L
+
+    /**
+     * 上一完整拍的 presentToPresent 直方图（帧间隔「当秒」差分基线）；null = 无基线。
+     * 1s 样本的 frameSpaceMs = 本拍与上一拍直方图的**差集**加权平均 —— 累计口径是一条
+     * 衰减收敛曲线（开局加载的大间隔被稀释到 8.4-8.5），读不出当秒、也判不了
+     * "FPS 低谷是真实掉帧（帧时间跳 9+）还是计时伪差（纹丝不动 8.0）"。
+     * ⚠️ 只在目标切换（resetTimestats 清直方图）时作废；直方图中途被 statsd 清表的
+     * 情形由 [p2pDeltaFrameSpace] 的负增量检查兜住。
+     */
+    private var prevP2p: Map<Int, Long>? = null
     /** 上一拍 timestats 快照时刻（readTimestats 返回处打点，**非拍首** —— 见采集循环 diffAt 赋值处） */
     private var diffAt = 0L
 
     /**
+     * 守卫拒收分支内**立即重读刷新率**的节拍：限 ≥1s 一次。「刷新率其实没变但守卫持续
+     * 拒收」（计数污染 / 刷新率节点读失败等罕见情形）不至于每子拍都白跑一次 ~300ms 的
+     * dumpsys display。动机与复验流程见 [updateFpsFromDiff] 的 LTPO 探测注释。
+     */
+    @Volatile
+    private var lastGuardProbeAt = 0L
+
+    /** 一次可用的子拍差分结果：实时读数 + 供 1s 样本合成的窗口增量（帧数与时长） */
+    private class DiffResult(val fps: Double, val frames: Long, val dtSec: Double)
+
+    /**
      * 逐图层差分出实时帧率并推进基线；无可差分（首拍 / 基线陈旧 / 图层全换）时返回 null。
+     * 返回值带本窗的 Δ帧数与 dt —— 1s 样本的 fps 由本拍窗口内各子拍差分合成（ΣΔF ÷ Σdt）。
      *
      * ⚠️ 帧率 = **单图层差分的最大值**，不是认领总和的差分（原因见
      * [FrameRateSource.Timestats.perLayerFrames]）：
@@ -221,20 +251,22 @@ object FrameRecordController {
      *
      * ⚠️ 基线陈旧（距上一拍超 [STALE_DIFF_WINDOW_SEC]，典型 = 重开悬浮窗后的第一拍）
      * 时本拍只建基线不出数：作废旧基线、下一拍重建 —— 不会拿"停顿前的累计值 ÷ 秒级
-     * dt"算出假值。返回 null 的拍调用方不产样本，但拍尾照常推进 diffMissed，
+     * dt"算出假值。返回 null 的拍调用方不产样本点，但拍尾照常推进 diffMissed，
      * 下一拍的丢帧差分基线同步就位。
      *
-     * ⚠️ **物理上限守卫**（2026-09-25 加，口径见 [FPS_LIVE_CEILING_TOLERANCE]）：差分结果
-     * 超过「当前刷新率 +1」即视为计数被污染，拒绝出数并打 warning 留痕（图层名 / prev /
-     * cur / dt 全带上，真机 logcat 直接定位污染源）。**基线照常推进**：一次性跳变（如
-     * statsd 拉 atom 清零后又涨回、误认领行只出现一拍）下一拍自愈；持续性跳变则每拍
-     * 留痕、读数保持最后一个可信值 —— 宁可「—」也不显示 1000+ 的假帧率。
+     * ⚠️ **物理上限守卫**（随窗长缩放）：单表面 dt 秒窗口最多呈现 refresh×dt+1 帧
+     * （窗口两端各粘一个 vsync 的边界效应）⇒ fps ≤ refresh + **1/dt**（1s 窗 = refresh+1、
+     * 250ms 窗 = refresh+4；固定 +1 会把 4Hz 下约三成的合法边界拍整拍拒收）。差分超限
+     * 即视为计数被污染，拒绝出数并打 warning 留痕（图层名 /
+     * prev / cur / dt 全带上，真机 logcat 直接定位污染源）。**基线照常推进**：一次性跳变
+     * （如 statsd 拉 atom 清零后又涨回、误认领行只出现一拍）下一拍自愈；持续性跳变则
+     * 每拍留痕、读数保持最后一个可信值 —— 宁可「—」也不显示 1000+ 的假帧率。
      *
      * ⚠️ @param snapshotAt 必须是**本拍 timestats 快照的落地时刻**（readTimestats 返回处
      * 打点），不能用拍首时间：差分窗口必须与两次快照的实际间隔对齐，拍首与快照之间隔着
      * 本拍的全部取数命令，错位量随命令耗时不等而波动（事故记录见采集循环 diffAt 赋值处）。
      */
-    private fun updateFpsFromDiff(stats: FrameRateSource.Timestats, snapshotAt: Long): Double? {
+    private fun updateFpsFromDiff(stats: FrameRateSource.Timestats, snapshotAt: Long): DiffResult? {
         val dtSec = (snapshotAt - diffAt) / 1_000.0
         val usable = diffPerLayer.isNotEmpty() && dtSec > 0.0 && dtSec <= STALE_DIFF_WINDOW_SEC
         var bestFps = -1.0
@@ -259,18 +291,63 @@ object FrameRecordController {
         //    守卫只挡住「本拍读数与本拍样本」，不影响差分窗口的连续性
         diffPerLayer = if (usable || diffPerLayer.isEmpty()) stats.perLayerFrames else emptyMap()
         if (bestFps < 0.0) return null
-        if (sessionRefreshHz > 0 && bestFps > sessionRefreshHz + FPS_LIVE_CEILING_TOLERANCE) {
+        if (sessionRefreshHz > 0 && bestFps > sessionRefreshHz + 1.0 / dtSec) {
+            // LTPO 档位切换探测（2026-09-27）：单表面物理上限 = refresh×dt+1 帧，
+            // 超上限只可能来自「刷新率被误报过低」（60→120 切换后 sessionRefreshHz 仍挂
+            // 旧值 60，差分 120 的合法读数被 60+1/dt 整拍拒杀，要等慢速拍 ~5s 才自愈）
+            // 或「计数污染」。前者远更常见 —— 立即重读一次刷新率并复验本次差分：
+            // 新上限放行 → 本拍照常接受（读数与 1s 合成累计器都恢复，不再苦等慢速拍）。
+            // 重读按 [lastGuardProbeAt] 限 ≥1s；复验仍超限（真污染 / 刷新率节点读失败）
+            // 落回原拒收路径，warning 留痕、下一拍自愈。
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastGuardProbeAt >= 1_000L) {
+                lastGuardProbeAt = nowMs
+                FrameRateSource.readRefreshRateHz().takeIf { it > 0 }?.let { sessionRefreshHz = it }
+                if (bestFps <= sessionRefreshHz + 1.0 / dtSec) {
+                    Log.i(
+                        TAG,
+                        "LTPO 档位切换探测命中：刷新率重读为 ${sessionRefreshHz}Hz，" +
+                            "本次差分放行：raw=${"%.1f".format(bestFps)} fps, " +
+                            "dt=${"%.2f".format(dtSec)}s, layer=$bestLayer",
+                    )
+                    _fps.value = bestFps
+                    return DiffResult(bestFps, bestCur - bestPrev, dtSec)
+                }
+            }
             Log.w(
                 TAG,
                 "帧率差分超刷新率上限，本拍拒绝出数（基线已照常推进）：" +
-                    "raw=${"%.1f".format(bestFps)} fps vs refresh=${sessionRefreshHz}Hz, " +
+                    "raw=${"%.1f".format(bestFps)} fps vs ceiling=${sessionRefreshHz + 1.0 / dtSec}, " +
                     "dt=${"%.2f".format(dtSec)}s, layer=$bestLayer, " +
                     "Δ=${bestCur - bestPrev} (prev=$bestPrev → cur=$bestCur)",
             )
             return null
         }
         _fps.value = bestFps
-        return bestFps
+        return DiffResult(bestFps, bestCur - bestPrev, dtSec)
+    }
+
+    /**
+     * 相邻两拍 presentToPresent 直方图**差集**的加权平均 = 「当秒」平均帧间隔（ms）。
+     *
+     * 口径意义：累计直方图的平均是一条衰减收敛曲线（开局加载的大间隔被后续稀释到
+     * ~8.4-8.5），既读不出当秒、也判不了 FPS 低谷的真假 —— 差集口径下，真实掉帧的秒
+     * （16ms 桶混入）帧时间跳到 9+，计时伪差的秒纹丝不动 8.0。
+     *
+     * @return 0.0 = 无差分基线（拍首）/ 直方图中途被清（计数负增长：statsd 拉 atom、
+     *   -clear），调用方按缺测处理
+     */
+    private fun p2pDeltaFrameSpace(cur: Map<Int, Long>, prev: Map<Int, Long>?): Double {
+        if (prev == null) return 0.0
+        var weighted = 0.0
+        var total = 0L
+        for (ms in (cur.keys + prev.keys)) {
+            val delta = (cur[ms] ?: 0L) - (prev[ms] ?: 0L)
+            if (delta < 0L) return 0.0
+            weighted += ms.toDouble() * delta
+            total += delta
+        }
+        return if (total > 0L) weighted / total else 0.0
     }
 
     /** 限时到点时刻（epoch ms）；0 = 不限时。由 [start] / [setLimit] 写，采集循环读 */
@@ -417,6 +494,7 @@ object FrameRecordController {
         _startFps.value = Double.NaN
         pending.clear()
         pendingCpu.clear()
+        pendingFps.clear()
         sessionRefreshHz = 0
         sessionStartWall = System.currentTimeMillis()
         sessionEndWall = sessionStartWall
@@ -548,6 +626,9 @@ object FrameRecordController {
         var cpuFastFrom = 0
         /** 连续读不到累计帧数的完整拍轮数；成功一轮即归零（宽限期见 [MAX_READ_FAILURES]） */
         var readFailures = 0
+        // ── 1s 样本的帧率合成累计器（子拍差分写入、完整拍清零）：ΣΔF ÷ Σdt 口径见循环内注释
+        var accFrames = 0L
+        var accDtSec = 0.0
 
         // suspend 函数里没有 CoroutineScope 接收者，isActive 要显式从 coroutineContext 取
         while (coroutineContext.isActive) {
@@ -562,12 +643,12 @@ object FrameRecordController {
             // stop() cancel 后立即作废本拍：快样命令是阻塞调用，不能让已停止的拍继续走完整拍
             if (!coroutineContext.isActive) break
 
-            // ── 完整拍（每 BEAT_SUBTICKS 个子拍 ≈ 1s）：timestats 差分 / 电量 / 落库样本 ──
-            if (tick % BEAT_SUBTICKS == 0) {
+            val isBeat = tick % BEAT_SUBTICKS == 0
+            if (isBeat) {
                 val now = cycleStart
 
                 // 前台应用：**未锁定前每轮都试**。不排除自身包名（2026-09-22 用户口径：
-                // 任何界面都实时显示帧率）—— 停在本应用页面时测的就是自己的渲染帧率。
+                // 任何界面都实时显示帧率）—— 停在本应用页面上时测的就是自己的渲染帧率。
                 // ⚠️ start() 已从预览交棒 sessionPkg（通常非空），所以首拍只有 beat==0 会刷新
                 if (beat % SLOW_POLL_EVERY == 0 || sessionPkg.isEmpty()) {
                     FrameRateSource.readTopPackage()
@@ -578,14 +659,20 @@ object FrameRecordController {
                 }
                 // GPU 占用率：快变量，完整拍直读（一条 cat，代价可忽略）
                 FrameRateSource.readGpuLoadPct()?.let { gpuLoadPct = it }
-                // 刷新率与虚拟温度变化慢、且每条命令都要起进程，保持抽稀。
+                // 慢速项（前台应用 / 刷新率 / 温度）变化慢、每条都要起进程：按 5 拍抽稀之外，
+                // 三项**错峰**到相邻三拍（0=前台应用、1=刷新率、2=温度），任何一拍至多多跑一条。
+                // ⚠️ 曾经三项同拍执行：单拍叠加 dumpsys activity + dumpsys display + 温感区遍历，
+                //    游戏满载时该拍被拖到 9~14s；下一拍差分窗口超过陈旧上限（STALE_DIFF_WINDOW_SEC）
+                //    被作废不出样本 —— 真机 xlsx 实测 132 条样本跨 714s、平均 5.45s/条、间隔双峰
+                //    1~4s / 9~14s（2026-09-26 定案，2026-09-27 修）。
                 // ⚠️ 刷新率**每轮慢速拍都重读**（读不到不清零，2026-09-25 从「只在为 0 时读」改）：
                 //    智能刷新 / LTPO 会在 60↔120 间切换，而差分的物理上限守卫（updateFpsFromDiff）
                 //    用的是「当前」刷新率 —— 锁死首拍值，切换后要么误杀合法读数、要么放行不了虚高。
-                if (beat % SLOW_POLL_EVERY == 0) {
+                if (beat % SLOW_POLL_EVERY == 1) {
                     FrameRateSource.readRefreshRateHz().takeIf { it > 0 }?.let { sessionRefreshHz = it }
-                    // CPU / GPU 温度同一条温感区命令一次取回（原本两个函数各 fork 一轮
-                    // thermal_zone 遍历，慢速拍平白多花一倍耗时，采样周期被拉得更长）
+                }
+                if (beat % SLOW_POLL_EVERY == 2) {
+                    // CPU / GPU 温度同一条温感区命令一次取回（单进程 awk 读完全部温感区）
                     FrameRateSource.readCpuGpuTempsC().let { (tCpu, tGpu) ->
                         tCpu?.let { virtualTempC = it }
                         tGpu?.let { gpuTempC = it }
@@ -603,6 +690,8 @@ object FrameRecordController {
                     diffPkg = sessionPkg
                     diffPerLayer = emptyMap()
                     diffMissed = 0L
+                    // resetTimestats 会清直方图 → 帧间隔差分基线一并作废
+                    prevP2p = null
                     if (sessionPkg.isNotEmpty()) FrameRateSource.resetTimestats()
                 }
 
@@ -612,21 +701,35 @@ object FrameRecordController {
                 } else if (_error.value == ERROR_NO_TARGET_APP) {
                     _error.value = null
                 }
+            }
 
+            if (isBeat) {
+                val now = cycleStart
+
+                // ── 帧率差分：每完整拍一次（1Hz；2026-09-27 曾提到 4Hz 子拍，真机实测
+                //    帧率读数仍异常，用户定案回退 1Hz —— 250ms 子拍仅保留 CPU 快样）。
+                //    读数与 1s 样本同源：fps = ΔF ÷ dt（快照实际间隔），悬浮 tab 1Hz 响应。
                 val stats = FrameRateSource.readTimestats(sessionPkg)
-                // ⚠️ 快照落地时刻（readTimestats 返回处）：差分窗口以此打点，理由见下方 diffAt 赋值处
+                // ⚠️ 快照落地时刻（readTimestats 返回处）打点差分窗口，而非拍首 now：
+                //    拍首到快照之间隔着本拍取数命令（GPU 占用 / timestats / 电量，慢速拍
+                //    还多跑刷新率 + 温度），各拍耗时相差几百 ms —— 按拍首差分，窗口与真实
+                //    呈现窗口错位，且随慢速轮询**周期性振荡**：慢速拍快照被推后 → 下一拍
+                //    差分窗被压短 → 120Hz 实测掉到 ~95（2026-09-25 用户实测「一堆 95Hz」）。
+                //    快照时刻的抖动只剩命令耗时的波动（±几十 ms），差分窗口才与帧数增量
+                //    真正对应。
                 val statsAt = System.currentTimeMillis()
-                // 同上：cancel 后本拍作废，不写共享基线（readTimestats 阻塞期间可能已被 stop()）
+                // cancel 后本拍作废：readTimestats 是阻塞调用，期间可能已被 stop()，
+                // 不能让已停止的拍继续写共享基线 / 落库
                 if (!coroutineContext.isActive) break
                 if (stats == null) {
                     // 这一轮读不到累计帧数 —— **先不判死**（宽限期见 [MAX_READ_FAILURES]）。
                     // 读数清零成"无"：通道死了还挂着最后一帧的旧数字，界面会继续骗人
                     readFailures++
                     _fps.value = Double.NaN
-                    // 差分基线一并作废：否则通道恢复后第一轮会拿"几秒前的累计值 ÷ 1 秒"算出假尖峰
+                    // 差分基线一并作废：否则通道恢复后第一轮会拿"几秒前的累计值 ÷ 秒级 dt"算出假尖峰
                     diffPerLayer = emptyMap()
                     diffMissed = 0L
-                    // 只在一段失败的开头判定一次原因（内部要 fork su 探测，不必每秒重算）
+                    // 只在一段失败的开头判定一次原因（内部要 fork su 探测，不必每拍重算）
                     if (readFailures == 1) _errorDetail.value = diagnoseNoAccess()
                     if (readFailures >= MAX_READ_FAILURES) {
                         // 一个样本都没采到 = 录制**根本没跑起来**（典型：无 root / Shizuku 未运行）。
@@ -663,57 +766,76 @@ object FrameRecordController {
                         _fps.value = Double.NaN
                         diffPerLayer = emptyMap()
                     } else {
+                        if (_error.value == ERROR_NO_TARGET_APP) _error.value = null
                         // 逐图层差分取 max（假尖峰 / 转场叠加的治理见 [updateFpsFromDiff]）；
-                        // 返回 null（首拍建基线 / 图层全换）= 本拍无可差分，不产样本不更新读数
-                        val fpsValue = updateFpsFromDiff(stats, statsAt)
-                        if (fpsValue != null) {
+                        // 返回 null（首拍建基线 / 图层全换 / 守卫拒收）= 本拍无可差分
+                        val diff = updateFpsFromDiff(stats, statsAt)
+                        // 帧率采样点落库缓冲：基线重建 / 守卫拒收的拍也留行（fps=null →
+                        // 曲线断线、统计跳过），行网格均匀，索引制图的时间轴才不失真
+                        pendingFps.add(FrameFpsSampleEntity.from(statsAt, diff?.fps))
+                        if (diff != null) {
                             // 起始帧率 = 本场第一个有效采样值（只记一次），供悬浮窗作为对比基准
-                            if (_startFps.value.isNaN()) _startFps.value = fpsValue
-                            // 电量四项（电压 / 电流 / 功率 / 电池温度）与帧率**同频**（每秒一次）：
-                            // 要能和帧率逐秒对齐，才能回答"掉帧的那一刻是不是正好在发热 / 拉电流"。
-                            // 数据源 = 功率侧同一条取数链（root 机器 sysfs 节点、Shizuku 机器
-                            // BatteryManagerSource 实时电流，符号口径"正=充电"两页一致）——
-                            // 不再自采 dumpsys battery/thermalservice（后者在 22081212C 无 ibat，
-                            // 且符号未取反、单位靠启发式，见 FrameRateSource 的说明）
-                            val power = RootPowerReader.read()
-                            // 1s 样本的 CPU 字段 = 本拍窗口内快样的均值（250ms 快样聚合成
-                            // 与 Kite 每秒行对齐的口径；250ms 密集明细另有 pendingCpu 落库）
-                            val (cpuTotal, cpuCores, cpuMhzAvg) = aggregateCpuWindow(cpuFastFrom)
-                            pending += FrameSample(
-                                timeMillis = now,
-                                fps = fpsValue,
-                                frameSpaceMs = stats.frameSpaceMs,
-                                missedFrames = (stats.missedFrames - diffMissed).coerceAtLeast(0).toInt(),
-                                cpuMhz = cpuMhzAvg,
-                                cpuUsagePct = cpuTotal,
-                                cpuCoreUsagePct = cpuCores,
-                                currentMa = power?.currentMa,
-                                // RootPowerReader 返回 V/W，这里 ×1000 统一成毫口径落库
-                                // （mV/mW/mA 与 Kite CSV 表头同源，App 显示时 ÷1000 换回）
-                                voltageMv = power?.voltageV?.times(1_000.0),
-                                powerMw = power?.powerW?.times(1_000.0),
-                                tempBatteryC = power?.tempBatteryC,
-                                tempVirtualC = virtualTempC,
-                                gpuTempC = gpuTempC,
-                                // 容量 % 来自功率链的 SOC（0 = 上报缺失，按缺测处理，不画成 0）
-                                capacityPct = power?.socPct?.takeIf { it > 0 }?.toDouble(),
-                                gpuLoadPct = gpuLoadPct,
-                            )
+                            if (_startFps.value.isNaN()) _startFps.value = diff.fps
+                            // ΣΔF÷Σdt 累计器：1Hz 下本拍只有单窗，逐位等于直接差分；
+                            // 保留累计器结构，落库口径不随采样频率分叉
+                            accFrames += diff.frames
+                            accDtSec += diff.dtSec
                         }
-                        // ⚠️ 基线推进放在每拍结尾：目标为空 / 认领为 0 的分支已作废基线，
-                        //    这里照常推进成功拍的丢帧差分基线
-                        diffMissed = stats.missedFrames
                     }
                 }
-                // ⚠️ diffAt 记**快照时刻**（statsAt，readTimestats 返回处）而非拍首 now：
-                //    拍首到快照之间隔着本拍全部取数命令（GPU 占用 / timestats / 电量，
-                //    慢速拍还多跑刷新率 + 温度），各拍耗时相差几百 ms —— 按拍首差分，窗口
-                //    与真实呈现窗口错位，且随慢速轮询**周期性振荡**：慢速拍快照被推后 →
-                //    下一拍差分窗被压短 → 120Hz 实测掉到 ~95（2026-09-25 用户实测
-                //    「一堆 95Hz」）；反向拍窗口被拉长 → 差分超 refresh+1 被上限守卫拒收 →
-                //    周期性丢样本（同日反馈「数据很少」）。快照时刻的抖动只剩命令耗时的
-                //    波动（±几十 ms），差分窗口才与帧数增量真正对应。
+                // diffAt 记快照时刻而非拍首（理由见上），每完整拍推进一次
                 diffAt = statsAt
+
+                // 1s 落库样本：fps = 本拍差分（ΣΔF÷Σdt 在 1Hz 下即单窗直接差分）；
+                // frameSpace / 丢帧取本拍自己的快照。本拍通道失效（stats=null）或
+                // 目标未锁定时不产样本（同旧口径）
+                val fps1s = if (accDtSec > 0.0) accFrames / accDtSec else null
+                if (fps1s != null && stats != null && stats.totalFrames > 0L && sessionPkg.isNotEmpty()) {
+                    // 电量四项（电压 / 电流 / 功率 / 电池温度）与帧率**同频**（每秒一次）：
+                    // 要能和帧率逐秒对齐，才能回答"掉帧的那一刻是不是正好在发热 / 拉电流"。
+                    // 数据源 = 功率侧同一条取数链（root 机器 sysfs 节点、Shizuku 机器
+                    // BatteryManagerSource 实时电流，符号口径"正=充电"两页一致）——
+                    // 不再自采 dumpsys battery/thermalservice（后者在 22081212C 无 ibat，
+                    // 且符号未取反、单位靠启发式，见 FrameRateSource 的说明）
+                    val power = RootPowerReader.read()
+                    // 帧间隔 = 本拍与上一拍 presentToPresent 直方图的**差集**加权平均
+                    // （「当秒」帧时间）：累计口径是衰减收敛曲线，读不出当秒。无基线
+                    // （拍首）或直方图中途被清（statsd 拉 atom）→ 0.0，画图断线处理
+                    val frameSpace = p2pDeltaFrameSpace(stats.p2pHistogram, prevP2p)
+                    // 1s 样本的 CPU 字段 = 本拍窗口内快样的均值（250ms 快样聚合成
+                    // 与 Kite 每秒行对齐的口径；250ms 密集明细另有 pendingCpu 落库）
+                    val (cpuTotal, cpuCores, cpuMhzAvg) = aggregateCpuWindow(cpuFastFrom)
+                    pending += FrameSample(
+                        timeMillis = now,
+                        fps = fps1s,
+                        frameSpaceMs = frameSpace,
+                        missedFrames = (stats.missedFrames - diffMissed).coerceAtLeast(0).toInt(),
+                        cpuMhz = cpuMhzAvg,
+                        cpuUsagePct = cpuTotal,
+                        cpuCoreUsagePct = cpuCores,
+                        currentMa = power?.currentMa,
+                        // RootPowerReader 返回 V/W，这里 ×1000 统一成毫口径落库
+                        // （mV/mW/mA 与 Kite CSV 表头同源，App 显示时 ÷1000 换回）
+                        voltageMv = power?.voltageV?.times(1_000.0),
+                        powerMw = power?.powerW?.times(1_000.0),
+                        tempBatteryC = power?.tempBatteryC,
+                        tempVirtualC = virtualTempC,
+                        gpuTempC = gpuTempC,
+                        // 容量 % 来自功率链的 SOC（0 = 上报缺失，按缺测处理，不画成 0）
+                        capacityPct = power?.socPct?.takeIf { it > 0 }?.toDouble(),
+                        gpuLoadPct = gpuLoadPct,
+                    )
+                }
+                accFrames = 0L
+                accDtSec = 0.0
+                // 丢帧差分基线按完整拍推进（本拍自己的快照）：1s 样本的 missedFrames =
+                // 本拍相对上一拍的整段增量，jankCount 口径与旧实现一致。
+                // 帧间隔差分基线（直方图）同步推进 —— 无论本拍是否产出样本
+                if (stats != null) {
+                    diffMissed = stats.missedFrames
+                    prevP2p = stats.p2pHistogram
+                }
+
                 sessionEndWall = now
                 _elapsedMs.value = now - sessionStartWall
 
@@ -729,8 +851,9 @@ object FrameRecordController {
 
             tick++
             // 补偿式等待（子拍口径）：按"距下一个子拍还差多少"来等，快样的名义间隔才稳；
-            // 完整拍耗时超 250ms 时该子拍必然超时，只留 [MIN_SUB_TICK_MS] 防硬轮询 ——
-            // 此时拍周期整体拉长，但帧率差分用的是真实快照时间戳，读数不受影响
+            // 子拍全部取数（CPU 快样 + timestats）耗时超 250ms 时该子拍必然超时，只留
+            // [MIN_SUB_TICK_MS] 防硬轮询 —— 此时拍周期整体拉长，但帧率差分用的是真实
+            // 快照时间戳，读数不受影响
             val spent = System.currentTimeMillis() - cycleStart
             delay((SUB_TICK_MS - spent).coerceAtLeast(MIN_SUB_TICK_MS))
         }
@@ -803,8 +926,10 @@ object FrameRecordController {
             // 旧基线会让下一拍差分窗口错位、算出假尖峰）
             if (!coroutineContext.isActive) break
             // 刷新率慢速拍重读（读不到不清零）：预览的差分同样走物理上限守卫（updateFpsFromDiff），
-            // 没有这个值守卫不生效 —— 悬浮 tab 在预览态也会冒 1000+（用户报的场景正是预览）
-            if (tick % SLOW_POLL_EVERY == 0) {
+            // 没有这个值守卫不生效 —— 悬浮 tab 在预览态也会冒 1000+（用户报的场景正是预览）。
+            // ⚠️ 与前台应用轮询（tick%5==0）**错峰**到 tick%5==1：两项同拍会把该拍拖长数秒，
+            //    悬浮 tab 的更新节奏跟着卡顿（同录制循环的慢速项错峰）
+            if (tick % SLOW_POLL_EVERY == 1) {
                 FrameRateSource.readRefreshRateHz().takeIf { it > 0 }?.let { sessionRefreshHz = it }
             }
             if (sessionPkg != diffPkg) {
@@ -876,9 +1001,11 @@ object FrameRecordController {
         if (pending.isEmpty()) return
         try {
             val dao = FrameDatabase.getInstance(appContext).frameDao()
-            // ⚠️ 汇总前丢弃**高于刷新率**的不合理帧率（口径见 [FPS_CEILING_TOLERANCE]）：
-            // 60Hz 锁帧被按 61Hz 展示、差分窗口边界尖峰（refresh×T+1 帧的物理上限）都算在内，
-            // 超限值不参与 avg / min / max。
+            // ⚠️ avg / min 汇总前剔除**超刷新率+容差**的样本（上限 = 1s 窗物理上限
+            // refresh+1.0，口径沿革见 [FPS_CEILING_TOLERANCE]）：边界值本身合法、照常
+            // 参与（与 max 一致，不再系统性低估）；子拍守卫拦不住的漏网污染在此兜底。
+            // ⚠️ **max 例外**（2026-09-27 用户口径）：max 的语义是"实际记录到的最大帧率"，
+            // 全量样本取 max，不剔边界帧 —— 120Hz 屏录出 121 就显示 121（Scene / Kite 同口径）。
             // ⚠️ 只影响汇总数字，样本本体照常落库 —— 那一秒的功率 / 温度 / 丢帧数据仍要用于
             // 详情页与帧率的相关性分析，整条丢弃会在曲线上挖洞。
             // 刷新率未知（0，无法判定）或全部超限（刷新率上报异常）→ 退回全量：
@@ -887,6 +1014,11 @@ object FrameRecordController {
                 .filter { refreshHz <= 0 || it.fps <= refreshHz + FPS_CEILING_TOLERANCE }
                 .ifEmpty { pending }
                 .map { it.fps }
+            // MIN / 1% / 5% Low 的取值源：**帧率采样点表优先**（frame_fps_samples，
+            // 2026-09-27 差分回退 1Hz 后与 1s 样本同为 1Hz 粒度；保留独立来源是因两表
+            // 落库条件略有差异）。⚠️ fps=0 的点不计入（语义是"该拍没有合成帧"，不是
+            // "帧率掉到 0"，与 [lowFps] 的正样本口径一致）。
+            val lowSource = pendingFps.mapNotNull { it.fps }.filter { it > 0.0 }.ifEmpty { fpsValues }
             val session = FrameSession(
                 startTime = startWall,
                 endTime = endWall,
@@ -895,10 +1027,10 @@ object FrameRecordController {
                 refreshRateHz = refreshHz,
                 sampleCount = pending.size,
                 avgFps = fpsValues.average(),
-                minFps = fpsValues.min(),
-                maxFps = fpsValues.max(),
-                lowFps1 = lowFps(fpsValues, 0.01),
-                lowFps5 = lowFps(fpsValues, 0.05),
+                minFps = lowSource.min(),
+                maxFps = pending.maxOf { it.fps },
+                lowFps1 = lowFps(lowSource, 0.01),
+                lowFps5 = lowFps(lowSource, 0.05),
                 avgFrameSpaceMs = pending.map { it.frameSpaceMs }.average(),
                 jankCount = pending.sumOf { it.missedFrames },
             )
@@ -907,12 +1039,17 @@ object FrameRecordController {
             if (pendingCpu.isNotEmpty()) {
                 dao.insertCpuSamples(pendingCpu.map { it.copy(sessionId = id) })
             }
+            if (pendingFps.isNotEmpty()) {
+                dao.insertFpsSamples(pendingFps.map { it.copy(sessionId = id) })
+            }
             Log.i(
                 TAG,
-                "已保存帧率会话 id=$id，样本 ${pending.size} 条（CPU 快样 ${pendingCpu.size} 条），pkg=$pkg",
+                "已保存帧率会话 id=$id，样本 ${pending.size} 条（CPU 快样 ${pendingCpu.size}、" +
+                    "FPS 子拍 ${pendingFps.size}），pkg=$pkg",
             )
             pending.clear()
             pendingCpu.clear()
+            pendingFps.clear()
             FrameHistoryStore.refresh(appContext)
         } catch (e: Exception) {
             Log.e(TAG, "保存帧率会话失败", e)
