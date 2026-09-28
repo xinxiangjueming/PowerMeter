@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -37,7 +38,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
+import kotlinx.coroutines.delay
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import android.content.res.Configuration
@@ -121,12 +124,14 @@ val DialogGlassBorderDark = Color(0x33FFFFFF)
 const val DialogButtonWidthFraction = 0.8f
 
 /**
- * 弹窗外部 scrim 毛玻璃样式：25% 黑压暗底 + 20dp 模糊。模糊层自带压暗底色，替代原 scrim 的
- * 纯 background(Black@0.25f)，弹窗外部显示模糊的页面内容。
+ * 弹窗外部 scrim 毛玻璃样式：25% 黑压暗底 + 10dp 模糊（2026-09-28 framestats 取证后从 20dp
+ * 降档：Skia GL 的 RenderEffect 无结果缓存，弹窗卡片 300ms 动画期间 scrim 每帧重执行模糊，
+ * 20dp 实测 GPU 11-14ms/帧（120Hz 预算 8.3ms）＝动画期掉帧一半 + 首帧 GPU 12.8ms；半径
+ * 近似线性换 GPU 时间，10dp 预期 ~7ms 压回预算。压暗底不变，观感只轻一点）。
  */
 val DialogBlurStyle: HazeStyle = HazeStyle(
     backgroundColor = Color.Black.copy(alpha = 0.25f),   // 压暗 scrim（替代原 background）
-    blurRadius = 20.dp,
+    blurRadius = 10.dp,
     tint = null,
 )
 
@@ -185,6 +190,8 @@ class DialogEntry {
  * - miuix backdrop：backdrop 存在（API 33+）且弹窗活跃
  * - Haze source：弹窗活跃 且 API >= 31（低版本无 RenderEffect，回落压暗）
  * 必须挂在**非滚动容器**（页面根 Box）上；页面内容作为其子节点嵌套。
+ * （2026-09-28 曾试验常驻挂载治弹窗首帧卡顿——点击帧不再建层，但滚动/转场每帧多一次
+ * 整屏离屏拷贝、且与 scrim 延后模糊叠加后弹窗出现"闪一下"，已回退。）
  */
 fun Modifier.dialogBackdropSource(state: DialogBackdropState): Modifier =
     then(if (state.backdrop != null && state.openCount > 0)
@@ -212,6 +219,7 @@ fun Modifier.dialogBackdropSource(state: DialogBackdropState): Modifier =
 fun DialogBackdropHost(
     modifier: Modifier = Modifier.fillMaxSize(),
     onActiveChanged: (Boolean) -> Unit = {},
+    enableWarmup: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     val backdrop = rememberDialogBackdrop()
@@ -229,12 +237,75 @@ fun DialogBackdropHost(
             }
             // 浮层 slot：弹窗浮层在此渲染，与源 Box 兄弟（兄弟②）
             Box(Modifier.fillMaxSize()) {
+                if (enableWarmup) DialogPipelineWarmup()
                 // 用 entry 对象作 key（非索引）：索引 key(i) 在弹窗切换（如 选曲线→颜色面板
                 // 同帧替换，[A]→[B]）时，key(0) 组被 Compose 复用，新弹窗内容 lambda 被跳过不执行
                 // → 内容不显示。entry 引用稳定：同一弹窗重组保留状态，不同弹窗切换强制全新组合。
                 for (entry in state.entries) {
                     key(entry) { entry.content() }
                 }
+            }
+        }
+    }
+}
+
+/** 弹窗管线预热延迟：等页面首帧 + 数据加载/图表首绘稳定后再跑（再早会与启动忙期叠 GPU 尖峰） */
+private const val DialogWarmupDelayMs = 2000L
+
+/**
+ * 弹窗管线预热（治「弹窗出现卡一下」，试验性可整体 revert）：首次点弹窗的那一帧要现挂
+ * miuix/Haze 两个整屏离屏录制层并首次编译模糊 shader（AGSL RuntimeShader / RenderEffect），
+ * 首挂载开销全堆在点击帧 → 实测肉眼可见一顿。这里在页面空闲 ~2s 后，用一层 alpha 0.02
+ * （不可见、不挡触摸、不注册返回）的浮层按 GlassDialog 同款链路（挂源 → 全屏 Haze 模糊 →
+ * 玻璃卡 textureBlur + Highlight）完整跑 4 帧再卸载，把首挂载开销提前付掉；之后点弹窗走热路径。
+ * 预热窗口内点开真实弹窗 = 两层透明叠加互不影响；delay 期间已有弹窗活跃则跳过（首挂载
+ * 已被真弹窗付过）。API<31 无 RenderEffect，弹窗本就纯压暗+实心卡，无管线可预热不跑。
+ */
+@Composable
+private fun DialogPipelineWarmup() {
+    val state = LocalDialogBackdrop.current
+    if (state == null || !isHazeSupported) return
+    var warmupActive by remember { mutableStateOf(false) }
+    LaunchedEffect(state) {
+        delay(DialogWarmupDelayMs)
+        if (state.openCount > 0) return@LaunchedEffect
+        warmupActive = true
+        // 第1帧挂载建层（源录制层此时为空），第2帧起源已填充、scrim/玻璃卡真实执行模糊
+        //（shader 编译发生在这帧），再留2帧兜底慢机型/驱动延迟提交
+        repeat(4) { withFrameNanos { } }
+        warmupActive = false
+    }
+    if (warmupActive) {
+        DialogOverlay {
+            val isDark = isSystemInDarkTheme()
+            val shape = RoundedCornerShape(16.dp)
+            // 整层 2% alpha：任何底色上都不可见；graphicsLayer 先整层离屏再合成，
+            // 内部 RenderEffect/AGSL 照常执行（预热目的），且无 clickable/BackHandler 不拦交互
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { alpha = 0.02f },
+            ) {
+                // scrim 预热：全屏 20dp Haze 模糊（GlassDialog scrim 同款，去掉关闭点击）
+                Box(Modifier.fillMaxSize().dialogHazeEffect(state.hazeState))
+                // 玻璃卡预热：小卡触发 miuix textureBlur + Highlight 的 AGSL 首次编译
+                Box(
+                    Modifier
+                        .align(Alignment.Center)
+                        .size(72.dp)
+                        .dialogCardShadow()
+                        .clip(shape)
+                        .then(
+                            if (state.backdrop != null) Modifier.textureBlur(
+                                state.backdrop, shape,
+                                blurRadius = DialogGlassBlurRadius,
+                                highlight = if (isDark) DialogGlassHighlightDark
+                                else DialogGlassHighlightLight,
+                            )
+                            else Modifier
+                        )
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                )
             }
         }
     }
@@ -348,7 +419,10 @@ fun GlassDialog(
             ) {
                 title?.let {
                     it()
-                    if (text != null) Spacer(Modifier.height(16.dp))
+                    // 无正文形态（仅标题 + 按钮，如删除确认）标题与按钮栏之间也要有间距，
+                    // 否则直接贴上 —— SportLink WearDeviceArchiveDialog 口径 = 20dp；
+                    // 有正文时走 16dp（标题 → 正文，与正文 → 按钮栏一致）
+                    Spacer(Modifier.height(if (text != null) 16.dp else 20.dp))
                 }
                 text?.let { textContent ->
                     Column(
@@ -399,6 +473,8 @@ fun GlassDialog(
         // 主路径：同窗口浮层（与 BlurredAlertDialog 一致），居中
         DialogOverlay {
             BackHandler { onDismissRequest() }
+            // （2026-09-28 曾试验 scrim 模糊延后一帧治弹窗顿挫——压暗→模糊的一帧补变实测
+            // 肉眼可见"闪一下"，已回退为出现即全屏模糊。）
             Box(
                 modifier = Modifier
                     .fillMaxSize()
