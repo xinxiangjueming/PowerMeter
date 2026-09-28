@@ -214,13 +214,16 @@ fun PowerMeterScreen(
     val openTrendFullscreen: () -> Unit = {
         val act = context as? Activity
         if (act != null) {
-            // keepPageSnapshot = true（X 方案 2026-09-28）：整窗截图随 Handoff 带走供旋转
-            // 等待期垫底 —— 系统旋转期间屏幕上是主页像素跟着转（替代纯色一拍），横屏
-            // 落地后同一张截图按显示旋转转向，撑开/收拢窗口外露的也是"冻结主页"
+            // keepPageSnapshot = false（2026-09-28 三改）：趋势全屏页已改**半透明窗口主题**
+            // （Theme.PowerMeter.Transitions，与帧率详情页同源）→ 主页只 onPause 不停、
+            // 全程可见并实时跟随旋转/insets/主题，旋转等待期与收拢期间裁剪窗口外露出的
+            // 就是**真实主页**（实时、永不过期），不再需要整窗冻结截图；留着它反而有害
+            // —— 不透明整窗图会把底下的实时主页盖住，且 180° 翻转后快照不会重绘
+            // （PageSnapshotView 只在 overrideBitmap/showSolid 时 invalidate），旧方向的
+            // 避让像素会盖在正确的主页上。同时省下 ~18MB 峰值内存。
             val capture = AppTransitions.capture(
                 act.window.decorView,
                 pageBackgroundArgb,
-                keepPageSnapshot = true,
             )
             TrendFullscreenActivity.launch(act, metric, capture)
         }
@@ -847,6 +850,14 @@ internal fun TrendCard(
     // （滚动/换向自动跟随），由卡内 `< >` 胶囊的点击转发登记（FullscreenPillButton 的
     // anchorSource）。
     val cardSource = rememberContainerSource()
+    // 文字层（2026-09-28 三改，修"收拢回卡片后需闪一下才出现功率/电压这些 tab"）：
+    // 锚点本体走**纯色填充**（见 ClipRevealLayout.setAnchorSolidColor），收拢末段卡片
+    // 区域是一块纯色、没有任何内容，覆盖层移除后才补上真实卡片 = 用户看到的"闪一下"。
+    // 挂文字层后，卡片内全部内容（标题行 + 胶囊 + 指标 tab + 曲线）随窗口上边滑移落回，
+    // 口径与帧率列表卡 FrameMeterScreen.FrameSessionCard:629-630 完全一致。
+    // 挂在 padding(vertical = 16.dp) **之后**：modifier 链自外向内，onGloballyPositioned
+    // 报告的是内缩后的内容区矩形，不含卡片上下留白环。
+    val cardTextSource = rememberContainerTextSource(cardSource)
     AppCard(
         shape = shape,
         modifier = modifier.fillMaxWidth().containerSource(cardSource),
@@ -856,7 +867,8 @@ internal fun TrendCard(
         // 就被裁掉（2026-09-21 用户报告「裁切在卡片边框内部就开始了」）。
         // 口径同 SportLink：SegmentSection.kt:117-119「水平内边距移到非滚动内容内部，
         // 外层只留垂直 padding」；ChartSection.kt:117-119（padding 置于 horizontalScroll 之后）。
-        Column(Modifier.padding(vertical = 16.dp)) {
+        // textSource 挂在 padding 之后（见上方 cardTextSource）：矩形 = 内容区，不含留白环
+        Column(Modifier.padding(vertical = 16.dp).then(cardTextSource)) {
             // 标题行：「趋势」二字在整张卡片宽度内真正居中；两个胶囊置于右端
             // 口径对齐 SportLink 分段数据卡 SegmentSection.kt:139-172：
             // 标题 Text.align(Center) 占满整宽居中，按钮 Box.align(CenterEnd) 贴右，二者叠加不冲突

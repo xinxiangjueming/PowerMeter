@@ -59,15 +59,18 @@ fun PowerMeterTheme(
     LaunchedEffect(darkTheme) {
         if (appliedDark == darkTheme) return@LaunchedEffect
         if (!themeTransition) { appliedDark = darkTheme; return@LaunchedEffect }
-        // 后台错过的变化在 onResume 兜底补状态（requestSilent）→ 静默放行，不补播动画
-        // （2026-09-28：返回本页时应直接呈现目标主题，而非再播一遍圆孔动画）
+        // 静默标记：仅二级页退场交棒路径设置（MainActivity.applyExitHandoff）——返回源页
+        // 时首帧必须已是目标主题、不播动画。交棒场景下源页表面停留的旧主题帧是"闪回旧色"
+        // （用户刚在二级页看过目标主题），不是揭露动画的合理起点（2026-09-28）。
+        // 后台错过的系统深浅变化不走这里：2026-09-29 用户定案回前台照播揭露动画。
         if (ThemeTransition.consumeSilent()) { appliedDark = darkTheme; return@LaunchedEffect }
         // 已有快照在播（动画未播完又发生新切换）：直接放行，overlay 继续播
         if (ThemeTransition.snapshot != null) { appliedDark = darkTheme; return@LaunchedEffect }
-        // 宿主不在前台（被不透明二级页覆盖的源页走了 onStop，后台期间系统深浅变化分不到它，
-        // 状态只能等回前台才补）→ 直接放行：不截图、不播动画。否则用户会看到"返回瞬间按旧
-        // 主题画一帧 + 紧接着补播 800ms 圆孔"（2026-09-28 用户报）。判据见
-        // [ThemeTransition.isHostForeground]；前台切换不受影响（那时宿主必为 RESUMED）。
+        // 宿主未 RESUMED（被半透明二级页盖着、paused 但可见）：不截图、不播动画，直接
+        // 放行——用户此刻看的是二级页（它自己播揭露动画），底下的本页静默换装即可，
+        // 不双层各播一遍。回前台场景（从桌面/多任务/息屏返回）闸门在 onResume 之后的首帧
+        // 才触发，宿主必已 RESUMED → 走下方截图 + 圆孔揭露（2026-09-29 用户定案：后台
+        // 错过的变化回前台也播动画，不硬切）。
         val host = ThemeTransition.activityOf(view.context)
         if (host == null || !ThemeTransition.canAnimateFrom(host)) {
             appliedDark = darkTheme

@@ -68,6 +68,8 @@ data class FrameSampleEntity(
      * 电量类字段**可空**（对应 [FrameSample] 的同名可空字段）：
      * 通道取不到数（Shizuku 未绑定 / 无 su）的周期这几列为空，详情页显示破折号。
      * 列可空而不是填 0，是为了让「没采」与「采到 0」在库里可区分。
+     * ⚠️ currentMa / powerMw 为**绝对值口径**（2026-09-28，v6 迁移把历史负数行就地取
+     * abs 纠正；新数据在 FrameRecordController 采集侧已落正数）。
      */
     val currentMa: Double?,
     /** 电压 mV（RootPowerReader 的 V ×1000 落库，毫口径与 Kite CSV 同源，见 [FrameSample]） */
@@ -80,14 +82,25 @@ data class FrameSampleEntity(
     val gpuTempC: Double?,
     /** 电池容量 %（v7 起采集，来自功率链 socPct；通道不可用 / 旧会话为 null） */
     val capacityPct: Double?,
-    /** GPU 占用率 %（v8 起采集，kgsl gpu_busy_percentage；节点不可读 / 旧会话为 null） */
+    /** GPU 占用率 %（v8 起采集，kgsl gpubusy 的 busy/total；节点不可读 / 旧会话为 null） */
     val gpuLoadPct: Double?,
+    /** GPU 频率 MHz（2026-09-29 起，与 gpuLoadPct 同一条命令取回；本机 kgsl 被拦 / 旧会话为 null） */
+    val gpuFreqMhz: Double?,
+    /**
+     * 本秒帧间隔分布（presentToPresent 差集直方图，frame.db v5 起采集）。
+     * 序列化格式 `ms:count,ms:count`（桶按 ms 升序），如 `8:115,9:3`；
+     * null = 缺测（无差分基线 / 直方图中途被清 / 本秒无合成帧）/ 旧会话未采集。
+     * 存分布而不是只存 jank 计数：判定门槛（83/125ms、小卡顿倍数）留在 UI 层可调，
+     * 数据不随之作废。
+     */
+    val p2pHist: String?,
 ) {
     fun toFrameSample(): FrameSample = FrameSample(
         timeMillis = timeMillis,
         fps = fps,
         frameSpaceMs = frameSpaceMs,
         missedFrames = missedFrames,
+        p2pHist = parseHist(p2pHist),
         cpuMhz = listOf(cpu0Mhz, cpu1Mhz, cpu2Mhz, cpu3Mhz, cpu4Mhz, cpu5Mhz, cpu6Mhz, cpu7Mhz),
         cpuUsagePct = cpuUsagePct,
         cpuCoreUsagePct = listOf(
@@ -102,6 +115,7 @@ data class FrameSampleEntity(
         gpuTempC = gpuTempC,
         capacityPct = capacityPct,
         gpuLoadPct = gpuLoadPct,
+        gpuFreqMhz = gpuFreqMhz,
     )
 
     companion object {
@@ -114,6 +128,7 @@ data class FrameSampleEntity(
             fps = s.fps,
             frameSpaceMs = s.frameSpaceMs,
             missedFrames = s.missedFrames,
+            p2pHist = serializeHist(s.p2pHist),
             cpu0Mhz = s.cpuMhz.core(0),
             cpu1Mhz = s.cpuMhz.core(1),
             cpu2Mhz = s.cpuMhz.core(2),
@@ -136,9 +151,32 @@ data class FrameSampleEntity(
             powerMw = s.powerMw,
             tempBatteryC = s.tempBatteryC,
             tempVirtualC = s.tempVirtualC,
-            gpuTempC = s.gpuTempC,
-            capacityPct = s.capacityPct,
-            gpuLoadPct = s.gpuLoadPct,
-        )
+        gpuTempC = s.gpuTempC,
+        capacityPct = s.capacityPct,
+        gpuLoadPct = s.gpuLoadPct,
+        gpuFreqMhz = s.gpuFreqMhz,
+    )
+
+        /** 分布 → `ms:count,ms:count`（桶升序）；空 = null（缺测列） */
+        private fun serializeHist(hist: Map<Int, Long>): String? {
+            if (hist.isEmpty()) return null
+            return hist.entries.sortedBy { it.key }
+                .joinToString(",") { "${it.key}:${it.value}" }
+        }
+
+        /**
+         * `ms:count,ms:count` → 分布；null/空白/坏 token 容错跳过（格式演进不崩读取）。
+         * 坏行丢弃而不整列作废：一个 token 解析失败只少一个桶，不至于整秒断线。
+         */
+        private fun parseHist(raw: String?): Map<Int, Long> {
+            if (raw.isNullOrBlank()) return emptyMap()
+            val out = HashMap<Int, Long>()
+            for (token in raw.split(',')) {
+                val ms = token.substringBefore(':').trim().toIntOrNull() ?: continue
+                val cnt = token.substringAfter(':').trim().toLongOrNull() ?: continue
+                if (ms >= 0 && cnt > 0) out[ms] = cnt
+            }
+            return out
+        }
     }
 }

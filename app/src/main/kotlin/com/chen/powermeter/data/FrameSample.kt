@@ -27,6 +27,16 @@ data class FrameSample(
     val frameSpaceMs: Double,
     /** 该周期内丢失的帧数（timestats 的 missedFrames 增量） */
     val missedFrames: Int,
+    /**
+     * 本周期**帧间隔分布**（presentToPresent 直方图相邻快照差集，桶 = 整毫秒 → 帧数；
+     * frame.db v5 起采集）。详情页逐帧卡顿判定 / 卡顿率 / 稳帧指数的数据源 —— 1s 平均
+     * 帧时间会把单帧尖刺摊薄（2026-09-28 王者实测一整场 1s 均值 max=13.31ms，83ms
+     * 门槛的 jank 一场判不出一帧），逐帧口径必须用分布而不是均值。
+     *
+     * ⚠️ 空 = 缺测（无差分基线 / 直方图中途被清 / 本秒无合成帧），**不是**「没有卡顿」；
+     * 消费方按断线/跳过处理（同 [fps]=0 的语义约定）。旧会话（v5 前）整列缺省。
+     */
+    val p2pHist: Map<Int, Long> = emptyMap(),
     /** 8 个 CPU 核心的当前频率 MHz，按 cpu0..cpu7 顺序；核心数不足时补 0 */
     val cpuMhz: List<Double>,
     /**
@@ -37,8 +47,9 @@ data class FrameSample(
      */
     val cpuUsagePct: Double? = null,
     /**
-     * 电流 mA：正 = 充电，负 = 放电（与 [PowerSample] 同口径 —— 数据源同为
-     * [RootPowerReader]，root 机器 sysfs 与 Shizuku 机器 BatteryManagerSource 都已取反）。
+     * 电流 mA：**绝对值口径（2026-09-28 用户约定）**——只记大小、不记充放方向，库里与
+     * 顶部卡片都不出现负号；取数链 [RootPowerReader] 本身仍是"正=充电"（与 [PowerSample]
+     * 同口径），帧率侧在采集构造时就地取绝对值。
      *
      * ⚠️ **可空 = 该采样周期取数通道不可用**（Shizuku 未绑定且无 su 等）；
      * 空值在详情页显示为破折号，而不是谎报 0。
@@ -56,7 +67,8 @@ data class FrameSample(
      * 空值在详情页显示为破折号，而不是谎报 0。
      */
     val voltageMv: Double? = null,
-    /** 功率 mW（来源同 [voltageMv]：[RootPowerReader] 的 powerW ×1000；显示时 ÷1000 回 W） */
+    /** 功率 mW（来源同 [voltageMv]：[RootPowerReader] 的 powerW ×1000；显示时 ÷1000 回 W）。
+     *  绝对值口径同 [currentMa]（2026-09-28，库与卡片不出现负号） */
     val powerMw: Double? = null,
     val tempBatteryC: Double? = null,
     /** 虚拟温度（Kite 的 virTemp）：`thermal_zone*` 里 CPU 代表温感区的温度（5s 抽稀） */
@@ -72,12 +84,21 @@ data class FrameSample(
      */
     val capacityPct: Double? = null,
     /**
-     * GPU 占用率 %（FPS 卡右轴可切换的 GPU(%) 线，v8 起采集；kgsl gpu_busy_percentage）。
-     * ⚠️ 实机验证（24031PN0DC / HyperOS V816）：shell 对 /sys/class/kgsl **全目录拒绝**
-     * （SELinux，同 power_supply），本机 Shizuku 模式恒 null——该选项按数据自适应隐藏；
-     * root 机器或 kgsl 可读的 ROM 可采。可空 = 不可读 / 旧会话（断线处理）。
+     * GPU 占用率 %（FPS 卡右轴可切换的 GPU(%) 线，v8 起采集；kgsl gpubusy 的 busy/total，
+     * 候选池与厂商分叉见 FrameRateSource.readGpuLoadPct）。
+     * ⚠️ 实机定案（24031PN0DC / HyperOS V816，2026-09-28）：kgsl 目录里 gpu_busy_percentage
+     * 等被 SELinux 拦，但 **gpubusy 漏网可读**（Scene 同款通道）——本机 Shizuku 模式可采
+     * （09-27 的"恒 null 自动隐藏"结论据此修正）；节点全部不可读的机器仍恒 null。
+     * 可空 = 不可读 / 旧会话（断线处理）。
      */
     val gpuLoadPct: Double? = null,
+    /**
+     * GPU 频率 MHz（2026-09-29 加，FPS 卡右轴可切换的 GPU(MHz) 线；与 [gpuLoadPct]
+     * 同一条命令/直读取回，候选池与量级换算见 FrameRateSource.readGpuLoadFreq）。
+     * 可空 = 节点全被 SELinux 拦（本机 24031PN0DC 实测 kgsl/ged 全拦，恒 null 属预期）/
+     * 旧会话未采集（断线处理）。
+     */
+    val gpuFreqMhz: Double? = null,
     /**
      * CPU 逐核使用率 %（v9 起采集，/proc/stat 逐核行差分；下标 = 核心号 cpu0..）。
      * null = 该核本周期无有效差分（基线未建立 / 离线核）/ 旧会话未采集（断线处理）。

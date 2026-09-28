@@ -10,6 +10,8 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -23,6 +25,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -45,6 +48,7 @@ import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -64,9 +68,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
@@ -86,6 +92,8 @@ import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import com.chen.powermeter.R
+import com.chen.powermeter.data.FpsAlgorithm
+import com.chen.powermeter.data.FrameRateSource
 import com.chen.powermeter.data.db.FrameSession
 import com.chen.powermeter.service.FrameOverlayService
 import com.chen.powermeter.service.FrameRecordController
@@ -93,6 +101,7 @@ import com.chen.powermeter.ui.common.AppCard
 import com.chen.powermeter.ui.common.BlurTopBar
 import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.chen.powermeter.util.AppTransitions
+import com.chen.powermeter.util.Prefs
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import dev.chrisbanes.haze.HazeState
@@ -204,7 +213,13 @@ fun FrameMeterScreen(
                 .then(if (useKyantTopBar) Modifier.layerBackdrop(topBarBackdrop) else Modifier)
         ) {
             if (sessions.isEmpty()) {
-                FrameHistoryEmpty(topBarHeight = topBarHeight)
+                // 空态也要有采样源选择卡（第一场录制之前就得能选）；空态文案居中在
+                // 「顶栏 + 选择卡」以下的剩余区域（topBarHeight 已由上方 Spacer 占位）
+                Column(Modifier.fillMaxSize()) {
+                    Spacer(Modifier.height(topBarHeight))
+                    FpsSourceSelector(Modifier.padding(horizontal = 16.dp), cardShape)
+                    FrameHistoryEmpty(topBarHeight = 0.dp)
+                }
             } else {
                 // 横屏两列 / 竖屏单列共用同一套 LazyVerticalGrid：列数按方向切换，
                 // item key 保持条目身份，旋转不打断滚动位置。
@@ -225,6 +240,10 @@ fun FrameMeterScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
+                    // 帧率采样源选择卡（2026-09-29）：跨整行置顶，切算法即时生效
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        FpsSourceSelector(shape = cardShape)
+                    }
                     items(items = sessions, key = { it.id }) { session ->
                         FrameSessionEntry(
                             session = session,
@@ -451,6 +470,119 @@ private fun FrameFabIcon(overlayVisible: Boolean) {
  * **3.6:1**，比原来还高一档 —— FAB 里是白色 + / × 图标，不会糊。
  */
 private val ColorFabBlue = Color(0xFF3482FF)
+
+/**
+ * 帧率采样源选择卡（2026-09-29 加，对标 Metric 的 realtime_fps_algorithm 设置）：
+ * 三选一（Timestats 累计差分 / SF Latency 帧时间戳 / TaskFps 系统直推），点击即写
+ * [Prefs.setFpsAlgorithm]，采集循环下一拍生效（切换拍自动作废旧算法的差分基线）。
+ * 本机不可用的选项压暗 + 文案标注「自动回落」：SF Latency 已被存活探测判死、
+ * TaskFps 缺 Shizuku v3 UserService（或系统 < Android 11）时实际仍走 Timestats。
+ * ⚠️ 点击反馈 = 选中态变色（miuix 蓝，同 [ColorFabBlue] 的取证口径），无水波纹
+ * （全应用 2026-09-25 起的去波纹口径）。
+ * ⚠️ 切换时说明文案长短不一会让卡片高度跳变（2026-09-29 用户反馈）——内容列挂
+ * [animateContentSize] 衔接高度，文案本身走 [AnimatedContent] 交叉淡变。
+ */
+@Composable
+private fun FpsSourceSelector(modifier: Modifier = Modifier, shape: Shape) {
+    val context = LocalContext.current
+    var selected by remember { mutableStateOf(FpsAlgorithm.fromKey(Prefs.getFpsAlgorithm(context))) }
+    // 可用性在组合期快照即可：判死/绑定状态在一次停留内变化时下一拍也会自动回落，不误导
+    val latencyDead = remember { FrameRateSource.isLatencyDead() }
+    val taskSupported = remember { FrameRateSource.isTaskFpsSupported() }
+    val entries = listOf(
+        Triple(FpsAlgorithm.TIMESTATS, stringResource(R.string.frame_source_timestats), true),
+        Triple(FpsAlgorithm.SF_LATENCY, stringResource(R.string.frame_source_latency), !latencyDead),
+        Triple(FpsAlgorithm.TASK_FPS, stringResource(R.string.frame_source_taskfps), taskSupported),
+    )
+    val desc = when (selected) {
+        FpsAlgorithm.TIMESTATS -> stringResource(R.string.frame_source_desc_timestats)
+        FpsAlgorithm.SF_LATENCY ->
+            stringResource(R.string.frame_source_desc_latency) +
+                if (latencyDead) " · " + stringResource(R.string.frame_source_fallback) else ""
+        FpsAlgorithm.TASK_FPS ->
+            stringResource(R.string.frame_source_desc_taskfps) +
+                if (!taskSupported) " · " + stringResource(R.string.frame_source_fallback) else ""
+    }
+    AppCard(modifier = modifier.fillMaxWidth(), shape = shape) {
+        // animateContentSize：三段说明文案行数不同（sf_latency/task_fps 还可能拼上
+        // 「自动回落」后缀换行），不挂它，点一下卡片高度就硬跳一档
+        Column(
+            Modifier
+                .padding(horizontal = 16.dp, vertical = 14.dp)
+                .animateContentSize(animationSpec = tween(200, easing = FastOutSlowInEasing)),
+        ) {
+            Text(
+                stringResource(R.string.frame_source_title),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                entries.forEach { (algo, label, available) ->
+                    FpsSourceChip(
+                        label = label,
+                        selected = selected == algo,
+                        dimmed = !available,
+                        onClick = {
+                            selected = algo
+                            Prefs.setFpsAlgorithm(context, algo.key)
+                        },
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            // AnimatedContent：文案随选中项交叉淡变（只改 text 会在同一帧硬切换）
+            AnimatedContent(
+                targetState = desc,
+                transitionSpec = { (fadeIn(tween(150)) togetherWith fadeOut(tween(150))) },
+                label = "fpsSourceDesc",
+            ) { text ->
+                Text(
+                    text,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** 采样源胶囊：选中 = miuix 蓝（light 0xFF3482FF / dark 0xFF277AF7，口径同 ColorFabBlue），白字 */
+@Composable
+private fun FpsSourceChip(
+    label: String,
+    selected: Boolean,
+    dimmed: Boolean,
+    onClick: () -> Unit,
+) {
+    val isDark = isSystemInDarkTheme()
+    val bg by animateColorAsState(
+        targetValue = when {
+            selected -> if (isDark) Color(0xFF277AF7) else Color(0xFF3482FF)
+            else -> MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f)
+        },
+        animationSpec = tween(200, easing = FastOutSlowInEasing),
+        label = "fpsSourceChipBg",
+    )
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(50))
+            .background(bg)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { onClick() }
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.alpha(if (dimmed) 0.45f else 1f),
+        )
+    }
+}
 
 @Composable
 private fun FrameHistoryEmpty(topBarHeight: Dp) {

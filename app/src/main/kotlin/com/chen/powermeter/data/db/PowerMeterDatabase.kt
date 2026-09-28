@@ -209,7 +209,8 @@ abstract class PowerMeterDatabase : RoomDatabase() {
         }
 
         /**
-         * v7 → v8：`frame_samples` 新增 GPU 占用率列（2026-09-25，kgsl gpu_busy_percentage）。
+         * v7 → v8：`frame_samples` 新增 GPU 占用率列（2026-09-25；采集源现走 kgsl gpubusy
+         * 的 busy/total，候选池见 FrameRateSource.readGpuLoadPct）。
          * （历史条目，理由同 [MIGRATION_1_2]。）
          */
         private val MIGRATION_7_8 = object : Migration(7, 8) {

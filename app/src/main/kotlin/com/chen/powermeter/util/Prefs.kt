@@ -10,6 +10,7 @@ object Prefs {
     private const val KEY_CHARGE_MONITOR = "charge_monitor"
     private const val KEY_SERIES_DUAL_BATTERY = "series_dual_battery"
     private const val KEY_MONITOR_MODE = "monitor_mode"
+    private const val KEY_FPS_ALGORITHM = "fps_algorithm"
 
     /** 曲线自定义颜色（ARGB Int），按指标名分键存储 */
     private const val KEY_METRIC_COLOR_PREFIX = "metric_color_"
@@ -84,6 +85,21 @@ object Prefs {
     fun setMonitorMode(context: Context, mode: String) {
         context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
             .edit().putString(KEY_MONITOR_MODE, mode).apply()
+    }
+
+    /**
+     * 帧率**采样源**（[com.chen.powermeter.data.FpsAlgorithm.key]）：实时帧率从哪条路径取数。
+     * 存字符串口径同 [getMonitorMode]（枚举序号会漂移）；未知 key 回落 timestats。
+     * 默认 timestats —— 老用户升级后行为不变；SF_LATENCY / TASK_FPS 在不支持的机器上由
+     * 采集循环自动回落（回落不改写本设置，用户换机/ROM 更新后选择仍有效）。
+     */
+    fun getFpsAlgorithm(context: Context): String =
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .getString(KEY_FPS_ALGORITHM, "timestats") ?: "timestats"
+
+    fun setFpsAlgorithm(context: Context, key: String) {
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_FPS_ALGORITHM, key).apply()
     }
 
     /**

@@ -497,12 +497,20 @@ class MainActivity : ComponentActivity() {
         // 交棒在这里也要消费：半透明二级页路径下本页不 onStop → onStart 不执行（见 applyExitHandoff）
         applyExitHandoff()
         // 后台切换深浅兜底（configChanges 含 uiMode 的已知坑：后台时 ViewRootImpl 不分发
-        // 配置，Compose 不跟随）——回前台读 Resources 最新值；走**静默通道**：这类错过的
-        // 变化应立即呈现目标主题、不补播圆孔动画（2026-09-28 用户报"返回列表后颜色还是
-        // 切换前的、要等补播动画才变"）
+        // 配置，Compose 不跟随）——回前台读 Resources 最新值。
+        // 不再静默（2026-09-29 用户定案，推翻 2026-09-28 的静默决策"返回直接呈现目标主题
+        // 不补播"）：后台错过的变化回前台**要播圆孔揭露动画**。回前台瞬间窗口表面还是
+        // 离开前的旧主题帧 = 揭露动画的起点画面；状态在这里落地，闸门在 onResume 之后
+        // 的首帧触发（宿主必已 RESUMED，见 Theme.kt canAnimateFrom）→ 播动画而非硬切。
+        // 当年"颜色还是切换前的、要等补播动画才变"的观感根因是主题落地**晚**（配置分发
+        // 迟到后闸门才补），不是动画本身；现在落地发生在 onResume 即时、揭露立刻开播，
+        // 旧主题只是动画的起点帧，不再有"停在旧色"的空窗。
         val night = isNightMode()
         if (darkThemeState.value != night) {
-            ThemeTransition.requestSilent()
+            // 系统栏图标色跟到目标主题：错过的变化可能没有任何配置回调送达（后台时
+            // ViewRootImpl 不分发），不在这里重放的话揭露播完后图标色仍停在旧主题
+            // （对齐 FrameDetailActivity.onResume 的做法）
+            NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !night)
             darkThemeState.value = night
         }
         // 用户可能刚在 Shizuku 里完成授权，或重启过 Shizuku 服务；回到前台重新探测一次
@@ -521,9 +529,11 @@ class MainActivity : ComponentActivity() {
         val dark = (newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
         if (darkThemeState.value != dark) {
-            // 送达时本页还没 onStart（= 后台期间错过的变化，随返回事务补发）→ 静默落地，
-            // 不补播圆孔动画。判据与实测时序见 ThemeTransition.isHostForeground
-            if (!ThemeTransition.isHostForeground(this)) ThemeTransition.requestSilent()
+            // 送达时本页可能还没 onStart（后台期间错过的变化随返回事务补发）：不在这里
+            // 判静默（2026-09-29 用户定案：后台错过的变化回前台也要播揭露动画）——状态
+            // 落地后由 PowerMeterTheme 闸门在首帧判定：宿主已 RESUMED（从桌面/多任务
+            // 返回，闸门晚于 onResume）→ 播圆孔揭露；仍被半透明二级页盖着（paused 但
+            // 可见，用户看的是二级页）→ 闸门静默落地，不双层各播一遍动画
             darkThemeState.value = dark
         }
         NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())

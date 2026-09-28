@@ -220,7 +220,13 @@ object ShizukuHelper {
                                 .daemon(false)
                                 .processNameSuffix("shell")
                                 .debuggable(true)
-                                .version(1),
+                                // ⚠️ v2（2026-09-29）：IShellService 加 readCpuFastSample/readGpuLoad/
+                                // readThermalTemps 三个直读方法。version 变更 = Shizuku 杀掉旧
+                                // UserService、按新接口重绑；切换瞬间旧调用返回 null，采样循环
+                                // 自动回退 exec 通道，下一拍恢复正常。
+                                // ⚠️ v3（2026-09-29）：加 registerTaskFps/readTaskFps/unregisterTaskFps
+                                // （系统 TaskFpsCallback 桥）+ readGpuLoad 输出追加 freq 行。
+                                .version(3),
                             connection,
                         )
                         // 等待绑定结果（onServiceConnected 会置 _serviceBound=true），最长 ~2.5s
@@ -272,6 +278,81 @@ object ShizukuHelper {
             Log.e(TAG, "exec exception: ${e.message}")
             null
         }
+    }
+
+    /**
+     * 直读取数入口（2026-09-29 加，采样循环去 fork）：调用 UserService 进程内的
+     * java.io 文件读取（uid 2000 与 awk 同权限、零进程创建），返回值与对应 awk 命令
+     * 的输出逐行同构。服务未绑定 / 旧版本 / 异常（含旧 UserService 没有新方法）返回
+     * null —— 调用方回退 [execSync] 通道。空串是合法结果（节点全不可读 = 无数据）。
+     */
+    private fun callDirect(source: String, block: (IShellService) -> String): String? {
+        val svc = shellService
+        if (svc == null) {
+            if (_available.value && _granted.value) helperScope.launch { bindServiceWithRetry() }
+            return null
+        }
+        return try {
+            val output = block(svc)
+            if (output.startsWith("ERROR:")) {
+                Log.w(TAG, "$source non-zero: ${output.take(200)}")
+                null
+            } else {
+                output
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "$source exception: ${e.message}")
+            null
+        }
+    }
+
+    /** /proc/stat cpu 行 + 逐核频率（替代 CPU_FAST_CMD 的 exec） */
+    fun readCpuFastSampleDirect(): String? = callDirect("readCpuFastSample") { it.readCpuFastSample() }
+
+    /** GPU 占用率候选探测（替代 GPU_LOAD_CMD 的 exec） */
+    fun readGpuLoadDirect(): String? = callDirect("readGpuLoad") { it.readGpuLoad() }
+
+    /** 温感区配对行（替代 VIRTUAL_TEMP_CMD 的 exec） */
+    fun readThermalTempsDirect(): String? = callDirect("readThermalTemps") { it.readThermalTemps() }
+
+    // ── 系统 TaskFpsCallback 桥（2026-09-29，v3）────────────────────────
+
+    /**
+     * 注册前台任务的系统 FPS 回调（目标切换时重复调用即重注册）。
+     * 返回 Triple(ok, taskId, errorMessage)：ok=false 时 taskId=-1、errorMessage 带 "ERROR:" 后文
+     * （"-2:no-task" = 目标任务还没到前台，调用方下一拍重试；其余 = 算法不可用，回落 timestats）。
+     */
+    fun registerTaskFps(packageName: String): Triple<Boolean, Int, String?> {
+        val svc = shellService ?: return Triple(false, -1, "shizuku-not-bound")
+        return try {
+            val out = svc.registerTaskFps(packageName)
+            if (out.startsWith("ok ")) {
+                Triple(true, out.substringAfter(' ').toIntOrNull() ?: -1, null)
+            } else {
+                Triple(false, -1, out)
+            }
+        } catch (e: Exception) {
+            // 旧版 UserService（v2-）没有该方法也会走这里
+            Triple(false, -1, "exception:${e.message}")
+        }
+    }
+
+    fun unregisterTaskFps() {
+        runCatching { shellService?.unregisterTaskFps() }
+    }
+
+    /**
+     * 最近一次系统 FPS 推送：`"<fps> <atMillis>"`（解析出 (fps, atMs)）；
+     * 空串/未绑定/旧版 UserService → null（尚无推送 ≠ 失败，调用方按"本拍无新推送"处理）。
+     */
+    fun readTaskFpsDirect(): Pair<Float, Long>? {
+        val out = callDirect("readTaskFps") { it.readTaskFps() } ?: return null
+        val trimmed = out.trim()
+        if (trimmed.isEmpty()) return null
+        val parts = trimmed.split(Regex("\\s+"))
+        val fps = parts.getOrNull(0)?.toFloatOrNull() ?: return null
+        val at = parts.getOrNull(1)?.toLongOrNull() ?: return null
+        return fps to at
     }
 
     // ---- 监听器 ----

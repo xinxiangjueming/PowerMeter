@@ -57,7 +57,9 @@
 
     <!--
         容器变换子页专用主题（2026-09-28，对齐 SportLink 的 Theme.SportLink.Transitions）：
-        **只挂在"进场侧滑 + 退场收拢回卡片"这类二级页上**（当前 = 帧率详情页）。
+        **挂在一镜到底的二级页上** —— 当前两个使用方：帧率详情页 FrameDetailActivity
+        （进场侧滑 + 退场收拢回卡片）、趋势全屏页 TrendFullscreenActivity（跨方向一镜到底，
+        2026-09-28 三改加入：收拢期间裁剪窗口外直接露出实时主页）。
 
         windowIsTranslucent + 透明底 ⇒ 源页（帧率列表）只 onPause、**不停** → 它全程可见、
         跟着系统深浅实时重绘。这修的是「收拢结束后闪一下之前的颜色」（2026-09-28 用户报）：
@@ -66,6 +68,13 @@
         只能是源页上一次画的那张旧主题帧。
         副作用（与 SportLink 同观感）：进场侧滑期间能看到底下的列表；收拢期间裁剪窗口外
         直接露出**真实列表**（因此源页不再需要整窗冻结截图，见 FrameMeterScreen）。
+
+        ⚠️ 趋势全屏页用它还有第二层原因（2026-09-28 三改）：该页锁横屏（SENSOR_LANDSCAPE），
+        而源页是主页。**不透明窗口会让被覆盖的 MainActivity 真 onStop** —— 主页在 stopped
+        期间既收不到 180° 翻转的配置分发（Android 12+ 的 landscape↔reverseLandscape 不回调
+        onConfigurationChanged），也不接收新 insets（挖孔侧别变化），返回后首帧只能沿用旧
+        方向的避让布局，随后才"突然避开"（用户实测）。半透明后主页只 onPause、全程可见并
+        实时跟随旋转与 insets 重排，该类问题从根上不成立。
 
         ⚠️ 只写在 values/：parent Theme.PowerMeter 在 values-night 有深色变体，子样式
         不重复声明 parent 即可自动随昼夜切换（与上面 ActivitySlideWindowAnimation 的

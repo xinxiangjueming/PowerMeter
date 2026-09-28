@@ -15,13 +15,16 @@ import androidx.room.RoomDatabase
  *   结构变更直接升版本、整库重建 —— v2（2026-09-25）新增 CPU 快样表
  *   frame_cpu_samples（250ms 级，详情页 CPU 两卡的密集数据源，见
  *   [FrameCpuSampleEntity]），装机后帧率历史清空一次；
- * - [fallbackToDestructiveMigration] 兜住开发期的每次结构变更与版本重置
+ *   ⚠️ 2026-09-27 起口径收紧：正装机对比场次的历史数据不能清，结构变更改走**真实
+ *   迁移**（v2→v3 fps 子拍表、v3→v4 索引修复、v4→v5 p2pHist 列），破坏性兜底只接
+ *   意外版本跳变；
+ * - [fallbackToDestructiveMigration] 兜住开发期的意外版本跳变
  *   （帧率数据可弃，整库重建）；
  * - 功率侧的 powermeter.db 走自己的版本链，永不因帧率的改动被触碰。
  */
 @Database(
     entities = [FrameSession::class, FrameSampleEntity::class, FrameCpuSampleEntity::class, FrameFpsSampleEntity::class],
-    version = 4,
+    version = 7,
     exportSchema = false
 )
 abstract class FrameDatabase : RoomDatabase() {
@@ -79,6 +82,65 @@ abstract class FrameDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v4 → v5（2026-09-28）：frame_samples 加 `p2pHist` 列 —— 本秒**帧间隔分布**
+         * （presentToPresent 差集直方图的序列化，`ms:count,ms:count`，见
+         * [FrameSampleEntity.p2pHist]）。逐帧卡顿判定 / 卡顿率 / 稳帧指数的数据源。
+         *
+         * ⚠️ 动机 = 详情页 Jank 卡三档全零（用户报障）：旧口径把 PerfDog 的 **单帧**
+         * 83/125ms 绝对门槛套在 **1s 平均帧时间**上 —— 门槛数值没随聚合粒度换算，
+         * "整秒均值 > 83ms" 意味着该秒平均帧率 < 12fps，正常录制永不触发。2026-09-28
+         * 王者实测一整场 1s 均值 max=13.31ms（门槛的 16%），三档全零，而同场 FPS 最低
+         * 62.8、累计 vsync 缺口 ~2257 帧 —— 掉帧真实发生、判定粒度错配。分布落库后
+         * 门槛回到**单帧**口径（判定在 UI 层，见 FrameDetailActivity 的逐帧卡顿判定）。
+         *
+         * 真实迁移（同 2→3 的教训：DDL 必须与实体生成的期望 schema 逐字符核对，
+         * 可空列 = `TEXT` 不带 NOT NULL；装机后旧会话该列为 null，UI 走旧口径回退）。
+         */
+        private val MIGRATION_4_5 = object : androidx.room.migration.Migration(4, 5) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `frame_samples` ADD COLUMN `p2pHist` TEXT")
+            }
+        }
+
+        /**
+         * v5 → v6（2026-09-28）：电流 / 功率两列改**绝对值口径**（用户口径：库与顶部卡片
+         * 不出现负号）。历史行按旧"正=充电"符号落库，放电为负 —— 迁移就地把负数行取
+         * abs 纠正成正数；新数据在采集侧（FrameRecordController）已直接落正数，本条
+         * 只管旧数据。纯数据 UPDATE、不动 schema，Room 只校验结构所以安全；
+         * 电压 / 温度等其余列无符号问题，不动。
+         */
+        private val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    "UPDATE `frame_samples` SET `currentMa` = abs(`currentMa`) " +
+                        "WHERE `currentMa` IS NOT NULL"
+                )
+                db.execSQL(
+                    "UPDATE `frame_samples` SET `powerMw` = abs(`powerMw`) " +
+                        "WHERE `powerMw` IS NOT NULL"
+                )
+            }
+        }
+
+        /**
+         * v6 → v7（2026-09-29）：① frame_samples 加 `gpuFreqMhz` 列（GPU 频率 MHz，与
+         * gpuLoadPct 同一条命令取回，2026-09-29 加的第三条可选数据线，见
+         * FrameRateSource.readGpuLoadFreq）；② frame_sessions 加 `fpsSource` 列
+         * （本场生效的帧率采样源 sf_latency / task_fps / timestats，帧间隔口径的依据，
+         * 见 FrameSession.fpsSource 与 FpsAlgorithm）。
+         *
+         * 真实迁移（装机对比批次的历史不能清）：可空列不带 NOT NULL，ALTER TABLE
+         * ADD COLUMN；旧会话两列为 null，UI 走缺测/回退口径。DDL 与实体生成 schema
+         * 的逐字符核对记录在编译后核对 FrameDatabase_Impl.kt（批次三十七的教训）。
+         */
+        private val MIGRATION_6_7 = object : androidx.room.migration.Migration(6, 7) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `frame_samples` ADD COLUMN `gpuFreqMhz` REAL")
+                db.execSQL("ALTER TABLE `frame_sessions` ADD COLUMN `fpsSource` TEXT")
+            }
+        }
+
         fun getInstance(context: Context): FrameDatabase =
             INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -86,7 +148,7 @@ abstract class FrameDatabase : RoomDatabase() {
                     FrameDatabase::class.java,
                     "frame.db"
                 )
-                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { INSTANCE = it }

@@ -1,8 +1,10 @@
 package com.chen.powermeter.data
 
+import android.os.Build
 import android.util.Log
 import com.chen.powermeter.util.ShizukuHelper
 import java.util.Locale
+import kotlin.math.roundToInt
 
 private const val TAG = "FrameRateSource"
 
@@ -63,7 +65,7 @@ object FrameRateSource {
          * 全局 presentToPresent 直方图（桶 = 整毫秒 → 帧数；**自 -clear 起累计**）。
          * ⚠️ 上层对相邻快照做**直方图差分**才得到「当秒」帧间隔 —— 累计值是一条衰减收敛
          * 曲线（开局加载的大间隔被逐渐稀释），既读不出当秒、也判不了短谷真假
-         * （2026-09-27 帧时间卡改差分口径的根由，见 FrameRecordController.p2pDeltaFrameSpace）。
+         * （2026-09-27 帧时间卡改差分口径的根由，见 FrameRecordController.p2pDeltaHistogram）。
          */
         val p2pHistogram: Map<Int, Long> = emptyMap(),
     )
@@ -178,10 +180,19 @@ object FrameRateSource {
     fun readTimestats(pkg: String): Timestats? {
         ensureTimestatsReady()
         var out = exec(timestatsDumpCmd(pkg))?.takeIf { it.isNotBlank() }
-            ?: exec("dumpsys SurfaceFlinger --timestats -enable", allowBlank = true)
+        if (out == null && !timestatsMaxLayersDead) {
+            // 裸命令失败（Shizuku 瞬断，或 ROM 无视 -maxlayers 把全量 dump 灌爆 binder
+            // 事务——异常形态返回 null，探测不到 usage 文本）→ 立即用 awk 收窄版重试；
+            // 收窄版能出数 = 通道活着而 maxlayers 有问题，直接拉黑（代价只是退回旧管道）
+            out = exec(timestatsFullDumpCmd(pkg))?.takeIf { it.isNotBlank() }
+            if (out != null) timestatsMaxLayersDead = true
+        }
+        if (out == null) {
+            out = exec("dumpsys SurfaceFlinger --timestats -enable", allowBlank = true)
                 .let { exec(timestatsDumpCmd(pkg)) }
                 ?.takeIf { it.isNotBlank() }
             ?: return null
+        }
         if (!timestatsMaxLayersDead && !out.contains("totalFrames")) {
             timestatsMaxLayersDead = true
             out = exec(timestatsDumpCmd(pkg))?.takeIf { it.isNotBlank() } ?: return null
@@ -250,13 +261,26 @@ object FrameRateSource {
     private var timestatsMaxLayersDead = false
 
     private fun timestatsDumpCmd(pkg: String): String {
-        val needle = pkg.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }
-        val dumpArgs = if (timestatsMaxLayersDead) {
-            "--timestats -dump"
-        } else {
-            "--timestats -dump -maxlayers $TIMESTATS_MAX_LAYERS"
+        if (!timestatsMaxLayersDead) {
+            // ⚠️ 裸命令（2026-09-29 去 awk）：-maxlayers 8 下 SF 侧只拼全局段 + 8 图层段
+            //（几 KB，远够不着 binder 事务上限），不再需要 shell 层收窄 —— 省掉管道里的
+            // awk（每拍 1 fork），输出直接回主进程由 [parseTimestats]/[parseP2pHistogram]
+            // 解析。两个解析函数本来就按原始格式写正则（awk 只是预收窄），逐图层段仅 8 个、
+            // 行距守卫照常生效；全局 presentToPresent 直方图之后的收口逻辑见
+            // parseP2pHistogram（非 "=" 行闭合，逐图层 present2present 不互含）。
+            return "dumpsys SurfaceFlinger --timestats -dump -maxlayers $TIMESTATS_MAX_LAYERS 2>/dev/null"
         }
-        return "dumpsys SurfaceFlinger $dumpArgs 2>/dev/null | awk -v pkg='$needle' '" +
+        return timestatsFullDumpCmd(pkg)
+    }
+
+    /**
+     * 全量 dump 的 awk 收窄版（[timestatsDumpCmd] 的 ROM 不认 `-maxlayers` / 裸命令异常
+     * 时的回退）：管道尾接 awk 只保留全局段 + 目标图层段字段行（~2KB），整份 ~1.23MB
+     * 的输出跨 binder 的 UTF-16 回传会超 ~1MB 事务上限。
+     */
+    private fun timestatsFullDumpCmd(pkg: String): String {
+        val needle = pkg.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }
+        return "dumpsys SurfaceFlinger --timestats -dump 2>/dev/null | awk -v pkg='$needle' '" +
             "BEGIN{havePkg=(pkg!=\"\")} " +
             "/layerName/{inLayer=1; keep=(havePkg && index(\$0,pkg)>0)} " +
             "keep && /layerName|totalFrames|droppedFrames|missedFrames/{print;next} " +
@@ -443,11 +467,18 @@ object FrameRateSource {
      * ⚠️ 整份输出拿回来、本地解析：只有几 KB，远够不着 binder 上限
      * （[readTopPackage] 的教训是"大输出必须在 shell 层收窄"，不是"一律禁止整份回传"）。
      *
-     * ⚠️ 必须在后台线程调用（内部起进程）。
+     * ⚠️ 必须在后台线程调用（直读 = 同步 binder + 文件 IO；回退 exec 时内部起进程）。
      */
     fun readCpuFastSample(): CpuFastSample? {
-        // awk 单进程版优先；个别 ROM 裁剪 awk 时退回逐核 shell 循环（见 CPU_FAST_CMD 注释）
-        val out = exec(CPU_FAST_CMD) ?: exec(CPU_FAST_CMD_LEGACY) ?: return null
+        // ⚠️ 直读优先（2026-09-29）：UserService 进程内 java.io 读 /proc/stat + 逐核频率，
+        // 零 fork —— CPU 快样每 250ms 子拍一次，是采样循环里最高频的 exec，fork 成本
+        // （满载 100~200ms）曾把 1s 拍拖到 1.35s。直读输出与 CPU_FAST_CMD 的 awk 输出
+        // 逐行同构，解析零改动。直读不可用（未绑定 / 旧版 UserService / 异常）回退
+        // awk 单进程版；个别 ROM 裁剪 awk 时再退逐核 shell 循环（见 CPU_FAST_CMD 注释）。
+        val out = ShizukuHelper.readCpuFastSampleDirect()
+            ?: exec(CPU_FAST_CMD)
+            ?: exec(CPU_FAST_CMD_LEGACY)
+            ?: return null
         var totalNow: Pair<Long, Long>? = null
         val coresNow = HashMap<Int, Pair<Long, Long>>()
         val mhzNow = ArrayList<Double?>(8)
@@ -636,11 +667,13 @@ object FrameRateSource {
      * - null = 该侧读不到（命令失败 / 一个区段都没解析到），调用方沿用上一次的值；
      *   ROM 裁剪 awk 时自动退回 legacy 逐区循环（见 [VIRTUAL_TEMP_CMD_LEGACY]）。
      *
-     * ⚠️ 必须在后台线程调用（内部起进程）。
+     * ⚠️ 必须在后台线程调用（直读 = 同步 binder + 文件 IO；回退 exec 时内部起进程）。
      */
     fun readCpuGpuTempsC(): Pair<Double?, Double?> {
-        // awk 单进程版优先；个别 ROM 裁剪 awk 时退回逐区 shell 循环（兜底口径同 readCpuFastSample）
-        var out = exec(VIRTUAL_TEMP_CMD)
+        // 直读优先（零 fork，每 5s 错峰一次的频率不敏感，但同享去 fork 收益）；不可用回退
+        // awk 单进程版；个别 ROM 裁剪 awk 时再退逐区 shell 循环（兜底口径同 readCpuFastSample）
+        var out = ShizukuHelper.readThermalTempsDirect()
+            ?: exec(VIRTUAL_TEMP_CMD)
         if (out == null && !virtualTempLegacyDead) {
             out = exec(VIRTUAL_TEMP_CMD_LEGACY)
             if (out == null && ShizukuHelper.serviceBound.value) virtualTempLegacyDead = true
@@ -662,42 +695,69 @@ object FrameRateSource {
     }
 
     /**
-     * GPU 占用率 %（FPS 卡右轴可切换的 GPU Load(%) 线）。
+     * GPU 占用率 + 频率，**一条命令/一次直读同时取回**（2026-09-29 加频率段：候选池口径对齐
+     * Metric helper 的 GpuSampler；本机 kgsl/ged 全被 SELinux 拦 → 频率恒缺，节点可读的机型自动出数）。
+     * 返回 (占用率 %, 频率 MHz)。允许只出其一（占用率命中而频率全拦是常见组合）。
      *
+     * 占用率口径（沿革见下）：候选节点按厂商分叉，第一个非空命中；
      * ⚠️ 节点**按厂商分叉**，[GPU_LOAD_CMD] 单进程 awk 按候选序探测、读到第一个非空即回：
-     * ① `/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage` —— 高通经典节点（内容形如 "42 %"，
-     *    驱动内部 ~359ms 窗口自刷新，读不改写）；
-     * ② `/sys/kernel/gpu/gpu_busy` —— 通用 GPU sysfs（本机存在但被拦；Exynos 常见可读）；
-     * ③ `/sys/class/kgsl/kgsl-3d0/gpu_load` —— 新版 kgsl 累计口径（读后 acc 复位，
-     *    按拍读恰好就是"距上次读取的负载"）；
-     * ④ `/sys/kernel/ged/hal/gpu_utilization` —— MTK GED（首数字 = 利用率）；
-     * ⑤ `/sys/class/misc/mali0/device/utilisation` —— Mali。
-     * 解析取**首个非空行的第一个数字**（"42 %" / "42" / "24 604000" 通吃），
-     * 内容异常时返回 null（断线处理）。
+     * ① `/sys/class/kgsl/kgsl-3d0/gpubusy` —— 高通 kgsl 双数对（"busy total" 微秒），本
+     *    awk 分支直接算 busy÷total×100（total=0 = GPU 整窗断电，按 0 处理）；
+     * ② `/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage` —— 高通经典节点（内容形如 "42 %"）；
+     * ③ `/sys/kernel/gpu/gpu_busy` —— 通用 GPU sysfs（Exynos 常见可读）；
+     * ④ `/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load` —— kgsl 的 devfreq 挂点；
+     * ⑤⑥⑦⑧ MTK/Mali：ged gpu_utilization、mali0 utilisation、ged parameters gpu_loading、
+     *    devfreq mali_ondemand utilisation。①以外输出原样透传，解析取首个数字。
      *
-     * ⚠️⚠️ 实机验证（24031PN0DC / HyperOS V816）：**本机 Shizuku（shell 身份）恒 null** ——
-     * 2026-09-27 全量复测：`/sys/class/kgsl` 与 `/sys/kernel/gpu` 两目录 SELinux 全拦
-     * （cat / ls -Z 都 Permission denied）、`/sys/class/devfreq` 目录本身不可列、
-     * tracefs 只读但事件 enable 文件拒访问（tracing_on=0 也无法置位）、
-     * `dumpsys gpu`/game/perfservice/powerkeeper 等 9 个服务均无利用率、/proc 无 gpu 节点。
-     * ⇒ 本机 Shizuku 模式 GPU Load(%) 选项照旧自动隐藏；**root 模式可读 kgsl**、
-     * 节点可读的机型/ROM（部分 Exynos / MTK / Mali 机器 shell 可读）自动亮起。
+     * ⚠️ 实机定案（24031PN0DC / HyperOS V816，2026-09-28）：**gpubusy 可读** ——
+     * 同目录的 gpu_busy_percentage 被拦、gpubusy 放行：SELinux 按文件标签逐一判定，
+     * 不能拿"kgsl 目录被拦"推断全拦（09-27 的"本机恒 null、选项自动隐藏"结论据此修正）。
+     * 取证路径：Scene（同为 Shizuku 模式无 root）在同机录出 GPU(%) 且 GPU(KHz)=-1 →
+     * 抠它 APK 里的 sysfs 候选池 → adb shell（与 Shizuku 同为 uid 2000/shell 上下文，
+     * 测试结论对 Shizuku 等效）逐点实测，候选里仅 gpubusy 返回数据。
+     * 节点实测语义：busy/total 微秒对（如 219056/1001290 ≈ 22%），GPU 断电的整窗返回
+     * "0 0"、有载窗口 ~1s 规模、快速连读不清零 —— 每拍读一次，busy/total 即该窗口占用率
+     * （游戏满载时 GPU 恒上电，比值 ≈ 真实占用率；Scene 同款数据源同款口径）。
      *
      * ⚠️ **allowBlank 必须为 true**（2026-09-25 修）：本函数**每拍**都在跑，而节点不可读时
-     * awk 空输出是这台机器的**常态结论**——按失败处理会让空输出走完整个通道回退链
+     * awk 空输出是这类机器的**常态结论**——按失败处理会让空输出走完整个通道回退链
      * （Shizuku → su 再试一轮）且 [exec] 每秒刷一条 warning。空输出在此处本来就是
      * "无 GPU 占用数据"的有效结论，返回 "" → 解析为 null 即可。
      *
-     * ⚠️ 无 legacy 兜底（对比温度/CPU 快样）：awk 单进程读 5 个文件成本可忽略，真缺 awk 的
+     * ⚠️ 无 legacy 兜底（对比温度/CPU 快样）：awk 单进程读 8 个文件成本可忽略，真缺 awk 的
      * ROM 连 CPU 快样都死了，GPU 这条辅助线跟着 null（UI 隐藏选项）是可接受的一致降级，
-     * 不值得为它养 5 fork/拍的 shell 循环。
+     * 不值得为它养多 fork/拍的 shell 循环。
      *
-     * ⚠️ 必须在后台线程调用（内部起进程）。
+     * ⚠️ 必须在后台线程调用（直读 = 同步 binder + 文件 IO；回退 exec 时内部起进程）。
      */
-    fun readGpuLoadPct(): Double? {
-        val out = exec(GPU_LOAD_CMD, allowBlank = true) ?: return null
-        val line = out.lineSequence().firstOrNull { it.isNotBlank() } ?: return null
-        return Regex("""\d+""").find(line)?.value?.toDoubleOrNull()
+    fun readGpuLoadFreq(): Pair<Double?, Double?> {
+        // 直读优先（UserService 进程内读节点，零 fork；gpubusy 的窗口由内核维护，
+        // 1s 一次读恰好是当拍窗口）；直读不可用回退 awk 探测命令，口径完全一致
+        val out = ShizukuHelper.readGpuLoadDirect()
+            ?: exec(GPU_LOAD_CMD, allowBlank = true)
+            ?: return null to null
+        var load: Double? = null
+        var freqMhz: Double? = null
+        for (raw in out.lineSequence()) {
+            val line = raw.trim()
+            when {
+                line.startsWith("freq") -> {
+                    // 频率行 `freq <原始值>`：单位不统一（Hz/kHz/MHz 都有），按量级换算。
+                    // GPU 频率实际范围 ~100-3500MHz：≥1e6 视作 Hz、≥1e3 视作 kHz、否则已是 MHz。
+                    val v = Regex("""\d+(\.\d+)?""").find(line.substringAfter("freq"))?.value
+                        ?.toDoubleOrNull() ?: continue
+                    freqMhz = when {
+                        v >= 1_000_000.0 -> v / 1_000_000.0
+                        v >= 1_000.0 -> v / 1_000.0
+                        else -> v
+                    }
+                }
+                load == null && line.isNotEmpty() -> {
+                    load = Regex("""\d+(\.\d+)?""").find(line)?.value?.toDoubleOrNull()
+                }
+            }
+        }
+        return load to freqMhz
     }
 
     private val THERMAL_ZONE_RE = Regex("""^(\S+)\s+(-?\d+)$""")
@@ -752,24 +812,326 @@ object FrameRateSource {
     /** 温感区根目录（本文件多处命令共用） */
     private const val THERMAL_ZONE_DIR = "/sys/class/thermal"
 
-    /** GPU 占用率候选节点（[readGpuLoadPct] 的探测序，厂商分叉见该函数注释） */
+    /** GPU 占用率候选节点（[readGpuLoadFreq] 的探测序，厂商分叉见该函数注释）。
+     *  ⚠️ gpubusy 排第一且独享双数比值分支：它是本机（24031PN0DC）唯一可读的 GPU 活动
+     *  节点（2026-09-28 Scene APK 抠串 + adb 逐点实测定案，见 [readGpuLoadFreq]）。 */
     private const val GPU_BUSY_NODES: String =
-        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage " +
+        "/sys/class/kgsl/kgsl-3d0/gpubusy " +
+            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage " +
             "/sys/kernel/gpu/gpu_busy " +
-            "/sys/class/kgsl/kgsl-3d0/gpu_load " +
+            "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load " +
             "/sys/kernel/ged/hal/gpu_utilization " +
-            "/sys/class/misc/mali0/device/utilisation"
+            "/sys/class/misc/mali0/device/utilisation " +
+            "/sys/module/ged/parameters/gpu_loading " +
+            "/sys/class/devfreq/gpufreq/mali_ondemand/utilisation"
 
     /**
-     * GPU 占用率命令：**单进程 awk** 依次 getline 各候选节点，读到第一个非空即 print+exit
-     * （全部不可读 = 空输出，就是"无 GPU 数据"的常态结论）。不可读文件 getline 返回 -1、
-     * 可读空文件返回 0，两种都落 v="" 继续下一个，不会误回空串。
-     * ⚠️ 命令里全是字面路径，无 shell 变量/命令替换，不踩 `\$` 双重转义的坑（批次十七教训）。
+     * GPU 频率候选节点（与 ShellService.GPU_FREQ_NODES 同表同序，两处改动必须同步）。
+     * 单位不统一（kgsl/高通 = Hz、ged = kHz、部分挂点 = MHz），解析侧按量级换算（见
+     * [readGpuLoadFreq]）。本机（24031PN0DC）kgsl 与 /sys/kernel/gpu 全拦 → 恒缺（预期）。
+     */
+    private const val GPU_FREQ_NODES: String =
+        "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq " +
+            "/sys/class/kgsl/kgsl-3d0/gpuclk " +
+            "/sys/kernel/gpu/gpu_clock " +
+            "/sys/class/misc/mali0/device/clock " +
+            "/sys/devices/11800000.mali/clock " +
+            "/sys/devices/14ac0000.mali/clock " +
+            "/sys/kernel/ged/hal/current_freqency " +
+            "/sys/kernel/debug/ged/hal/current_freqency " +
+            "/sys/class/devfreq/gpufreq/cur_freq " +
+            "/sys/kernel/tegra_gpu/gpu_rate"
+
+    /**
+     * GPU 占用率 + 频率命令：**单进程 awk** 依次 getline 两组候选节点（负载命中即回、
+     * 频率独立探测），输出第一行为占用率（口径同前），命中频率时追加一行 `freq <原始值>`。
+     * ⚠️ 命令里全是字面路径与 awk 内建，无 shell 变量/命令替换，不踩 `\$` 双重转义的坑
+     * （批次十七教训）；`\\n` 是 awk printf 的换行转义。
      */
     private val GPU_LOAD_CMD: String =
-        "awk 'BEGIN{n=split(\"$GPU_BUSY_NODES\",a,\" \");" +
+        "awk 'BEGIN{" +
+            "n=split(\"$GPU_BUSY_NODES\",a,\" \");" +
             "for(i=1;i<=n;i++){v=\"\";getline v < a[i];" +
-            "if(v!=\"\"){print v;exit}}}' 2>/dev/null"
+            "if(v!=\"\"){" +
+            "if(a[i]~/gpubusy/){split(v,b,\" \");" +
+            "if(b[2]+0>0)printf \"%.1f\\n\",b[1]*100.0/b[2];else print \"0\"}" +
+            "else print v;exit}}" +
+            "m=split(\"$GPU_FREQ_NODES\",f,\" \");" +
+            "for(i=1;i<=m;i++){v=\"\";getline v < f[i];" +
+            "if(v!=\"\"){print \"freq \" v;exit}}}' 2>/dev/null"
+
+    // ── SF --latency 路径（2026-09-29 加，可选帧率算法 ①）─────────────────
+    //
+    // `dumpsys SurfaceFlinger --latency <layer>`：AOSP 老牌的逐帧 present 时间戳查询 ——
+    // 首行 = 刷新周期（ns），随后 ≤127 行「desiredPresent actualPresent frameReady」三元组
+    // （ns），末尾 "0 0 0" 终止。**原始时间戳口径**：帧率 = 帧数 ÷（时间戳差），没有累计
+    // 计数器、没有跟踪表上限、不用 -enable/-clear 改全局状态、差分窗口由时间戳自带 ——
+    // timestats 路径的五套护栏（见本文件上方）在这里整个消失。Scene 的通用解析器同款。
+    //
+    // ⚠️⚠️ 本机定案（24031PN0DC / HyperOS V816，2026-09-29 adb 复核）：**--latency 已死** ——
+    // 精确图层名（--list 原样返回的 `com.tencent.mm/...LauncherUI#483086`）查询只回一行
+    // 周期数 `8333333`，无任何帧时间戳（批次二十六的结论成立，「图层名没匹配」假设被否定）。
+    // 因此本路径带**存活探测自回落**：命中「只有周期行」即置 [latencyDead]，本进程永久回落
+    // timestats（调用方 FrameRecordController 处理），不再浪费每拍一次 exec。图层名不精确
+    // （未渲染/已销毁）与「ROM 砍功能」输出同形，区分方式 = 探测时用 --list 原样返回的
+    // 名字且要求该图层 FIFO 里有帧——已尽最大努力区分，ROM 行为如超出此判别能力，
+    // 代价只是回落 timestats，无损。
+    //
+    // ⚠️ --list 输出形态随版本分叉：经典 AOSP = 每行一个图层名；AOSP 16 / HyperOS =
+    // `RequestedLayerState{<hash> <name> parentId=<n>}` 内部状态行。解析两种都认
+    // （见 [parseLatencyListLine]），并按 Metric 同款排除无帧镜像层。
+
+    /** 一次 --latency 差分窗口：fps = ΔF ÷ 时间戳 dt（时间戳自带窗口，免墙钟） */
+    data class LatencySample(
+        /** 本窗帧率；0.0 = 本周期无新帧（语义同 timestats 路径的 0 帧） */
+        val fps: Double,
+        /** 本窗新帧数 */
+        val frames: Long,
+        /** 本窗**帧间隔分布**（真实逐帧 present 间隔，桶 = 整毫秒；含跨拍边界间隔） */
+        val p2pHistogram: Map<Int, Long>,
+        /** 命中的图层名（日志/诊断用） */
+        val layerName: String,
+        /** true = FIFO 溢出（127 帧装不下一个轮询窗，帧数有缺，fps 为降级估计） */
+        val overflow: Boolean,
+    )
+
+    @Volatile
+    private var latencyDead = false
+
+    @Volatile
+    private var latencyLayer: String? = null
+
+    /** 当前缓存图层对应的包名（目标切换即重新选层） */
+    @Volatile
+    private var latencyLayerPkg = ""
+
+    /** 上一拍最后一条新帧的 present 时间戳（ns）；0 = 尚无基线（首拍只建基线不出数） */
+    private var latencyLastPresentNs = 0L
+
+    /** 连续 0 新帧拍数（图层可能已被销毁重建）；≥[LATENCY_IDLE_REPICK_BEATS] 触发重新选层 */
+    private var latencyIdleBeats = 0
+
+    private const val LATENCY_IDLE_REPICK_BEATS = 5
+
+    /** 目标切换 / 算法切换时清空 latency 侧状态（选层与时间戳基线一并作废） */
+    fun resetLatency() {
+        latencyLayer = null
+        latencyLayerPkg = ""
+        latencyLastPresentNs = 0L
+        latencyIdleBeats = 0
+    }
+
+    /** 本机/本进程已判定 --latency 不可用（设置页据此展示提示） */
+    fun isLatencyDead(): Boolean = latencyDead
+
+    /**
+     * 取一次 --latency 差分窗口。null = 无可出数（首拍建基线 / 图层未渲染 / 本机已判定死），
+     * 调用方按「本拍无可差分」处理，**不算通道失败**（存活探测是独立语义，见 [latencyDead]）。
+     *
+     * 必须在后台线程调用（内部 exec，图层探测一轮最多 4 次 fork）。
+     */
+    fun readLatencySample(pkg: String): LatencySample? {
+        if (latencyDead || pkg.isEmpty()) return null
+        // 选层：包名变化 / 尚无缓存图层 → 重新探测；长时间 0 帧（图层销毁重建）→ 再试一轮
+        var layer = latencyLayer
+        if (layer == null || latencyLayerPkg != pkg) {
+            layer = pickLatencyLayer(pkg) ?: return null
+            latencyLayer = layer
+            latencyLayerPkg = pkg
+            latencyLastPresentNs = 0L
+            latencyIdleBeats = 0
+        }
+
+        val out = exec(
+            "dumpsys SurfaceFlinger --latency '${layer.filter { it != '\'' && it != '\\' }}' 2>/dev/null",
+        ) ?: return null // 通道失败：状态原样保留（选层/基线不作废），下一拍重试
+        val actuals = parseLatencyTimestamps(out)
+        if (actuals == null) {
+            // 只有周期行：图层刚被销毁（选层时还有帧）或本机砍功能 —— 作废选层，
+            // 下一拍重新探测；若本机真的死了，[pickLatencyLayer] 的全候选判定会置 latencyDead
+            latencyLayer = null
+            return null
+        }
+        if (actuals.isEmpty()) {
+            // FIFO 空 = 该图层自 SF 启动没渲染过（选层探测后 theoretically 不该发生），按待渲染处理
+            return null
+        }
+
+        if (latencyLastPresentNs == 0L) {
+            // 首拍只建时间戳基线（口径同 timestats 路径：不拿无基线的窗口算数）
+            latencyLastPresentNs = actuals.last()
+            return null
+        }
+
+        val lastNs = actuals.last()
+        val newFrames = actuals.filter { it > latencyLastPresentNs }
+        if (newFrames.isEmpty()) {
+            latencyIdleBeats++
+            if (latencyIdleBeats >= LATENCY_IDLE_REPICK_BEATS) {
+                // 长时间无帧：图层可能被销毁重建（新 Surface 拿到新名字），重新选层
+                latencyLayer = null
+            }
+            return LatencySample(0.0, 0L, emptyMap(), layer, overflow = false)
+        }
+        latencyIdleBeats = 0
+
+        // FIFO 深度 = 127：一个轮询窗的帧数超过它就会滑出旧帧（ΔF 少计 → fps 系统性偏低）。
+        // 判据 = FIFO 满（≥126 行）且最老帧晚于基线（早于基线的被滑出的帧无法从输出看出）。
+        // 降级口径：整个 FIFO 当一个重叠窗 —— fps = (n-1) ÷ FIFO 跨度，不再对齐轮询窗。
+        // 正常采样节奏（1s 拍、≤120Hz → ≤120 帧）不会触发。
+        val fifoFull = actuals.size >= 126
+        val overflow = fifoFull && actuals.first() > latencyLastPresentNs
+        val hist = HashMap<Int, Long>()
+        return if (overflow) {
+            Log.w(TAG, "--latency FIFO 溢出（127 帧装不下一个轮询窗），本拍降级为整窗平均：layer=$layer")
+            var prev = actuals.first()
+            for (i in 1 until actuals.size) {
+                val bucket = ((actuals[i] - prev) / 1_000_000.0).roundToInt().coerceAtLeast(0)
+                hist[bucket] = (hist[bucket] ?: 0L) + 1
+                prev = actuals[i]
+            }
+            val spanSec = (actuals.last() - actuals.first()) / 1e9
+            LatencySample(
+                fps = if (spanSec > 0) (actuals.size - 1) / spanSec else 0.0,
+                frames = (actuals.size - 1).toLong(),
+                p2pHistogram = hist,
+                layerName = layer,
+                overflow = true,
+            ).also { latencyLastPresentNs = lastNs }
+        } else {
+            // 正常窗：帧间隔从「上一拍末帧」到「本拍每条新帧」—— 边界间隔是真实 present-to-present，
+            // 逐拍拼起来恰好每条间隔计一次（与 timestats 直方图差分同一目标，但这里是原始值）
+            var prev = latencyLastPresentNs
+            for (ns in newFrames) {
+                val bucket = ((ns - prev) / 1_000_000.0).roundToInt().coerceAtLeast(0)
+                hist[bucket] = (hist[bucket] ?: 0L) + 1
+                prev = ns
+            }
+            val dtSec = (lastNs - latencyLastPresentNs) / 1e9
+            latencyLastPresentNs = lastNs
+            LatencySample(
+                fps = if (dtSec > 0) newFrames.size / dtSec else 0.0,
+                frames = newFrames.size.toLong(),
+                p2pHistogram = hist,
+                layerName = layer,
+                overflow = false,
+            )
+        }
+    }
+
+    /**
+     * 解析 --latency 输出为 actualPresent 时间戳列表（ns，升序）。
+     * 返回 null = 「只有周期行」（本机砍功能的签名，见 [readLatencySample] 上方注释）；
+     * 空列表 = 命令成功但 FIFO 无帧。
+     */
+    private fun parseLatencyTimestamps(out: String?): List<Long>? {
+        if (out.isNullOrBlank()) return null
+        val lines = out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+        if (lines.isEmpty()) return null
+        // 首行 = 刷新周期（单数字）。只此一行 = 本机死；多行才继续解析帧三元组。
+        if (lines.size == 1) return null
+        val actuals = ArrayList<Long>(lines.size - 1)
+        for (line in lines.drop(1)) {
+            val tokens = line.split(WHITESPACE_SPLIT_RE)
+            if (tokens.size < 2) continue // "0 0 0" 终止行或残行
+            val actual = tokens[1].toLongOrNull() ?: continue
+            if (actual > 0) actuals.add(actual)
+        }
+        actuals.sort()
+        return actuals
+    }
+
+    /**
+     * 从 --list 里选出目标应用的图层（Metric 同款：候选逐个探测 FIFO 帧数，最多者胜）。
+     * 全部候选探测都只回周期行 = 本机死（置 [latencyDead]）；无候选 = 应用没在渲染，返回 null
+     * 但**不**判死（等下一拍目标锁定再试）。
+     */
+    private fun pickLatencyLayer(pkg: String): String? {
+        val needle = pkg.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }
+        if (needle.isEmpty()) return null
+        // --list 输出可能上百 KB：shell 层 grep 收窄再回传（大输出必须在 shell 层收窄的铁律，
+        // 同 readTopPackage / timestatsFullDumpCmd）。grep -F 字面匹配包名。
+        val out = exec("dumpsys SurfaceFlinger --list 2>/dev/null | grep -F '$needle'; true")
+            ?: return null
+        val names = out.lineSequence()
+            .mapNotNull { parseLatencyListLine(it, needle) }
+            .distinct()
+            .toMutableList()
+        if (names.isEmpty()) return null
+        // SurfaceView 优先：游戏 / 视频 / 地图的主渲染面（帧数最多）几乎恒在它名下
+        names.sortByDescending { it.contains("SurfaceView") }
+        var best: String? = null
+        var bestFrames = -1
+        var anyAlive = false
+        for (name in names.take(3)) {
+            val safe = name.filter { it != '\'' && it != '\\' }
+            val probe = exec("dumpsys SurfaceFlinger --latency '$safe' 2>/dev/null")
+            val actuals = parseLatencyTimestamps(probe)
+            if (actuals == null) continue // 周期行：该图层无数据（或本机死，见循环后判定）
+            anyAlive = true
+            if (actuals.size > bestFrames) {
+                bestFrames = actuals.size
+                best = safe
+            }
+        }
+        if (!anyAlive && names.isNotEmpty()) {
+            // 每个候选都只回周期行：与「精确名查询仍死」的本机形态一致 → 判死回落
+            latencyDead = true
+            Log.w(TAG, "--latency 全部候选图层均只返回周期行，本机不可用，永久回落 timestats：candidates=$names")
+        }
+        return best
+    }
+
+    /**
+     * --list 单行 → 图层名。两种形态：
+     * - 经典：整行就是名字（含目标包名才到这里）；
+     * - AOSP 16 / HyperOS：`RequestedLayerState{<hash> <name> parentId=<n>}` —— 剥壳、
+     *   丢弃首 token（hash），截掉 ` parentId=` 起的尾部。
+     * 排除无帧镜像层：InputSink（输入镜面）、ActivityRecord{（任务镜像）、animation-leash。
+     */
+    private fun parseLatencyListLine(line: String, needle: String): String? {
+        val trimmed = line.trim()
+        if (!trimmed.contains(needle)) return null
+        val name = if (trimmed.startsWith("RequestedLayerState{")) {
+            val inner = trimmed.removePrefix("RequestedLayerState{").removeSuffix("}")
+            val tokens = inner.trim().split(WHITESPACE_SPLIT_RE)
+            tokens.getOrNull(1) ?: return null
+        } else {
+            trimmed
+        }
+        if (name.isEmpty()) return null
+        if (EXCLUDED_LATENCY_LAYERS.any { name.contains(it) }) return null
+        return name
+    }
+
+    private val EXCLUDED_LATENCY_LAYERS = arrayOf("InputSink", "ActivityRecord{", "animation-leash")
+
+    private val WHITESPACE_SPLIT_RE = Regex("\\s+")
+
+    // ── 系统 TaskFpsCallback 路径（2026-09-29 加，可选帧率算法 ②）─────────
+    //
+    // AOSP 隐藏 AIDL：IWindowManager.registerTaskFpsCallback(taskId, ITaskFpsCallback) ——
+    // 系统对指定任务的帧呈现**主动推送** FPS（oneway onFpsReported(float)），零采样开销。
+    // 调用门槛 = ACCESS_FPS_COUNTER，AOSP Shell 包 manifest 自带（本机 granted=true 实测），
+    // 故只在 Shizuku（UserService = uid 2000）通道可用；注册/注销实现在 ShellService，
+    // 本类只做薄包装。口径细节见 IShellService.aidl 同段注释。
+
+    /** TaskFps 算法是否可用：需要 Shizuku UserService（v3+）且系统 ≥S（API 31 引入该 AIDL） */
+    fun isTaskFpsSupported(): Boolean =
+        Build.VERSION.SDK_INT >= 31 && ShizukuHelper.serviceBound.value
+
+    /** 为前台任务注册系统 FPS 推送；见 [ShizukuHelper.registerTaskFps] 的返回语义 */
+    fun taskFpsRegister(pkg: String): Triple<Boolean, Int, String?> =
+        ShizukuHelper.registerTaskFps(pkg)
+
+    fun taskFpsUnregister() = ShizukuHelper.unregisterTaskFps()
+
+    /**
+     * 最近一次系统推送 (fps, atMillis)；null = 从未推送 / 服务未绑定。
+     * ⚠️ 推送节奏由系统决定（FPS 变化或按窗口上报，随 ROM 而异）：调用方按
+     * 「atMillis 是否落在本拍窗口」判新值，陈旧值不补样本（判口径见 FrameRecordController）。
+     */
+    fun readTaskFpsSample(): Pair<Float, Long>? = ShizukuHelper.readTaskFpsDirect()
 
     /** 整数帧率格式化（Locale.US：小数点是点，不受系统语言影响） */
     internal fun formatFps(fps: Double): String = String.format(Locale.US, "%.0f", fps)

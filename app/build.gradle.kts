@@ -101,6 +101,9 @@ dependencies {
     // 版本与 fold 完全一致（13.1.5）。api = 宿主侧 SDK；provider = 声明 ShizukuProvider
     // 自动初始化 binder 连接。UserService（ShellService）由 Shizuku 反射加载，无需在 Manifest 注册。
     implementation(libs.dev.rikka.shizuku.api)
+
+    // 运行时 hidden API 豁免（ShellService 的 TaskFps 注册反射框架隐藏类用，见上）
+    implementation(libs.hiddenapibypass)
     implementation(libs.dev.rikka.shizuku.provider)
 
     // Room：采样会话落库（应用私有目录 /data/data/<pkg>/databases/）。

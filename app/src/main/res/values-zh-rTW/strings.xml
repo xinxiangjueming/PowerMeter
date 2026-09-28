@@ -104,8 +104,11 @@
     <string name="frame_energy_per_frame">幀能耗</string>
     <string name="frame_jank_rate">卡頓率</string>
     <string name="frame_steady_index">穩幀指數</string>
-    <string name="frame_steady_index_info">穩幀指數＝幀時間標準差（ms），是 PerfDog 穩幀指數（Smooth，綜合幀時間波動評估平穩度）的簡化口徑：數值越小，幀間隔越均勻，畫面越穩。</string>
-    <string name="frame_jank_info">卡頓判定（PerfDog 式口徑，按 1 秒粒度）：幀時間大於前 3 秒均值 2× 記小卡頓；再超過 83ms（兩倍電影幀耗時）記卡頓；大於均值 3× 且超過 125ms 記嚴重卡頓。頂部卡頓率＝卡頓總時長 ÷ 總時長。</string>
+    <string name="frame_steady_index_info">穩幀指數＝逐幀幀時間標準差（ms）：數值越小，幀間隔越均勻，畫面越平穩。逐幀幀時間取自每秒幀間隔分佈（present-to-present 直方圖）按單幀聚合；是 PerfDog 穩幀指數（Smooth）的簡化口徑。</string>
+    <string name="frame_jank_info">卡頓判定（PerfDog 式口徑，逐幀粒度）：單幀耗時大於前 3 個有效秒均值 2× 記小卡頓；大於 83ms（兩倍電影幀耗時）記卡頓；大於 125ms（三倍電影幀耗時）記嚴重卡頓。圖例＝全場各檔卡頓幀數；卡頓率＝卡頓/嚴重卡頓幀的耗時總和 ÷ 全部幀耗時。≥1s 的呈現間隔（切頁/空閒）按中斷處理不計入。</string>
+    <!-- 溫度卡 VIR 虛擬溫度說明（2026-09-29，Kite virTemp 口徑：0.75×電池溫度 + 0.25×43.5） -->
+    <string name="frame_card_temp_vir_info_title">VIR 虛擬溫度</string>
+    <string name="frame_card_temp_vir_info">手機裡沒有任何一個熱敏電阻裝在人手握持的外殼表面——那是最需要知道溫度的地方，卻是最沒法測的地方。VIR 就是為這個空位造出來的數：由實測的電池溫度合成，virTemp ≈ 0.75 × 電池溫度 + 0.25 × 43.5 ℃，其中 43.5 ℃ 是機身熱點溫度的實測均值，按常數代入。\n\n曲線略高於電池溫度，隨機身發熱向 43.5 ℃ 收攏。可以把它當作「手握外殼的溫感」的近似參考——它不是任何感測器的實測值。</string>
     <string name="frame_variance">變異數</string>
     <!-- 詳情頁卡片標題 / 圖例 / 右軸選項（2026-09-27 多語言化，原先硬編碼英文） -->
     <string name="frame_card_power">功率(W)</string>
@@ -121,6 +124,15 @@
     <string name="frame_card_frame_time" formatted="false">幀時間(ms)</string>
     <string name="frame_right_cpu_load" formatted="false">CPU 負載(%)</string>
     <string name="frame_right_gpu_load" formatted="false">GPU 負載(%)</string>
+    <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
+    <string name="frame_source_title">取樣源</string>
+    <string name="frame_source_timestats">Timestats</string>
+    <string name="frame_source_latency">SF Latency</string>
+    <string name="frame_source_taskfps">TaskFps</string>
+    <string name="frame_source_desc_timestats">累計幀數差異，全機型可用</string>
+    <string name="frame_source_desc_latency">SurfaceFlinger 逐幀時間戳（Scene 同款解析），無追蹤上限</string>
+    <string name="frame_source_desc_taskfps">系統主動推送幀率，零取樣開銷，需 Shizuku（Android 11+）</string>
+    <string name="frame_source_fallback">本機不可用，自動回落 Timestats</string>
     <string name="frame_right_axis_switch">切換右軸指標</string>
 
     <!-- ==================== 幀率監測：錄製懸浮窗 ==================== -->

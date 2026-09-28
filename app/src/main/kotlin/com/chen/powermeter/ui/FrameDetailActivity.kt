@@ -62,6 +62,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -78,6 +79,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -357,8 +359,9 @@ class FrameDetailActivity : ComponentActivity() {
         val night = isNightMode()
         if (darkThemeState.value != night) {
             // 回前台才侦测到"后台期间错过的变化"（本页窗口 stopped 期间不分发配置）→
-            // 静默落地，不补播圆孔动画（2026-09-28）
-            ThemeTransition.requestSilent()
+            // 状态在这里落地，闸门在 onResume 之后的首帧触发（宿主必已 RESUMED）→ 播
+            // 圆孔揭露动画（2026-09-29 用户定案：后台错过的变化回前台也播动画，不再
+            // 静默硬切；离开前的旧主题帧正好是揭露的起点画面）
             darkThemeState.value = night
             NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !night)
             AppTransitions.onThemeChangedForSnapshot(this, night)
@@ -460,9 +463,9 @@ class FrameDetailActivity : ComponentActivity() {
         val dark = (newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
         if (darkThemeState.value != dark) {
-            // 送达时本页还没 onStart（后台错过的变化）→ 静默落地（同 MainActivity，
-            // 判据见 ThemeTransition.isHostForeground）
-            if (!ThemeTransition.isHostForeground(this)) ThemeTransition.requestSilent()
+            // 送达时本页可能还没 onStart（后台错过的变化随返回事务补发）：不在这里判
+            // 静默（2026-09-29 用户定案，同 MainActivity）——由 PowerMeterTheme 闸门在
+            // 首帧判定：宿主已 RESUMED → 播圆孔揭露；仍 paused 可见 → 闸门静默落地
             darkThemeState.value = dark
             NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !dark)
             // 截图素材（冻结列表 / 锚点卡片）是旧主题像素 → 后台重映射到新主题，
@@ -597,13 +600,24 @@ private fun FrameDetailScreen(
                         // 2026-09-25 重构：按 Kite 报告版式重排（不再照搬电池查看页的卡片区）——
                         // 顶部统计网格 → 帧率与温度（双轴叠加）→ Frame Time → Jank → Power
                         // → Temperature → CPU Usage → CPU Frequency（后两卡 2026-09-25 追加置底）
-                        FrameSummaryCard(session, samples, cardShape)
+                        // 逐帧卡顿/稳帧统计一次算好三卡共用（旧会话为 null，卡内各自回退旧口径）
+                        val frameStats = remember(samples) { frameJankStats(samples) }
+                        FrameSummaryCard(session, samples, frameStats, cardShape)
                         if (samples.size >= 2) {
                             FrameFpsTempCard(samples, fpsPoints, fpsAxisMax, cardShape)
-                            FrameTimeCard(samples, cardShape)
-                            FrameJankCard(samples, cardShape)
+                            FrameTimeCard(samples, frameStats, session.refreshRateHz, cardShape)
+                            FrameJankCard(samples, frameStats, cardShape)
                             FramePowerCard(samples, cardShape)
-                            FrameTempCard(samples, cardShape)
+                            // Temperature 卡按数据显隐：CPU/GPU 温度取 thermal_zone 温感区
+                            // （需 root/Shizuku，非 root 机型整场缺失）；2026-09-29 起 VIR 线
+                            // （Kite virTemp 口径）渲染期从电池温度现算、旧会话照常出线 →
+                            // 四线任一有数据即显示，全无才隐藏
+                            if (samples.any {
+                                    it.tempVirtualC != null || it.gpuTempC != null || it.tempBatteryC != null
+                                }
+                            ) {
+                                FrameTempCard(samples, cardShape)
+                            }
                             // CPU 两卡按数据自适应显隐：占用卡在整场连 Total 都没有时隐藏；
                             // 频率卡有任一核的有效读数即显示。数据源 = 250ms 快样（旧会话回退 1s）
                             if (cpuPoints.any { it.totalPct != null || it.corePct.any { c -> c != null } }) {
@@ -732,6 +746,147 @@ private fun stdev(values: List<Double>): Double? {
     return sqrt(values.sumOf { (it - avg) * (it - avg) } / values.size)
 }
 
+// ── 逐帧卡顿判定（2026-09-28 重构，PerfDog 式口径回到**单帧**粒度）──────────
+//
+// ⚠️ 旧口径的事故（Jank 卡三档全零，用户报障）：PerfDog 的 83/125ms 是**单帧耗时**
+// 门槛（一帧 83ms ≈ 卡满 5 个 60Hz vsync），此前套在 **1s 平均帧时间**上没换算聚合
+// 粒度 —— 「整秒均值 > 83ms」意味着该秒平均帧率 < 12fps，正常录制永不触发。2026-09-28
+// 王者实测一整场 1s 均值 max=13.31ms（门槛的 16%）、小卡顿门槛（2× 均值 = 16ms）也
+// 够不着，SMALL/JANK/BIG JANK 全零；而同场 FPS 最低 62.8、累计 vsync 缺口 ~2257 帧
+// —— 掉帧真实发生，判定粒度错配。
+//
+// 新口径：p2pHist（presentToPresent 差集分布）本身就是**当秒逐帧间隔**（桶 ms → 帧数），
+// 判定回到帧：
+// - 小卡顿：单帧 > 前 3 个有效秒平均帧时间 × 2（PerfDog 的相对条件；基线用**前 3 秒**
+//   均值近似「前 3 帧均值」—— 直方图只有分布没有帧序，逐帧滑窗不可得；不用本秒自己的
+//   均值，避免卡顿秒抬高自己的门槛）；
+// - 卡顿：单帧 > 83ms（2× 电影帧耗时，24fps → 41.7ms）；
+// - 严重卡顿：单帧 > 125ms（3× 电影帧耗时）。
+// 每帧只计最高一档；图例 = 全场各档**帧数**；柱 = 该秒命中档位的最高档着色。
+//
+// ⚠️ ≥1s 的间隔按**呈现中断**处理（切页 / 空闲 / Surface 重建），不进任何一档、不进
+// 卡顿率与稳帧指数的 Σms —— presentToPresent 把「停顿后恢复的那次呈现」记成巨大间隔，
+// 那是没渲染，不是卡了一帧。
+private const val JANK_FRAME_MS = 83.0
+private const val BIG_JANK_FRAME_MS = 125.0
+private const val SMALL_JANK_FACTOR = 2.0
+private const val PRESENT_GAP_MS = 1_000
+
+/**
+ * 逐帧卡顿统计 —— Jank 卡 / 卡顿率 / 稳帧指数（逐帧口径）的统一数据源。
+ * 三个耗时量（卡顿率分母、稳帧指数的 Σx/Σx²）都跳过 ≥[PRESENT_GAP_MS] 的中断桶。
+ *
+ * @return 全部样本都无 p2pHist（旧会话，frame.db v5 前落库）时为 null，调用方回退
+ *   [jankTiers] / 1s 均值口径；同场内个别缺测秒（无基线 / 直方图被清）整秒跳过。
+ */
+private class FrameJankStats(
+    /** 每秒最高档：0 无 / 1 小卡顿 / 2 卡顿 / 3 严重卡顿（柱着色用） */
+    val tiers: List<Int>,
+    /** 全场各档**帧数**（图例） */
+    val smallFrames: Int,
+    val jankFrames: Int,
+    val bigFrames: Int,
+    /** 卡顿率 % = (卡顿+严重卡顿帧的耗时 ms) ÷ 全部帧耗时 ms ×100；小卡顿不计（同旧口径） */
+    val jankRatePct: Double,
+    /** 逐帧帧时间标准差 ms（稳帧指数）与总体方差 ms²（Frame Time 卡，互为平方） */
+    val frameTimeSd: Double,
+    val frameTimeVar: Double,
+)
+
+private fun frameJankStats(samples: List<FrameSample>): FrameJankStats? {
+    if (samples.none { it.p2pHist.isNotEmpty() }) return null
+    val tiers = IntArray(samples.size)
+    val baseline = ArrayDeque<Double>() // 前 3 个有效秒的（去中断）平均帧时间
+    var small = 0
+    var jank = 0
+    var big = 0
+    var jankMs = 0.0
+    var totalMs = 0.0
+    var sum = 0.0
+    var sumSq = 0.0
+    var frames = 0L
+    for (i in samples.indices) {
+        val hist = samples[i].p2pHist
+        if (hist.isEmpty()) continue // 该秒缺测/无帧：不判定、不进基线（同旧口径）
+        var secMs = 0.0
+        var secFrames = 0L
+        for ((ms, cnt) in hist) {
+            if (ms >= PRESENT_GAP_MS) continue
+            val m = ms.toDouble()
+            secMs += m * cnt
+            secFrames += cnt
+            totalMs += m * cnt
+            sum += m * cnt
+            sumSq += m.toDouble() * m * cnt
+            frames += cnt
+            if (baseline.size >= 3 && m > SMALL_JANK_FACTOR * baseline.average()) {
+                small += cnt.toInt()
+                if (tiers[i] < 1) tiers[i] = 1
+            }
+            if (m > JANK_FRAME_MS) {
+                jank += cnt.toInt()
+                jankMs += m * cnt
+                if (tiers[i] < 2) tiers[i] = 2
+            }
+            if (m > BIG_JANK_FRAME_MS) {
+                big += cnt.toInt()
+                tiers[i] = 3
+            }
+        }
+        if (secFrames > 0L) {
+            baseline.addLast(secMs / secFrames)
+            if (baseline.size > 3) baseline.removeFirst()
+        }
+    }
+    val mean = if (frames > 0L) sum / frames else 0.0
+    // Σx²/n - mean² 的灾难性抵消可能出现微小负值，夹到 0
+    val variance = if (frames > 0L) (sumSq / frames - mean * mean).coerceAtLeast(0.0) else 0.0
+    return FrameJankStats(
+        tiers = tiers.toList(),
+        smallFrames = small,
+        jankFrames = jank,
+        bigFrames = big,
+        jankRatePct = if (totalMs > 0.0) jankMs * 100.0 / totalMs else 0.0,
+        frameTimeSd = sqrt(variance),
+        frameTimeVar = variance,
+    )
+}
+
+/**
+ * p2pHist 分布 → **逐帧帧时间序列**（Scene 同款 Frame Time 渲染的数据源，2026-09-28）。
+ *
+ * 直方图只有「每秒 × 每桶」的多元集、没有帧序 —— 桶内按计数展开、桶间升序拼接。
+ * 1s 内 ~115 帧摊在 ~3px 上，帧序在亚像素密度下不可辨（Scene 的逐帧条同样亚像素，
+ * 可见形态只由各高度的**密度**决定，与帧顺序无关）。
+ * ≥[PRESENT_GAP_MS] 的中断桶不展开（同 [frameJankStats] 口径：呈现中断不是帧）。
+ */
+private fun flattenFrameTimes(samples: List<FrameSample>): DoubleArray {
+    var total = 0L
+    val perSample = ArrayList<Pair<List<Pair<Int, Long>>, Long>>()
+    for (s in samples) {
+        val hist = s.p2pHist
+        if (hist.isEmpty()) continue
+        val valid = hist.filterKeys { it < PRESENT_GAP_MS }
+        val n = valid.values.sum()
+        if (n == 0L) continue
+        perSample.add(valid.entries.sortedBy { it.key }.map { it.key to it.value } to n)
+        total += n
+    }
+    val out = DoubleArray(total.toInt())
+    var w = 0
+    for ((flat, n) in perSample) {
+        if (flat.size == 1) {
+            val ms = flat[0].first.toDouble()
+            for (k in 0 until n.toInt()) out[w++] = ms
+        } else {
+            for ((ms, cnt) in flat) {
+                for (k in 0 until cnt.toInt()) out[w++] = ms.toDouble()
+            }
+        }
+    }
+    return out
+}
+
 /**
  * 卡顿判定 —— PerfDog 式口径在本应用 1s 采样粒度的移植（2026-09-25 按用户提供定义）：
  * - **卡顿**：帧时间 > 前 3 个有效秒均值 × 2，且 > 83ms（两倍电影帧耗时，24fps → 41.7ms）；
@@ -740,7 +895,10 @@ private fun stdev(values: List<Double>): Double? {
  * 每秒只计最高一档；前 3 秒基线不足 / 该秒无帧（frameSpace=0）不判定、不进基线。
  *
  * ⚠️ 粒度局限：样本是 1s 平均帧时间，单帧级尖刺会被整秒摊薄 —— 只有持续到秒级的
- * 卡顿才判得出来（忠实于数据，不假装有逐帧精度）。顶部卡顿率与 Jank 卡共用本判定。
+ * 卡顿才判得出来（忠实于数据，不假装有逐帧精度）。**2026-09-28 起降级为旧会话回退
+ * 路径**：正口径见 [frameJankStats]（逐帧判定，事故记录在其上方）—— 本函数的绝对
+ * 门槛套在秒均值上永不触发的问题即出自这里，保留只为 frame.db v5 前的旧会话（无
+ * p2pHist 分布）仍能出图。
  *
  * @return 每样本一档：0 无 / 1 小卡顿 / 2 卡顿 / 3 严重卡顿
  */
@@ -774,36 +932,43 @@ private fun jankTiers(samples: List<FrameSample>): List<Int> {
  * 口径：
  * - VARIANCE = FPS 总体标准差（Kite 页面标签作 VARIANCE，量纲 FPS）；
  * - MAX 温度 = 电池温度峰值（无电池温度样本 → 破折号）；
- * - AVG 功率带符号（"正=充电"口径，放电为负，与 Kite 截图 -8.53 一致）；
- * - 帧能耗 = |平均功率| ÷ 平均帧率（mW/帧，Kite 同名指标的换算口径）；
- * - 卡顿率 = 卡顿总时长 ÷ 总时长（卡顿判定见 [jankTiers]：PerfDog 式口径，
- *   卡顿与严重卡顿秒的时长计入，小卡顿不计）；
- * - 稳帧指数 = 帧时间标准差（ms），PerfDog 稳帧指数（Smooth）的简化口径，点 ⓘ 看定义。
+ * - AVG 功率为正数（2026-09-28 绝对值口径：库里只存大小不存符号，卡片不再出现负号，
+ *   历史 v5 负数行由 frame.db v5→v6 迁移就地取 abs 纠正）；
+ * - 帧能耗 = 平均功率 ÷ 平均帧率（mW/帧，Kite 同名指标的换算口径；功率恒正后无需再取 abs）；
+ * - 卡顿率：**逐帧口径优先**（[frameJankStats]，PerfDog 卡顿率的帧耗时占比口径 =
+ *   卡顿+严重卡顿帧的耗时 ÷ 全部帧耗时，小卡顿不计）——旧会话（无 p2pHist 分布）
+ *   回退时长占比 = 卡顿（含严重卡顿）秒的时长 ÷ 会话总时长（判定见 [jankTiers]）；
+ * - 稳帧指数 = **逐帧**帧时间标准差（ms），PerfDog 稳帧指数（Smooth）的简化口径，
+ *   点 ⓘ 看定义 —— 旧会话回退 1s 均值的标准差（粒度局限见 [jankTiers] 注释）。
  */
 @Composable
 private fun FrameSummaryCard(
     session: FrameSession,
     samples: List<FrameSample>,
+    frameStats: FrameJankStats?,
     shape: RoundedCornerShape,
 ) {
     val fpsVals = samples.map { it.fps }.filter { it > 0.0 }
     val fpsSd = stdev(fpsVals)
     val avgPowerMw = samples.mapNotNull { it.powerMw }.takeIf { it.isNotEmpty() }?.average()
-    // 卡顿率：卡顿（含严重卡顿）秒的时长合计 ÷ 会话总时长；首样本无前历不计时长
-    val tiers = jankTiers(samples)
-    val spanMs = (samples.last().timeMillis - samples.first().timeMillis).coerceAtLeast(1L)
-    val stutterMs = tiers.withIndex().sumOf { (i, tier) ->
-        if (tier >= 2 && i > 0) {
-            (samples[i].timeMillis - samples[i - 1].timeMillis).coerceAtLeast(0L)
-        } else {
-            0L
+    // 卡顿率：逐帧口径优先；旧会话回退时长占比
+    val jankRate = frameStats?.jankRatePct ?: run {
+        val tiers = jankTiers(samples)
+        val spanMs = (samples.last().timeMillis - samples.first().timeMillis).coerceAtLeast(1L)
+        val stutterMs = tiers.withIndex().sumOf { (i, tier) ->
+            if (tier >= 2 && i > 0) {
+                (samples[i].timeMillis - samples[i - 1].timeMillis).coerceAtLeast(0L)
+            } else {
+                0L
+            }
         }
+        stutterMs * 100.0 / spanMs
     }
-    val jankRate = stutterMs * 100.0 / spanMs
     val energyPerFrameMw =
-        if (avgPowerMw != null && session.avgFps > 0.0) abs(avgPowerMw) / session.avgFps else null
+        if (avgPowerMw != null && session.avgFps > 0.0) avgPowerMw / session.avgFps else null
     val maxBatTemp = samples.mapNotNull { it.tempBatteryC }.maxOrNull()
-    val ftSd = stdev(samples.map { it.frameSpaceMs }.filter { it > 0.0 })
+    val ftSd = frameStats?.frameTimeSd
+        ?: stdev(samples.map { it.frameSpaceMs }.filter { it > 0.0 })
 
     AppCard(
         shape = shape,
@@ -936,14 +1101,22 @@ private val TempOrange = Color(0xFFF5A623)
 
 /**
  * 折线规格：values 里 null/NaN = 缺测秒（断线不画）；[FrameLine.onRight] = 走右轴（默认左轴）；
- * [strokeWidth] 线宽 px（默认 5f 主线规格；CPU 两卡的簇内逐核细线传更小值）。
+ * [strokeWidth] 线宽 px（默认 5f 主线规格；CPU 两卡的簇内逐核细线传更小值）；
+ * [bridgeNullRun] 连片缺测 ≤ 该数时跨接连线（见 [buildChartLinePath]；0 = 缺测即断线，
+ * 其余卡维持原口径，只有 FPS 线开——CPU 频率卡的 null = 核离线，桥接会画出假线）。
  */
 private class FrameLine(
     val values: List<Double?>,
     val color: Color,
     val onRight: Boolean = false,
     val strokeWidth: Float = 5f,
+    val bridgeNullRun: Int = 0,
 )
+
+/** FPS 曲线的缺测桥接阈值：连片 ≤3 拍（~4s）直接连线。timestats 图层跟踪 churn
+ *  （statsd 拉 atom 清表 / 图层蒸发，09-27 审计定案）每 ~8s 打掉一拍差分，1s 节奏下
+ *  这些单拍缺测画断线就是把正常渲染的线打成虚线；场景加载等长缺测段（>3 拍）仍断线。 */
+private const val FPS_LINE_BRIDGE_NULL_RUN = 3
 
 /** Power 卡折线蓝（Kite 同款亮蓝；固定色避免动态主题下与 Capacity 浅蓝难区分） */
 private val PowerBlue = Color(0xFF2F7DE1)
@@ -954,11 +1127,26 @@ private val CpuTempBlue = Color(0xFF63B8EC)
 
 private val GpuTempPurple = Color(0xFF9C7BE8)
 
+/** VIR 虚拟温度线绿色：与 CPU 蓝 / GPU 紫 / BAT 橙在同一张卡里一眼可区分 */
+private val VirTempGreen = Color(0xFF4CAF50)
+
+/**
+ * VIR 虚拟温度 = Kite 的 virTemp 口径（2026-09-29 用户提供）：virTemp ≈ 0.75 × 电池温度 +
+ * 0.25 × 热点温度，热点温度实测均值 ≈ 43.5℃，恒定代入。不读温感区、无 root/Shizuku 也算
+ * 得出，渲染期从电池温度现算（不落库、不改 DB），旧会话照常出线。
+ */
+private const val VIR_TEMP_HOTSPOT_C = 43.5
+
+private fun virTempC(batteryTempC: Double?): Double? =
+    batteryTempC?.let { 0.75 * it + 0.25 * VIR_TEMP_HOTSPOT_C }
+
 /** CPU 占用率线（FPS 卡右轴候选；Kite 图例里的粉色） */
 private val CpuLoadPink = Color(0xFFF48FB1)
 
 /** GPU 占用率线（FPS 卡右轴候选；Kite 图例里的蓝色） */
 private val GpuLoadBlue = Color(0xFF64B5F6)
+/** GPU 频率线（2026-09-29 加，右轴 GPU(MHz) 候选；淡紫与 CpuLoadPink/GpuLoadBlue 区分） */
+private val GpuFreqPurple = Color(0xFF9575CD)
 
 /**
  * CPU Usage / CPU Frequency 两卡的分簇配色（Kite 同款：紫 / 亮青 / 深青 / 橙；
@@ -991,6 +1179,12 @@ private fun FrameLineChart(
     /** 左轴网格/刻度行数 = 顶线到底线的等分数（不标底档 0）：默认 4 等分；Power 卡传 7（Kite 观感） */
     leftTickCount: Int = 4,
     /**
+     * 非空 = 左轴刻度用这组**任意值**（CPU 频率卡：300MHz 一格 + 顶档 = 本场峰值 —— 等分
+     * 轴做不到"步长固定 300、轴顶却是任意峰值"），此时忽略 [leftTickCount]；值必须随
+     * [rememberChartInsets] 的同名参数一致传入，inset 计算与绘制才同一套刻度。
+     */
+    leftTickValues: List<Double>? = null,
+    /**
      * 绘图区左右内缩 = 轴标签区宽度。**必须由调用方按两侧标签实际宽度算好传入**
      * （[rememberChartInsets]，ClockTicks 的 x 刻度要用同一对值对位）——2026-09-25 前是
      * 固定 30/42dp，Power 卡的 1~2 字符轴标签（"3/2/1"、"50/0"）也占同样的宽度，
@@ -1010,7 +1204,7 @@ private fun FrameLineChart(
     // 一次重绘失效（重组波及 / 系统丢弃缓存 / 点图例）都会把 draw lambda 从头重跑。CPU 两卡
     // 12 条线 × 2400 点（250ms 快样）= 每次失效约 3 万次 moveTo/lineTo 的纯 CPU 几何计算，
     // 滑动中一插帧就掉。现在 Path 只在 lines / 轴区间 / 尺寸变化时重建一次，重绘只剩
-    // drawPath 指令录制；构建前先按绘图区像素宽做 min-max 抽稀（每 bin 保 min+max，峰谷不丢）。
+    // drawPath 指令录制。
     // ⚠️ 折线预渲染为位图（2026-09-28 横屏卡顿修复，用户实测减线即流畅定位）：
     // RT 每帧回放 12 条 stroke path（横屏 ~1.4 万段）的绘制命令 + 路径几何处理成本与
     // 线数/点数成正比，横屏绘制量是竖屏 ~1.7 倍 → 顶破 120Hz 帧预算（RT-issue 段大、
@@ -1027,8 +1221,14 @@ private fun FrameLineChart(
             val plotLeft = with(density) { startInset.toPx() }
             val plotW = (chartSize.width - plotLeft - with(density) { endInset.toPx() })
                 .coerceAtLeast(1f)
-            // 抽稀档位：每 ~3px 一个 bin —— 250ms 快样抽到几百点，视觉与全量点无差
-            val bins = (plotW / 3f).toInt().coerceIn(120, 600)
+            // ⚠️ 不做 min-max 抽稀（2026-09-28）：位图化后每帧只剩 drawImage、成本与点数
+            // 脱钩，抽稀省的只是重建时一次性的路径构建；而「一桶含任一 null → 整桶断线」
+            // 的口径会在密集会话（点数 > 2×bins）里把零星缺测放大成可见断口，得不偿失。
+            // ⚠️ 「断断续续」的真根因（2026-09-28 晚 xlsx 取证定案）：不是抽稀（518 点的
+            // 会话从未触发抽稀），是 fps=null 的拍被「缺测断线」画成洞——帧率差分 09-27
+            // 起回退 1s 完整拍后，timestats 图层 churn 每 ~8s 打掉一拍（全场 ~19% null、
+            // 几乎全是单拍），点距 ~5px 时每个洞肉眼可见 = 虚线观感。修法 = FPS 线的
+            // bridgeNullRun 短缺测桥接（见 FPS_LINE_BRIDGE_NULL_RUN），与本处无关。
             val bmp = ImageBitmap(
                 plotW.toInt().coerceAtLeast(1),
                 chartSize.height.coerceAtLeast(1),
@@ -1043,7 +1243,7 @@ private fun FrameLineChart(
                     lines.forEach { line ->
                         val r = (if (line.onRight) rightRange else leftRange) ?: return@forEach
                         val path = buildChartLinePath(
-                            downsampleForChart(line.values, bins), 0f, size.width, size.height, r,
+                            line.values, 0f, size.width, size.height, r, line.bridgeNullRun,
                         )
                         drawPath(path, line.color, style = Stroke(line.strokeWidth))
                     }
@@ -1067,8 +1267,15 @@ private fun FrameLineChart(
             val plotRight = size.width - endInset.toPx()
             val plotW = plotRight - plotLeft
             val dash = PathEffect.dashPathEffect(floatArrayOf(5f, 7f))
-            for (i in 1..leftTickCount) {
-                val y = size.height * (1 - i / leftTickCount.toFloat())
+            // 左轴网格行位置：等分（默认）或任意刻度值（leftTickValues，按左轴值域换算 frac）
+            val leftFracs: List<Float> = if (leftTickValues != null && leftRange != null) {
+                val span = leftRange.endInclusive - leftRange.start
+                leftTickValues.map { (1 - (it - leftRange.start) / span).toFloat() }
+            } else {
+                (1..leftTickCount).map { (1 - it / leftTickCount.toFloat()).toFloat() }
+            }
+            for (frac in leftFracs) {
+                val y = size.height * frac
                 drawLine(
                     gridColor,
                     Offset(plotLeft, y),
@@ -1092,16 +1299,30 @@ private fun FrameLineChart(
             labelPaint.textSize = 10.sp.toPx()
             labelPaint.color = labelColor.toArgb()
             leftRange?.let { r ->
-                val step = (r.endInclusive - r.start) / leftTickCount
                 labelPaint.textAlign = android.graphics.Paint.Align.RIGHT
-                for (i in 1..leftTickCount) {
-                    val y = size.height * (1 - i / leftTickCount.toFloat())
-                    drawContext.canvas.nativeCanvas.drawText(
-                        tickText(r.start + (r.endInclusive - r.start) * i / leftTickCount, step),
-                        plotLeft - 6.dp.toPx(),
-                        y + labelPaint.textSize / 3,
-                        labelPaint,
-                    )
+                if (leftTickValues != null) {
+                    val st = if (leftTickValues.size >= 2) leftTickValues[1] - leftTickValues[0] else 1.0
+                    val span = r.endInclusive - r.start
+                    for (v in leftTickValues) {
+                        val y = size.height * (1 - ((v - r.start) / span).toFloat())
+                        drawContext.canvas.nativeCanvas.drawText(
+                            tickText(v, st),
+                            plotLeft - 6.dp.toPx(),
+                            y + labelPaint.textSize / 3,
+                            labelPaint,
+                        )
+                    }
+                } else {
+                    val step = (r.endInclusive - r.start) / leftTickCount
+                    for (i in 1..leftTickCount) {
+                        val y = size.height * (1 - i / leftTickCount.toFloat())
+                        drawContext.canvas.nativeCanvas.drawText(
+                            tickText(r.start + (r.endInclusive - r.start) * i / leftTickCount, step),
+                            plotLeft - 6.dp.toPx(),
+                            y + labelPaint.textSize / 3,
+                            labelPaint,
+                        )
+                    }
                 }
             }
             rightRange?.let { r ->
@@ -1145,48 +1366,13 @@ private fun FrameLineChart(
 }
 
 /**
- * min-max 抽稀：把等间隔采样点压进 [bins] 个等宽 bin，每 bin 输出 min+max 两点（按
- * 时间序）——峰、谷一律保留，短谷可见性不受影响（FPS 卡 2026-09-27 的 4Hz 短谷口径不变）。
- * bin 内含 null/NaN（缺测）→ 该 bin 输出 null 断线，与「缺测断线」口径一致；点数不超过
- * 2×[bins] 时原样返回（短会话不抽）。
- */
-private fun downsampleForChart(values: List<Double?>, bins: Int): List<Double?> {
-    val n = values.size
-    if (n <= bins * 2) return values
-    val out = ArrayList<Double?>(bins * 2 + 2)
-    out.add(values.first())
-    val binW = n.toDouble() / bins
-    var start = 1
-    for (b in 0 until bins) {
-        val end = minOf(n, ceil((b + 1) * binW).toInt())
-        if (end <= start) continue
-        var hasNull = false
-        var minI = -1
-        var maxI = -1
-        for (j in start until end) {
-            val v = values[j]
-            if (v == null || v.isNaN()) {
-                hasNull = true
-                continue
-            }
-            if (minI == -1 || v < values[minI]!!) minI = j
-            if (maxI == -1 || v > values[maxI]!!) maxI = j
-        }
-        when {
-            hasNull || minI == -1 -> out.add(null)
-            minI <= maxI -> { out.add(values[minI]); out.add(values[maxI]) }
-            else -> { out.add(values[maxI]); out.add(values[minI]) }
-        }
-        start = end
-        if (start >= n) break
-    }
-    out.add(values.last())
-    return out
-}
-
-/**
  * 单条折线的 Path 构建（从 draw lambda 外移到组合期的版本，几何口径与旧实现逐字一致）：
  * x 按索引均分铺满绘图区，y 按轴量程线性映射，null/NaN 断线（moveTo 重新起笔）。
+ * [bridgeNullRun] > 0 时，连片缺测 ≤ 该数**跨接连线**（跳过缺测点，由下一个有效点直接
+ * lineTo 接上）；只有超阈值的长缺测段才断线——1s 节奏下 timestats 图层 churn 每 ~8s
+ * 打掉一拍（fps=null），点距数 px 时单拍断线就是肉眼可见的洞，把整条线打成虚线
+ * （2026-09-28 xlsx 取证：518 拍 99 个 null、89 个断口，80 个是单拍）。缺测点不参与
+ * 统计的口径不变，这里只管画的形态。
  * 点数不足 2 返回空 Path（drawPath 空路径 = 无操作）。
  */
 private fun buildChartLinePath(
@@ -1195,26 +1381,38 @@ private fun buildChartLinePath(
     plotWidth: Float,
     plotHeight: Float,
     range: ClosedFloatingPointRange<Double>,
+    bridgeNullRun: Int = 0,
 ): Path {
     val count = values.size
     if (count < 2) return Path()
     val span = range.endInclusive - range.start
     val path = Path()
     var drawing = false
-    values.forEachIndexed { i, v ->
+    var i = 0
+    while (i < count) {
+        val v = values[i]
         if (v == null || v.isNaN()) {
-            drawing = false
-            return@forEachIndexed
+            if (bridgeNullRun <= 0) {
+                drawing = false
+                i++
+                continue
+            }
+            var j = i
+            while (j < count && (values[j] == null || values[j]!!.isNaN())) j++
+            if (j - i > bridgeNullRun) drawing = false
+            i = j
+            continue
         }
         val px = plotLeft + plotWidth * i / (count - 1)
         val py = (plotHeight * (1 - ((v - range.start) / span))).toFloat()
         if (drawing) path.lineTo(px, py) else path.moveTo(px, py)
         drawing = true
+        i++
     }
     return path
 }
 
-/** FPS 卡右轴可切换序列（Kite 同款：电量 / 温度 / CPU Load / GPU Load） */
+/** FPS 卡右轴可多选叠加序列（Kite 同款：电量 / 温度 / CPU Load / GPU Load） */
 private class RightSeriesOption(
     val label: String,
     val range: ClosedFloatingPointRange<Double>,
@@ -1223,18 +1421,14 @@ private class RightSeriesOption(
 )
 
 /**
- * 帧率与温度卡：**双轴叠加 + 右轴可切换**（Kite 同款版式，2026-09-25）——
- * FPS 折线走左轴（灰，0 → 设备铺满刷新率），右轴在电量 / 温度 / CPU Load(%) / GPU Load(%) 间切换：
- * 点右上角 Refresh 钮循环轮换，或直接点底部图例选中（选中高亮、其余压暗，Kite 同款）。
- * 右轴值域随选项走（电量 / CPU / GPU 0-100，温度 0-50，右轴 5 档刻度）；缺测秒断线。
- * ⚠️ 整场无数据的候选自动不进切换列表（GPU Load 在本机 HyperOS 被 SELinux 拦 / 旧会话缺列）。
- */
-/**
- * 帧率与温度卡：**双轴叠加 + 右轴可切换**（Kite 同款版式，2026-09-25）——
- * FPS 折线走左轴（灰，0 → 设备铺满刷新率），右轴在电量 / 温度 / CPU Load(%) / GPU Load(%) 间切换：
- * 点右上角 Refresh 钮循环轮换，或直接点底部图例选中（选中高亮、其余压暗，Kite 同款）。
- * 右轴值域随选项走（电量 / CPU / GPU 0-100，温度 0-50，右轴 5 档刻度）；缺测秒断线。
- * ⚠️ 整场无数据的候选自动不进切换列表（GPU Load 在本机 HyperOS 被 SELinux 拦 / 旧会话缺列）。
+ * 帧率与温度卡：**双轴 + 右轴多曲线叠加**（Kite 版式，2026-09-28 单选改多选）——
+ * FPS 折线走左轴（灰，0 → 设备铺满刷新率），右轴候选电量 / 温度 / CPU Load(%) / GPU Load(%)：
+ * 点底部图例**切换勾选**（可多条同绘，选中高亮、未选压暗），右上角 Refresh 钮轮换到下一候选
+ * （收敛为单选）。右轴值域：纯温度 0-50、纯百分项 0-100；混选（温度+百分项）统一挂 0-100，
+ * 温度曲线落在轴下半区。
+ * ⚠️ 右轴标签区宽度**恒按 0-100 档预留**（用户 2026-09-28：温度 0-50 切换时绘图区宽度跳动）
+ * ——右轴标签从绘图区右缘起画，窄标签只是右侧多留白，绘图区宽度稳定不跳。
+ * ⚠️ 整场无数据的候选自动不进切换列表（GPU Load：节点全不可读的机器 / 旧会话缺列）。
  * ⚠️ FPS 线数据源（2026-09-27 4Hz 化）：新会话吃 250ms 子拍差分点（Scene 式密度、短谷可见），
  * 旧会话回退 1s 样本；右轴序列保持 1s 粒度、按索引比例重采样对齐子拍网格。
  */
@@ -1246,15 +1440,16 @@ private fun FrameFpsTempCard(
     shape: RoundedCornerShape,
 ) {
     // 右轴候选按**数据自适应**：整场一条数据都没有的选项不进切换列表 ——
-    // GPU Load 在 24031PN0DC / HyperOS 上 shell 身份对全部 GPU busy 节点拒绝（kgsl、
-    // /sys/kernel/gpu 两大目录 SELinux 拦截，2026-09-27 复测含 devfreq / tracefs / dumpsys
-    // 全家无收获），Shizuku 模式恒空 → 自动隐藏；root 模式或节点可读的 ROM 照常出现。
+    // GPU Load（2026-09-28 定案）：本机 kgsl 目录里 gpu_busy_percentage 等被 SELinux 拦，
+    // 但 gpubusy 漏网可读（Scene 同款通道，见 FrameRateSource.readGpuLoadPct）——
+    // 新会话应出数；旧会话（该列未采）与节点全不可读的机器仍自动隐藏。
     // 旧会话（v7 前）的 Battery/CPU 同理。TEMP 恒在（v1 起就有电池温度），保底不为空。
     // ⚠️ 文案在组合上下文先解析再进 remember（stringResource 不能在 remember 块里调）
     val batteryLabel = stringResource(R.string.frame_card_battery)
     val tempLabel = stringResource(R.string.frame_card_temp)
     val cpuLoadLabel = stringResource(R.string.frame_right_cpu_load)
     val gpuLoadLabel = stringResource(R.string.frame_right_gpu_load)
+    val gpuFreqLabel = stringResource(R.string.frame_right_gpu_freq)
     // FPS 线数据源：新会话吃 250ms 子拍点（短谷可见），旧会话回退 1s 样本。
     // 右轴序列是 1s 粒度 —— 索引制图要求两条线等长，按索引比例最近邻把 1s 值重采样到
     // 子拍点数（1s 值在 4Hz 网格上呈台阶、形状不变）
@@ -1269,7 +1464,12 @@ private fun FrameFpsTempCard(
         val n = fpsVals.size
         return List(n) { i -> this[((i.toLong() * size) / n).toInt().coerceAtMost(size - 1)] }
     }
-    val rightOptions = remember(samples, fpsPoints, batteryLabel, tempLabel, cpuLoadLabel, gpuLoadLabel) {
+    val rightOptions = remember(samples, fpsPoints, batteryLabel, tempLabel, cpuLoadLabel, gpuLoadLabel, gpuFreqLabel) {
+        // GPU 频率（2026-09-29 加）：值域按本场数据自适应取 500MHz 档上限（1000/1500/2000/2500…），
+        // 固定档会顶格裁尖或留大片空白；无数据的机器 / 旧会话整列 null → 选项自动不出现
+        val gpuFreqTop = samples.mapNotNull { it.gpuFreqMhz }.maxOrNull()
+            ?.let { max -> ((max / 500.0).toInt() + 1) * 500.0 }
+            ?: 1500.0
         listOfNotNull(
             RightSeriesOption(batteryLabel, 0.0..100.0, CapacityBlue, samples.map { it.capacityPct }.toFpsGrid())
                 .takeIf { o -> o.values.any { it != null } },
@@ -1278,10 +1478,23 @@ private fun FrameFpsTempCard(
                 .takeIf { o -> o.values.any { it != null } },
             RightSeriesOption(gpuLoadLabel, 0.0..100.0, GpuLoadBlue, samples.map { it.gpuLoadPct }.toFpsGrid())
                 .takeIf { o -> o.values.any { it != null } },
+            RightSeriesOption(gpuFreqLabel, 0.0..gpuFreqTop, GpuFreqPurple, samples.map { it.gpuFreqMhz }.toFpsGrid())
+                .takeIf { o -> o.values.any { it != null } },
         )
     }
-    var rightIdx by remember { mutableStateOf(0) }
-    val selected = rightOptions[rightIdx.coerceAtMost(rightOptions.lastIndex)]
+    // 右轴多选叠加：List 保**选择序**（标题按序拼接，后选中的线画在上层）。至少保一个 ——
+    // 全清空会让右轴刻度消失、绘图区变宽，又是一次跳动。Refresh 仍单选轮换。
+    // ⚠️ filter 兜底：rightOptions 随 samples 异步重建（空 → 有数据）时防旧下标越界
+    var rightSel by remember { mutableStateOf(listOf(0)) }
+    val sel = rightSel.filter { it < rightOptions.size }.ifEmpty { listOf(0) }
+    // 右轴值域：选中项值域全一致（纯温度 0-50 / 纯百分项 0-100）直接用；混选统一挂
+    // **最宽值域**（2026-09-29 从固定 0-100 改：GPU 频率 0-2500 与温度/百分项混选时，
+    // 固定 0-100 会把频率线压成贴底的直线）—— 值域窄的线落到轴下半区，诚实不裁剪。
+    // 兼容性：原有全部混选组合的最宽值域本就是 0-100（电池/百分项），行为不变。
+    val rightRange = remember(sel, rightOptions) {
+        val rs = sel.map { rightOptions[it].range }.distinct()
+        if (rs.size == 1) rs.first() else 0.0..(rs.maxOf { it.endInclusive })
+    }
     val fpsLineColor = MaterialTheme.colorScheme.onSurfaceVariant
     val durationMs = samples.last().timeMillis - samples.first().timeMillis
 
@@ -1305,9 +1518,17 @@ private fun FrameFpsTempCard(
                     modifier = Modifier.clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
-                    ) { rightIdx = (rightIdx + 1) % rightOptions.size },
+                    ) { rightSel = listOf((sel.last() + 1) % rightOptions.size) },
                 ) {
-                    Text(selected.label, style = MaterialTheme.typography.titleMedium)
+                    // 多选时标题按选择序拼接；weight(fill=false) 让超长串在给图标让位后省略，
+                    // 不把左侧 "FPS" 标题挤下卡片
+                    Text(
+                        sel.joinToString(" / ") { rightOptions[it].label },
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
                     Spacer(Modifier.width(6.dp))
                     Icon(
                         imageVector = MiuixIcons.Refresh,
@@ -1318,19 +1539,22 @@ private fun FrameFpsTempCard(
                 }
             }
             Spacer(Modifier.height(8.dp))
-            // 内缩按两侧标签实际宽度算（右轴切换后随选项重算）：标签贴卡片边缘，绘图区加宽
+            // 内缩按两侧标签实际宽度算；⚠️ 右侧宽度**恒按 0-100 档预留**（2026-09-28 用户反馈：
+            // 温度 0-50 与百分项 0-100 切换时，"50"→"100" 的标签宽度差牵动绘图区左右跳）——
+            // 右轴标签从绘图区右缘起画，窄标签只是右侧多留白，绘图区宽度稳定不跳
             val (fpsStartInset, fpsEndInset) =
-                rememberChartInsets(0.0..fpsAxisMax, selected.range, rightTickCount = 5)
-            val fpsLines = remember(fpsVals, selected, fpsLineColor) {
+                rememberChartInsets(0.0..fpsAxisMax, 0.0..100.0, rightTickCount = 5)
+            val fpsLines = remember(fpsVals, sel, rightOptions, fpsLineColor) {
                 listOf(
-                    FrameLine(fpsVals, fpsLineColor),
-                    FrameLine(selected.values, selected.color, onRight = true),
-                )
+                    // FPS 线开缺测桥接：timestats churn 的单拍 null 不再打断线（右轴不开——
+                    // 1s 值缺测在子拍网格上是 4 连 null，超桥接阈值，仍断线）
+                    FrameLine(fpsVals, fpsLineColor, bridgeNullRun = FPS_LINE_BRIDGE_NULL_RUN),
+                ) + sel.map { FrameLine(rightOptions[it].values, rightOptions[it].color, onRight = true) }
             }
             FrameLineChart(
                 lines = fpsLines,
                 leftRange = 0.0..fpsAxisMax,
-                rightRange = selected.range,
+                rightRange = rightRange,
                 rightTickCount = 5,
                 startInset = fpsStartInset,
                 endInset = fpsEndInset,
@@ -1338,7 +1562,8 @@ private fun FrameFpsTempCard(
             )
             ClockTicks(durationMs, startInset = fpsStartInset, endInset = fpsEndInset)
             Spacer(Modifier.height(6.dp))
-            // 图例：FPS + 四个右轴候选；当前选中高亮、其余压暗，点图例直接切换（Kite 同款方块标）
+            // 图例：FPS（恒显，左轴锚）+ 四个右轴候选；选中高亮、未选压暗，**点图例切换勾选**
+            // 多选叠加（Kite 同款方块标）；仅剩一个选中项时再点它不清空（右轴恒有线）
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.Center,
@@ -1347,13 +1572,19 @@ private fun FrameFpsTempCard(
                 JankLegendDot(fpsLineColor, "FPS")
                 rightOptions.forEachIndexed { i, opt ->
                     Spacer(Modifier.width(12.dp))
-                    val active = i == rightIdx
+                    val active = i in sel
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,
-                        ) { rightIdx = i },
+                        ) {
+                            rightSel = when {
+                                i in sel && sel.size > 1 -> sel - i
+                                i in sel -> sel
+                                else -> sel + i
+                            }
+                        },
                     ) {
                         Box(
                             Modifier
@@ -1380,14 +1611,15 @@ private fun FrameFpsTempCard(
 
 /**
  * Power(W) 卡：功率（左轴 W，蓝）+ 电池容量 %（右轴，浅蓝）—— Kite 同名卡。
- * ⚠️ 纵轴口径 = **放电为正**（Kite 观感；与顶部 AVG Power(W) 的"正=充电"口径相反，
- * 充电时曲线为负）。底部 MAX / MIN / AVG 为图中口径；容量 v7 起采集，旧会话整线缺失。
+ * ⚠️ 纵轴口径 = 功率大小（2026-09-28 起库里为绝对值口径，曲线恒正；旧"放电为正、
+ * 充电为负"的取反画法随 v6 数据纠正一并作废）。底部 MAX / MIN / AVG 为图中口径；
+ * 容量 v7 起采集，旧会话整线缺失。
  */
 @Composable
 private fun FramePowerCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
     // powerW remember（2026-09-28 滑动卡顿修复）：派生列表引用稳定，下游 lines →
     // FrameLineChart 的 Path 缓存不因重组失效
-    val powerW = remember(samples) { samples.map { it.powerMw?.let { mw -> -mw / 1_000.0 } } }
+    val powerW = remember(samples) { samples.map { it.powerMw?.let { mw -> mw / 1_000.0 } } }
     val powerVals = powerW.filterNotNull()
     val pMax = ceil(powerVals.maxOrNull() ?: 0.0).coerceAtLeast(1.0)
     // 左轴整洁多行刻度（2026-09-27 用户指 Kite 截图要求）：轴顶 = 步长整数倍、每行标签
@@ -1460,12 +1692,19 @@ private fun FramePowerCard(samples: List<FrameSample>, shape: RoundedCornerShape
 }
 
 /**
- * Temperature(°C) 卡：CPU（虚拟温度 = CPU 代表温感）/ GPU（GPU 温感区，v7 起采集）/
- * BAT（电池）三线共绘，y 轴固定 0..100（Kite 同款）；缺测断线，旧会话无 GPU 列整线缺失。
+ * Temperature(°C) 卡：CPU（温感区代表温度，需 root/Shizuku）/ GPU（GPU 温感区，v7 起采集）/
+ * BAT（电池）/ VIR（Kite virTemp 口径虚拟温度，见 [virTempC]，电池温度在即有）四线共绘，
+ * y 轴固定 0..50（Kite 同款）；缺测断线，旧会话无 GPU 列整线缺失。
+ * 卡内单线自适应：某条线整场无任何读数（如机型没有 GPU 温感区）则该线连同图例点不出现，
+ * 不画一个只有颜色的空图例。
  */
 @Composable
 private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
+    var showInfo by remember { mutableStateOf(false) }
     val durationMs = samples.last().timeMillis - samples.first().timeMillis
+    val hasCpuTemp = samples.any { it.tempVirtualC != null }
+    val hasGpuTemp = samples.any { it.gpuTempC != null }
+    val hasBatTemp = samples.any { it.tempBatteryC != null }
 
     AppCard(
         shape = shape,
@@ -1473,19 +1712,40 @@ private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape)
     ) {
         // 图表列不再吃横向 padding（同 Power 卡：轴标签贴边、绘图区加宽），标题行保留 16dp
         Column(Modifier.padding(vertical = 16.dp)) {
-            Text(
-                stringResource(R.string.frame_card_temperature),
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
+            Box(Modifier.fillMaxWidth()) {
+                Text(
+                    stringResource(R.string.frame_card_temperature),
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+                // VIR 虚拟温度说明 ⓘ（样式/交互同 Jank 卡：无水波纹、再点一次收起）
+                Icon(
+                    imageVector = MiuixIcons.Info,
+                    contentDescription = stringResource(R.string.frame_card_temp_vir_info_title),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 16.dp)
+                        .size(16.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                        ) { showInfo = !showInfo },
+                )
+            }
             Spacer(Modifier.height(8.dp))
             val (startInset, endInset) = rememberChartInsets(0.0..50.0, null)
-            val tempLines = remember(samples) {
-                listOf(
-                    FrameLine(samples.map { it.tempVirtualC }, CpuTempBlue),
-                    FrameLine(samples.map { it.gpuTempC }, GpuTempPurple),
-                    FrameLine(samples.map { it.tempBatteryC }, TempOrange),
-                )
+            // ⚠️ lines 必须稳定（remember 住）：FrameLineChart 按 lines 实例记忆折线位图，
+            // 每次重组新建 List 会把位图重建拖回每帧
+            val tempLines = remember(samples, hasCpuTemp, hasGpuTemp, hasBatTemp) {
+                buildList {
+                    if (hasCpuTemp) add(FrameLine(samples.map { it.tempVirtualC }, CpuTempBlue))
+                    if (hasGpuTemp) add(FrameLine(samples.map { it.gpuTempC }, GpuTempPurple))
+                    if (hasBatTemp) {
+                        add(FrameLine(samples.map { it.tempBatteryC }, TempOrange))
+                        add(FrameLine(samples.map { virTempC(it.tempBatteryC) }, VirTempGreen))
+                    }
+                }
             }
             FrameLineChart(
                 lines = tempLines,
@@ -1502,11 +1762,25 @@ private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape)
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                JankLegendDot(CpuTempBlue, "CPU")
-                Spacer(Modifier.width(14.dp))
-                JankLegendDot(GpuTempPurple, "GPU")
-                Spacer(Modifier.width(14.dp))
-                JankLegendDot(TempOrange, "BAT")
+                buildList {
+                    if (hasCpuTemp) add(CpuTempBlue to "CPU")
+                    if (hasGpuTemp) add(GpuTempPurple to "GPU")
+                    if (hasBatTemp) {
+                        add(TempOrange to "BAT")
+                        add(VirTempGreen to "VIR")
+                    }
+                }.forEachIndexed { index, (color, label) ->
+                    if (index > 0) Spacer(Modifier.width(14.dp))
+                    JankLegendDot(color, label)
+                }
+            }
+            // ⓘ 弹窗直接交 GlassDialog（自带入场动效），不包 AnimatedVisibility —— 理由同稳帧指数 ⓘ
+            if (showInfo) {
+                FrameInfoDialog(
+                    title = stringResource(R.string.frame_card_temp_vir_info_title),
+                    body = stringResource(R.string.frame_card_temp_vir_info),
+                    onDismiss = { showInfo = false },
+                )
             }
         }
     }
@@ -1606,6 +1880,10 @@ private fun coreUnderlays(
  * 每条簇线下方叠簇内逐核的淡色细线（多核簇才有；图例开关整簇）。
  * 数据源 = 250ms 快样（旧会话回退 1s 样本，只剩 Total 一条线）；逐核 / Total
  * 全缺的会话整卡隐藏。
+ *
+ * y 轴 = **0-100 每 10% 一档、含顶档 100 全标**（2026-09-29 用户指定 Scene 样式：
+ * 网格虚线每 10% 一条、标签 10/20/…/90/100，0 = 底轴不标 —— Scene 截图只到 90，
+ * 用户点名要补上 100）；190dp / 10 行 = 19dp 行距，10sp 居中标签不叠印。
  */
 @Composable
 private fun FrameCpuUsageCard(points: List<CpuPoint>, shape: RoundedCornerShape) {
@@ -1628,13 +1906,23 @@ private fun FrameCpuUsageCard(points: List<CpuPoint>, shape: RoundedCornerShape)
             }
         }
     }
-    FrameCpuMultiLineCard(stringResource(R.string.frame_card_cpu_usage), series, 0.0..100.0, points, shape)
+    FrameCpuMultiLineCard(
+        stringResource(R.string.frame_card_cpu_usage),
+        series,
+        0.0..100.0,
+        points,
+        shape,
+        leftTickCount = 10,
+    )
     SideEffect { ChartPerf.tick("cpuUsage.recompose") }
 }
 
 /**
  * CPU Frequency(MHz) 卡：四条分簇频率线（按簇聚合）+ 簇内逐核淡色细线。
- * y 轴 0 → 本场峰值向上取整到 300MHz 档（Kite 同款"顶格 = 实测峰值"的观感）；
+ * y 轴 = **300MHz 一格 + 顶档 = 本场记录到的最大频率**（2026-09-29 用户定案，Scene 同款
+ * —— Scene 顶上那个 3148 就是它自己那场库里的频率峰值、随场次变；「设备静态最大频率」
+ * 方案作废：Shizuku 虽可读 cpuinfo_max_freq（实测 24031PN0DC 逐核 3302/3149/2957/2266
+ * MHz）但按最终口径不再需要）。
  * ⚠️ 峰值必须把逐核细线算进去：单核升挡可以高出簇均值一大截，只按均值算顶格会被裁掉。
  */
 @Composable
@@ -1657,9 +1945,31 @@ private fun FrameCpuFreqCard(points: List<CpuPoint>, shape: RoundedCornerShape) 
     val yMax = remember(series) {
         val peak = series.flatMap { it.underlays + it }.flatMap { it.values }
             .filterNotNull().maxOrNull() ?: 0.0
-        (ceil(peak / 300.0) * 300.0).coerceAtLeast(300.0)
+        peak.coerceAtLeast(300.0)
     }
-    FrameCpuMultiLineCard(stringResource(R.string.frame_card_cpu_frequency), series, 0.0..yMax, points, shape)
+    // y 轴刻度 = 300MHz 整倍数 + 顶档 = 本场峰值（标签 %.0f，如 3148.8 → "3149"）。
+    // ⚠️ 距顶不足 minGap 的整倍数省略，否则与顶档标签叠印：3302 顶下 3300 只差 2MHz、
+    // 3148 顶下 3000 差 149 —— minGap 按「10sp 标签高 ~14dp / 绘图区 190dp」的比例随
+    // 轴顶缩放（3302 → 省略 3300 留 3000；3148 / 3053 → 省略 3000）。
+    val leftTickValues = remember(yMax) {
+        buildList {
+            var v = 300.0
+            val minGap = yMax * 14.0 / 190.0
+            while (v <= yMax - minGap) {
+                add(v)
+                v += 300.0
+            }
+            add(yMax)
+        }
+    }
+    FrameCpuMultiLineCard(
+        stringResource(R.string.frame_card_cpu_frequency),
+        series,
+        0.0..yMax,
+        points,
+        shape,
+        leftTickValues = leftTickValues,
+    )
     SideEffect { ChartPerf.tick("cpuFreq.recompose") }
 }
 
@@ -1667,6 +1977,8 @@ private fun FrameCpuFreqCard(points: List<CpuPoint>, shape: RoundedCornerShape) 
  * 多线共轴折线卡（CPU 两卡共用）：标题 + 折线 + 时间刻度 + 图例。
  * 图例点击切换对应线的显示/隐藏（截图中 Kite「Chart Options」的等价简化：
  * 隐藏以图例压暗表示，至少保留一条可见）；轴标签贴边内缩，同其它折线卡。
+ * [leftTickCount] = 左轴等分数（默认 4 等分；Usage 卡传 10 = Scene 同款每 10% 一档），
+ * 必须同喂 [rememberChartInsets] 与 [FrameLineChart]（inset 计算与绘制同一套刻度）。
  */
 @Composable
 private fun FrameCpuMultiLineCard(
@@ -1675,6 +1987,9 @@ private fun FrameCpuMultiLineCard(
     leftRange: ClosedFloatingPointRange<Double>,
     points: List<CpuPoint>,
     shape: RoundedCornerShape,
+    leftTickCount: Int = 4,
+    /** 非空 = 左轴任意刻度值（频率卡 300MHz 一格 + 顶档峰值），见 [FrameLineChart.leftTickValues] */
+    leftTickValues: List<Double>? = null,
 ) {
     var hidden by remember { mutableStateOf(setOf<Int>()) }
     // visible / lines 链条 remember（2026-09-28 滑动卡顿修复）：series 引用稳定后，
@@ -1695,7 +2010,12 @@ private fun FrameCpuMultiLineCard(
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
             Spacer(Modifier.height(8.dp))
-            val (startInset, endInset) = rememberChartInsets(leftRange, null)
+            val (startInset, endInset) = rememberChartInsets(
+                leftRange,
+                null,
+                leftTickCount = leftTickCount,
+                leftTickValues = leftTickValues,
+            )
             if (visible.isEmpty()) {
                 // 全部隐藏时占位等高：时间刻度与卡片布局不塌陷
                 Box(Modifier.fillMaxWidth().height(190.dp))
@@ -1713,6 +2033,8 @@ private fun FrameCpuMultiLineCard(
                     rightRange = null,
                     startInset = startInset,
                     endInset = endInset,
+                    leftTickCount = leftTickCount,
+                    leftTickValues = leftTickValues,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
@@ -1764,29 +2086,28 @@ private fun FrameCpuMultiLineCard(
 }
 
 /**
- * Frame Time(ms) 卡：每秒平均帧时间柱状图（Kite 同名卡）。
- * 底部 MAX / 方差 —— 方差为帧时间总体方差（稳帧指数是它的平方根，见 [FrameSummaryCard]）。
- * y 轴整步长 ≤7 档（[barAxisStep]），柱高按轴顶自适应（轴顶 = 步长整数倍 ≥ 本场峰值）。
+ * Frame Time(ms) 卡：**逐帧**帧时间柱状图（2026-09-28 起，Scene 同款渲染；旧会话回退
+ * 每秒平均柱 —— Kite 同名卡）。
+ *
+ * ⚠️ 为什么弃"每秒平均柱"：1s 平均把单帧尖刺全摊平 —— 同一份王者数据逐帧 MAX 157ms
+ * vs 秒均 MAX 13.31ms，秒均柱是一条 8ms 死线（用户对照 Scene 截图拍板改逐帧；与 Jank
+ * 卡旧口径全零同源，事故记录见 [frameJankStats] 上方）。
+ *
+ * - 逐帧渲染：y 轴 = vsync 整数倍网格（[FramePerFrameChart]；120Hz → 8.33ms/档、12 档
+ *   轴顶 100ms、标签 8/16/25/…/100 与 Scene 逐位一致），超顶帧钉在顶端，footer MAX =
+ *   最大单帧桶（≥1s 呈现中断不计，见 [flattenFrameTimes]）；
+ * - 方差：逐帧口径（[FrameJankStats.frameTimeVar]，稳帧指数的平方，两处口径一致）；
+ * - 旧会话（无 p2pHist 分布，frame.db v5 前落库）：回退每秒平均柱，y 轴整步长 ≤7 档
+ *   （[barAxisStep]），MAX = 秒均值最大值 —— 粒度局限同 [jankTiers]。
  */
 @Composable
-private fun FrameTimeCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
-    val ftVals = samples.map { it.frameSpaceMs }
-    val maxFt = (ftVals.maxOrNull() ?: 0.0).coerceAtLeast(1.0)
-    // y 轴整洁刻度（2026-09-27 用户报"最上面的 13 乱糟糟"）：旧版 yMax=峰值、12 档均分 ——
-    // 峰值非整数时档值取整出 13/12/11/9/8/7…跳档序列；且 150dp 高塞 11 格（13.6dp/格）
-    // 让顶档标签（画在线下方）与次档（画在线上方）几乎完全叠印成乱码。改整步长轴
-    // （1/2/5×10ⁿ 中档数 ≤7 的最小解）：轴顶 = 档数×步长 ≥ 峰值，每档都是整洁值、
-    // 行距 ≥21dp 不叠印（口径同 Power 卡左轴）
-    val (ftStep, ftTicks) = barAxisStep(maxFt)
-    val ftAxisMax = ftTicks * ftStep
-    val variance =
-        if (ftVals.size >= 2) {
-            val avg = ftVals.average()
-            ftVals.sumOf { (it - avg) * (it - avg) } / ftVals.size
-        } else {
-            null
-        }
-    val barColor = MaterialTheme.colorScheme.primary
+private fun FrameTimeCard(
+    samples: List<FrameSample>,
+    frameStats: FrameJankStats?,
+    refreshHz: Int,
+    shape: RoundedCornerShape,
+) {
+    val durationMs = samples.last().timeMillis - samples.first().timeMillis
     AppCard(
         shape = shape,
         modifier = Modifier.fillMaxWidth(),
@@ -1795,39 +2116,174 @@ private fun FrameTimeCard(samples: List<FrameSample>, shape: RoundedCornerShape)
             // 2026-09-27 用户拍板多语言化（此前"Kite 原文不译"的口径作废）
             Text(stringResource(R.string.frame_card_frame_time), style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(10.dp))
-            FrameBarChart(
-                values = ftVals,
-                barColors = List(ftVals.size) { barColor },
-                yMax = ftAxisMax,
-                yTickCount = ftTicks + 1,
-                durationMs = samples.last().timeMillis - samples.first().timeMillis,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "MAX: ${maxFt.f2()}ms  " +
-                    stringResource(R.string.frame_variance) + ": " + (variance?.f2() ?: "—"),
-                style = MaterialTheme.typography.labelMedium,
-                fontFamily = DetailNumericFont,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.fillMaxWidth(),
-                textAlign = TextAlign.Center,
-            )
+            if (frameStats != null) {
+                val frames = remember(samples) { flattenFrameTimes(samples) }
+                // vsync 步长：刷新率未知时按 120Hz 兜底（网格仍可读，只是档位假设）
+                val vsyncMs = if (refreshHz > 0) 1000.0 / refreshHz else 1000.0 / 120.0
+                FramePerFrameChart(frames, vsyncMs, durationMs, Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "MAX: ${frames.maxOrNull()?.f0() ?: "—"}ms  " +
+                        stringResource(R.string.frame_variance) + ": " + frameStats.frameTimeVar.f2(),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = DetailNumericFont,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center,
+                )
+            } else {
+                val ftVals = samples.map { it.frameSpaceMs }
+                val maxFt = (ftVals.maxOrNull() ?: 0.0).coerceAtLeast(1.0)
+                // y 轴整洁刻度（2026-09-27 用户报"最上面的 13 乱糟糟"）：旧版 yMax=峰值、12 档均分 ——
+                // 峰值非整数时档值取整出 13/12/11/9/8/7…跳档序列；且 150dp 高塞 11 格（13.6dp/格）
+                // 让顶档标签（画在线下方）与次档（画在线上方）几乎完全叠印成乱码。改整步长轴
+                // （1/2/5×10ⁿ 中档数 ≤7 的最小解）：轴顶 = 档数×步长 ≥ 峰值，每档都是整洁值、
+                // 行距 ≥21dp 不叠印（口径同 Power 卡左轴）
+                val (ftStep, ftTicks) = barAxisStep(maxFt)
+                val ftAxisMax = ftTicks * ftStep
+                val variance =
+                    if (ftVals.size >= 2) {
+                        val avg = ftVals.average()
+                        ftVals.sumOf { (it - avg) * (it - avg) } / ftVals.size
+                    } else {
+                        null
+                    }
+                val barColor = MaterialTheme.colorScheme.primary
+                FrameBarChart(
+                    values = ftVals,
+                    barColors = List(ftVals.size) { barColor },
+                    yMax = ftAxisMax,
+                    yTickCount = ftTicks + 1,
+                    durationMs = durationMs,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "MAX: ${maxFt.f2()}ms  " +
+                        stringResource(R.string.frame_variance) + ": " + (variance?.f2() ?: "—"),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = DetailNumericFont,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center,
+                )
+            }
         }
     }
 }
 
 /**
- * Jank 卡：卡顿秒柱状图（Kite 同名卡）。柱高恒 1（该秒命中某档即立柱），三档判定见
- * [jankTiers]（PerfDog 式口径）：小卡顿（灰）/ 卡顿（蓝）/ 严重卡顿（红），每秒只计最高一档。
- * 底部图例为三档秒数合计；ⓘ 打开口径说明。
+ * 逐帧帧时间柱状图（Scene 同款渲染，2026-09-28）：每一帧一根竖条、高度 = 该帧帧间隔。
+ *
+ * - y 轴 = vsync 整数倍网格，[lineCount] 档、轴顶 = vsync×12（120Hz → 100ms，Scene
+ *   同款；60Hz → 200ms），标签 = 档值向下取整（8/16/25/33/41/50/58/66/75/83/91/100，
+ *   与 Scene 截图逐位一致）；**超轴顶的帧钉在顶端画出**（Scene 同款），真值看 footer MAX；
+ * - **12 档全标**（2026-09-29 用户指定 Scene 样式，推翻上一版隔行标注）：绘图区加高到
+ *   200dp（150dp 塞 12 行 = 12.5dp/行，9sp 居中标签必然叠印；200dp = 16.7dp/行，
+ *   fontScale 1.3 下仍有余量 —— 防叠印口径同 barAxisStep 的"行距 ≥21dp"，本卡 12 档
+ *   放宽到 16.7dp 靠加高而不是减档）；
+ * - 网格 = **点状虚线**（dash 5f/7f，与 FrameLineChart 折线卡同一套；Scene 同款）；
+ * - x 轴 = 帧序号等分铺满全程（帧与帧的真实间隔不均匀，但亚像素密度下不可辨，时间
+ *   刻度仍按真实时长 [ClockTicks]）；
+ * - 绘制：等值段合并成单矩形（数据桶内升序展开，同高帧天然连成 run）—— 路径矩形数
+ *   = 每秒桶数级（~1.5k），不是帧数级（~8.6 万）；**run 宽与孤立帧最小 1px**（slotW
+ *   亚像素时单个尖帧才可见，密集段重叠成实心带 = Scene 的观感来源）。
  */
 @Composable
-private fun FrameJankCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
+private fun FramePerFrameChart(
+    frames: DoubleArray,
+    vsyncMs: Double,
+    durationMs: Long,
+    modifier: Modifier = Modifier,
+) {
+    val gridColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f)
+    val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val barColor = MaterialTheme.colorScheme.primary
+    val labelPaint = remember { android.graphics.Paint().apply { isAntiAlias = true } }
+    val lineCount = 12
+    val axisTop = vsyncMs * lineCount
+    val labels = (1..lineCount).map { "${(vsyncMs * it).toInt()}" }
+    val startInset = rememberBarChartLeftInsetLabels(labels)
+    // 点状虚线网格（与 FrameLineChart 同参数）
+    val gridDash = remember { PathEffect.dashPathEffect(floatArrayOf(5f, 7f)) }
+    Column(modifier) {
+        Box(Modifier.fillMaxWidth().height(200.dp)) {
+            Canvas(Modifier.fillMaxSize()) {
+                if (frames.isEmpty() || axisTop <= 0.0) return@Canvas
+                val plotLeft = startInset.toPx()
+                val plotW = size.width - plotLeft
+                val h = size.height
+                labelPaint.textSize = 9.sp.toPx()
+                labelPaint.color = labelColor.toArgb()
+                labelPaint.textAlign = android.graphics.Paint.Align.RIGHT
+                for (k in 1..lineCount) {
+                    val y = h * (1f - k / lineCount.toFloat())
+                    drawLine(
+                        gridColor,
+                        Offset(plotLeft, y),
+                        Offset(size.width, y),
+                        strokeWidth = 1f,
+                        pathEffect = gridDash,
+                    )
+                    // 标签垂直居中在横线上（baseline = y + textSize/3，口径同 FrameBarChart）
+                    drawContext.canvas.nativeCanvas.drawText(
+                        labels[k - 1],
+                        plotLeft - 6.dp.toPx(),
+                        y + labelPaint.textSize / 3,
+                        labelPaint,
+                    )
+                }
+                // 内部三条竖向分隔线 + 外框（与 FrameBarChart / FrameLineChart 同一套骨架）
+                for (q in 1..3) {
+                    val x = plotLeft + plotW * q / 4
+                    drawLine(gridColor, Offset(x, 0f), Offset(x, h), strokeWidth = 1f)
+                }
+                drawRect(
+                    labelColor.copy(alpha = 0.4f),
+                    topLeft = Offset(plotLeft, 0f),
+                    size = Size(plotW, h),
+                    style = Stroke(1f),
+                )
+                val slotW = plotW / frames.size
+                val path = Path()
+                var i = 0
+                while (i < frames.size) {
+                    val ms = frames[i]
+                    var j = i
+                    while (j < frames.size && frames[j] == ms) j++
+                    val x0 = plotLeft + i * slotW
+                    val w = ((j - i) * slotW).coerceAtLeast(1f)
+                    // 超轴顶的帧钉在顶端（Scene 同款）；单帧至少 1px 高保可见
+                    val bh = (ms / axisTop * h).toFloat().coerceIn(1f, h)
+                    path.addRect(Rect(x0, h - bh, x0 + w, h))
+                    i = j
+                }
+                drawPath(path, barColor)
+            }
+        }
+        ClockTicks(durationMs, startInset = startInset)
+    }
+}
+
+/**
+ * Jank 卡：卡顿柱状图（Kite 同名卡）。柱高恒 1（该秒命中某档即立柱）。
+ * 三档判定**逐帧口径**（[frameJankStats]，2026-09-28 重构 —— 旧口径把 83/125ms 单帧
+ * 门槛套在 1s 均值上，正常录制三档全零，事故记录在该函数上方）：小卡顿（灰）/
+ * 卡顿（蓝）/ 严重卡顿（红），每帧只计最高一档、每秒柱取该秒命中帧的最高档。
+ * 底部图例 = 全场三档**帧数**合计；旧会话（无 p2pHist 分布）回退 [jankTiers]，此时
+ * 图例为**秒数**（1s 均值口径，粒度局限见该函数注释）；ⓘ 打开口径说明。
+ */
+@Composable
+private fun FrameJankCard(
+    samples: List<FrameSample>,
+    frameStats: FrameJankStats?,
+    shape: RoundedCornerShape,
+) {
     var showInfo by remember { mutableStateOf(false) }
-    val tiers = jankTiers(samples)
     val gray = MaterialTheme.colorScheme.onSurfaceVariant
     val blue = MaterialTheme.colorScheme.primary
+    // 逐帧口径优先（图例=帧数）；旧会话回退 1s 均值口径（图例=秒数）
+    val tiers = frameStats?.tiers ?: jankTiers(samples)
     val barColors = tiers.map { tier ->
         when (tier) {
             1 -> gray
@@ -1836,9 +2292,9 @@ private fun FrameJankCard(samples: List<FrameSample>, shape: RoundedCornerShape)
             else -> Color.Transparent
         }
     }
-    val smallCount = tiers.count { it == 1 }
-    val jankCount = tiers.count { it == 2 }
-    val bigCount = tiers.count { it == 3 }
+    val smallCount = frameStats?.smallFrames ?: tiers.count { it == 1 }
+    val jankCount = frameStats?.jankFrames ?: tiers.count { it == 2 }
+    val bigCount = frameStats?.bigFrames ?: tiers.count { it == 3 }
 
     AppCard(
         shape = shape,
@@ -2086,16 +2542,25 @@ private fun rememberChartInsets(
     rightRange: ClosedFloatingPointRange<Double>?,
     rightTickCount: Int = 3,
     leftTickCount: Int = 4,
+    /** 非空 = 左轴刻度用这组**任意值**（CPU 频率卡 300MHz 一格 + 顶档峰值），忽略 leftTickCount */
+    leftTickValues: List<Double>? = null,
 ): Pair<Dp, Dp> {
     val density = LocalDensity.current
-    return remember(leftRange, rightRange, rightTickCount, leftTickCount, density) {
+    return remember(leftRange, rightRange, rightTickCount, leftTickCount, leftTickValues, density) {
         val paint = android.graphics.Paint().apply {
             isAntiAlias = true
             textSize = with(density) { 10.sp.toPx() }
         }
-        val widestLeft = leftRange
-            ?.let { r -> leftTickTexts(r, leftTickCount).maxOf { paint.measureText(it) } }
-            ?.let { with(density) { it.toDp() } }
+        val widestLeft = if (leftTickValues != null) {
+            val st = if (leftTickValues.size >= 2) leftTickValues[1] - leftTickValues[0] else 1.0
+            with(density) {
+                leftTickValues.maxOf { paint.measureText(tickText(it, st)) }.toDp()
+            }
+        } else {
+            leftRange
+                ?.let { r -> leftTickTexts(r, leftTickCount).maxOf { paint.measureText(it) } }
+                ?.let { with(density) { it.toDp() } }
+        }
         val widestRight = rightRange
             ?.let { r -> rightTickTexts(r, rightTickCount).maxOf { paint.measureText(it) } }
             ?.let { with(density) { it.toDp() } }
@@ -2111,18 +2576,23 @@ private fun rememberChartInsets(
  */
 @Composable
 private fun rememberBarChartLeftInset(yMax: Double, yTickCount: Int): Dp {
+    val step = yMax / (yTickCount - 1)
+    val labels = (0 until yTickCount - 1).map {
+        tickText(yMax * (1 - it.toFloat() / (yTickCount - 1)), step)
+    }
+    return rememberBarChartLeftInsetLabels(labels)
+}
+
+/** 同 [rememberBarChartLeftInset]，但直接吃标签文本（[FramePerFrameChart] 的 vsync 档不走 tickText） */
+@Composable
+private fun rememberBarChartLeftInsetLabels(labels: List<String>): Dp {
     val density = LocalDensity.current
-    return remember(yMax, yTickCount, density) {
+    return remember(labels, density) {
         val paint = android.graphics.Paint().apply {
             isAntiAlias = true
             textSize = with(density) { 9.sp.toPx() }
         }
-        var maxW = 0f
-        val step = yMax / (yTickCount - 1)
-        for (i in 0 until yTickCount - 1) {
-            val v = yMax * (1 - i.toFloat() / (yTickCount - 1))
-            maxW = maxOf(maxW, paint.measureText(tickText(v, step)))
-        }
+        val maxW = labels.maxOf { paint.measureText(it) }
         4.dp + with(density) { maxW.toDp() } + 6.dp
     }
 }

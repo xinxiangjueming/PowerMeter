@@ -158,12 +158,20 @@
         </activity>
 
         <!-- 趋势卡全屏页：真沉浸（隐藏状态栏 + 小白条）+ 避让摄像头。
-             不锁方向 → 跟随传感器，横竖屏都可用；configChanges 与 MainActivity 同口径
-             （旋转不重建，由 onConfigurationChanged 重放沉浸设置） -->
+             ⚠️ **锁横屏**：代码里 requestedOrientation = SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+             （允许 landscape ↔ reverseLandscape 随重力切换，用户转 180° 不会被钉死）。
+             configChanges 与 MainActivity 同口径（旋转不重建，由 onConfigurationChanged 重放沉浸设置）。
+             ⚠️ 窗口主题用 **Theme.PowerMeter.Transitions（半透明）**（2026-09-28 三改）：
+             本页是"跨方向一镜到底"的目标页，**不透明窗口会让被覆盖的 MainActivity 真 onStop**
+             —— 它既收不到 180° 翻转的配置分发（Android 12+ 的 landscape↔reverseLandscape
+             不回调 onConfigurationChanged），也不接收新 insets，返回后首帧只能沿用旧方向的
+             挖孔避让布局，随后才"突然避开"（用户实测）。半透明后主页只 onPause、全程可见
+             并实时跟随旋转与 insets 重排；旋转等待期与收拢期间裁剪窗口外直接露出**实时主页**，
+             整窗冻结截图因此不再需要（见 PowerMeterScreen.openTrendFullscreen）。 -->
         <activity
             android:name=".ui.TrendFullscreenActivity"
             android:exported="false"
-            android:theme="@style/Theme.PowerMeter"
+            android:theme="@style/Theme.PowerMeter.Transitions"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale|uiMode" />
 
         <!-- 帧率记录详情页：从「帧率监测」的历史列表点进单条记录。

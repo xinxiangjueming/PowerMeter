@@ -35,6 +35,10 @@ build*.log
 # ---- 工作区内部数据（含其它项目信息，不入库）----
 .workbuddy/
 
+# ---- 逆向 / 代理工具工作区（tmp = Metric APK 反编译产物 ~463MB）----
+tmp/
+.zcode/
+
 # ---- OS ----
 .DS_Store
 Thumbs.db

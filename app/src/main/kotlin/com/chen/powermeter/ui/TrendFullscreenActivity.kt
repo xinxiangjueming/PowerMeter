@@ -231,7 +231,13 @@ class TrendFullscreenActivity : ComponentActivity() {
      */
     override fun onPostCreate(savedInstanceState: Bundle?) {
         super.onPostCreate(savedInstanceState)
-        AppTransitions.installWindowTransform(this, anchorTransform = ::mapAnchorRect)
+        AppTransitions.installWindowTransform(
+            this,
+            anchorTransform = ::mapAnchorRect,
+            // 文字层（2026-09-28 三改）：锚点 = 整张趋势卡，锚点内文字矩形必须走与主矩形
+            // **同一套**旋转映射，否则跨方向装配下文字层错位（横屏源 → 映射恒等，直接可用）
+            textRectTransform = ::mapRectByRotation,
+        )
     }
 
     /**
@@ -253,8 +259,19 @@ class TrendFullscreenActivity : ComponentActivity() {
      * 2026-09-28 修纵向镜像（方案 A）：旧版 ROTATION_90 少镜像一次（y'=x）、ROTATION_270
      * 多镜像一次（y'=源宽−x），映射锚点整体落到屏幕纵向另一侧，展开/收拢对不上真实卡片。
      */
-    private fun mapAnchorRect(capture: AppTransitions.Capture): Rect {
-        val r = capture.rect
+    private fun mapAnchorRect(capture: AppTransitions.Capture): Rect =
+        mapRectByRotation(capture.rect, capture)
+
+    /**
+     * 纯旋转映射（2026-09-28 三改抽出）：**主矩形与内部文字矩形共用同一套** ——
+     * 主矩形经 [mapAnchorRect] 交 [AppTransitions.installWindowTransform] 的
+     * `anchorTransform`，文字矩形经本函数交其 `textRectTransform`。两者必须同源：
+     * 跨方向装配只换算主矩形、文字矩形原样使用就会错位（文字层挂在错误的窗口坐标）。
+     *
+     * 横屏源（源窗口已横屏，与目标窗口同方向）→ 恒等返回：不映射即可直接使用，
+     * 用户从横屏主页点 `< >` 的主用场景走这条分支。
+     */
+    private fun mapRectByRotation(r: Rect, capture: AppTransitions.Capture): Rect {
         if (capture.sourceWidth >= capture.sourceHeight) return r
         val rotation = display?.rotation ?: android.view.Surface.ROTATION_0
         val mapped = when (rotation) {
@@ -274,7 +291,7 @@ class TrendFullscreenActivity : ComponentActivity() {
         }
         Log.d(
             "TrendReveal",
-            "mapAnchorRect rotation=$rotation source=${r.toShortString()} mapped=${mapped.toShortString()}",
+            "mapRectByRotation rotation=$rotation source=${r.toShortString()} mapped=${mapped.toShortString()}",
         )
         return mapped
     }
@@ -282,12 +299,15 @@ class TrendFullscreenActivity : ComponentActivity() {
     /**
      * 关闭全屏页 —— 一镜到底时序：
      *
+     * ⓪ **恢复系统栏**（[NavigationBarHelper.exitImmersive]，2026-09-28 三改提前到位）：
+     *    本页改半透明窗口主题后主页全程可见，系统栏隐藏/恢复都会让主页实时重排
+     *    （顶栏高度 = safeDrawing 顶部 inset + 64dp），必须赶在收拢动画之前完成；
      * ① [closing] = true（页面内容同步淡出，t=0 立即有可见反馈）；
      * ② [AppTransitions.collapseAndFinish] 播收拢：整页从当前进度裁剪**收回到趋势卡
      *    矩形**（一镜到底的收拢半程，截图淡回），结束时 CollapseHost.finishNow 调
      *    [finish]（窗口关闭转场已压 0）；
-     * ③ [finish] 里发现收拢已完成 → [finishClosingSequence]：恢复系统栏 + 解除横屏锁定
-     *    —— 旋转发生在纯色屏之下，没有内容可重排；
+     * ③ [finish] 里发现收拢已完成 → [finishClosingSequence]：解除横屏锁定（系统栏已在 ⓪
+     *    恢复，此处幂等重放）—— 旋转发生在纯色屏之下，没有内容可重排；
      * ④ 等方向落地：`onConfigurationChanged` 接住；设备本就横握时不会触发 → 超时兜底；
      * ⑤ 方向落地后才真正 `super.finish()`，主页已是正确的竖屏单列。
      *
@@ -296,6 +316,10 @@ class TrendFullscreenActivity : ComponentActivity() {
     private fun requestClose() {
         if (closing) return
         closing = true
+        // ⓪ 系统栏提前恢复（理由见 KDoc）：主页在收拢动画开始前就排定"有系统栏"的终态布局，
+        //    避免收拢末帧与真实主页差一个状态栏高度（用户实测"动画完成后突然避开/跳一下"）。
+        //    本页自身内容只避 displayCutout、不含 systemBars，系统栏回归不改它的内容排布。
+        NavigationBarHelper.exitImmersive(this)
         if (AppTransitions.collapseAndFinish(this)) return
         finishClosingSequence()
     }
@@ -312,9 +336,10 @@ class TrendFullscreenActivity : ComponentActivity() {
         closing = true
         if (closeSequenceStarted) return
         closeSequenceStarted = true
-        // ① 系统栏恢复要在主页被绘制之前完成：主页顶栏高度 = safeDrawing 顶部 inset + 64dp
-        //    （PowerMeterScreen 的 topBarHeight），若等窗口销毁才恢复，主页首帧会先按
-        //    "无系统栏"排一次、再跳一次 —— 这是返回瞬闪的第二个来源
+        // ① 系统栏恢复：正常路径已在 [requestClose] ⓪ 提前执行（收拢动画之前 —— 主页据此
+        //    排定终态布局）；本行兜底降级路径（无收拢宿主 / 装配前就触发关闭），重复调用
+        //    幂等。主页顶栏高度 = safeDrawing 顶部 inset + 64dp（PowerMeterScreen.topBarHeight），
+        //    必须早于主页绘制生效，否则首帧先按"无系统栏"排一次、再跳一次
         NavigationBarHelper.exitImmersive(this)
         // ② 解锁方向 → 显示开始转回。旋转发生在纯色屏之下，没有内容可重排
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -361,9 +386,9 @@ class TrendFullscreenActivity : ComponentActivity() {
         val dark = (newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
         if (darkThemeState.value != dark) {
-            // 送达时本页还没 onStart（后台错过的变化）→ 静默落地（同 MainActivity，
-            // 判据见 ThemeTransition.isHostForeground）
-            if (!ThemeTransition.isHostForeground(this)) ThemeTransition.requestSilent()
+            // 送达时本页可能还没 onStart（后台错过的变化随返回事务补发）：不在这里判
+            // 静默（2026-09-29 用户定案，同 MainActivity）——由 PowerMeterTheme 闸门在
+            // 首帧判定：宿主已 RESUMED → 播圆孔揭露；仍 paused 可见 → 闸门静默落地
             darkThemeState.value = dark
         }
         if (closing) {
@@ -381,10 +406,9 @@ class TrendFullscreenActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         // 后台切换深浅兜底（configChanges 含 uiMode 的已知坑：后台时 ViewRootImpl 不分发
-        // 配置）——回前台读 Resources 最新值，走**静默通道**：错过的变化立即呈现目标主题、
-        // 不补播圆孔动画（2026-09-28）
+        // 配置）——回前台读 Resources 最新值；不静默（2026-09-29 用户定案，同 MainActivity）：
+        // 状态落地后由 PowerMeterTheme 闸门在 onResume 之后的首帧播圆孔揭露动画
         if (darkThemeState.value != isNightMode()) {
-            ThemeTransition.requestSilent()
             darkThemeState.value = isNightMode()
         }
     }

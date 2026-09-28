@@ -131,38 +131,27 @@ object ThemeTransition {
     fun activityOf(context: Context): Activity? = context.findActivity()
 
     /**
-     * 宿主是否处于「可播动画」状态（2026-09-28，用户报「左滑返回后界面闪回白色、右下角
-     * 又补播一遍圆孔」）：只有**已 RESUMED 的前台页**才播圆孔揭露。
+     * 宿主是否处于「可播动画」状态：只有**已 RESUMED 的页**才播圆孔揭露。
      *
-     * 被不透明二级页覆盖的源页（本项目详情页是不透明窗口，见 FrameDetailActivity 的
-     * Theme.PowerMeter）会真的走 onStop —— 后台期间系统 uiMode 变化分不到它
-     * （ViewRootImpl 不分发配置，2026-08-15 已记录），深浅状态只能在回前台的那一刻补。
-     * 那一刻窗口尚未上屏 / 尚未 resume，此时截图 + 播 800ms 圆孔 = 用户先看到旧主题首帧
-     * （"闪回白色"）、再补一遍切换动画（"右下角又出现过渡动画"）。
-     *
-     * 与 [requestSilent] 同一目的（错过的变化应立即呈现目标主题），但**不依赖**
-     * onResume / onConfigurationChanged 谁先落地：只要判定时宿主还没 resume，就不播动画。
-     * 真正的前台切换（用户在页面上切深浅）宿主必为 RESUMED，动画照播，零行为变化。
+     * 闸门在目标深浅变化后的首帧才触发，彼时宿主必已走完 onResume —— 从桌面/多任务/
+     * 息屏回前台的「后台错过的变化」由此自然放行播动画（2026-09-29 用户定案，推翻
+     * 2026-09-28 的"静默落地"决策；回前台瞬间窗口表面停留的旧主题帧正是揭露的起点画面）。
+     * 唯一被拦下的是「被半透明二级页盖着、paused 但可见」的本页：用户看的是二级页
+     * （它自己播动画），底下的本页静默换装，不双层各播一遍。
      */
     fun canAnimateFrom(activity: Activity?): Boolean = isHostForeground(activity)
 
     /**
      * 宿主是否已在前台（RESUMED）。
      *
-     * ⚠️ 这是判定"这次配置变化算不算前台切换"的**唯一可靠时刻**——必须在
-     * `onConfigurationChanged` 里判，不能等到闸门（2026-09-28 三轮设备实测时序，
-     * `TAG=PowerMeterTheme`）：
-     * ```
-     *   03:21:53.247 onConfigChanged dark=true state=false   ← 配置随"回前台事务"补发到本页
-     *   03:21:53.248 onStart handoff=true state=true
-     *   03:21:53.249 onResume state=true night=true
-     *   03:21:53.286 gate dark=true → 播圆孔动画（宿主前台）  ← 晚 40ms，宿主已 RESUMED
-     * ```
-     * 被覆盖过的页在**返回瞬间**才收到配置（后台期间一条都没有），且送达时本页**还没 onStart**
-     * （lifecycle 仍在 CREATED）。若此时按"前台切换"放行，用户看到的就是"返回先按旧主题画一帧
-     * （闪回白色）+ 紧接着补播 800ms 圆孔"。故 onConfigurationChanged 内用本判据：
-     * 送达时宿主未 RESUMED = 后台错过的变化 → 先 [requestSilent] 再由闸门静默落地。
-     * 真正的前台切换（用户在页面上切深浅）送达时宿主必为 RESUMED，动画照播。
+     * 历史注记（2026-09-28 → 2026-09-29 推翻）：本判据曾用在三处 Activity 的
+     * onConfigurationChanged 里区分「后台错过的变化」（送达时宿主未 RESUMED →
+     * [requestSilent] 静默落地），修的是"返回瞬间闪回旧主题 + 紧接着补播 800ms 圆孔"
+     * ——彼时详情页还是不透明窗口、源页真 onStop，错过配置的状态只能回前台补。
+     * 2026-09-29 用户定案：后台错过的变化回前台**要播动画**（旧主题停留帧 = 揭露起点
+     * 画面），且详情/趋势页已改半透明窗口主题（源页只 onPause 不停，不再有"被盖住收不到
+     * 配置"的源页），三处静默调用随之移除。现在只经 [canAnimateFrom] 供闸门拦
+     * 「paused 但被半透明二级页盖着可见」的场景。
      */
     fun isHostForeground(activity: Activity?): Boolean {
         val owner = activity as? LifecycleOwner ?: return false
@@ -200,11 +189,11 @@ object ThemeTransition {
     // 解决：退出方直接把目标深浅交给源页，源页在 onStart 落地，不依赖配置何时送达。
 
     /**
-     * 「静默切换」标记（2026-09-28 用户报「返回列表后补播一遍切换动画」修复）：
-     * 后台期间系统深浅已变化（配置变化只分发给可见 Activity，后台页在 onResume 兜底时
-     * 才侦测到）——这类**错过的变化**回到前台应直接呈现目标主题，不能补播圆孔动画。
-     * 由 Activity 的 onResume 兜底路径在更新深浅状态前调用，PowerMeterTheme 闸门消费
-     * （消费即清）。仅主线程访问。
+     * 「静默切换」标记：现仅由二级页退场交棒路径设置（MainActivity.applyExitHandoff）——
+     * 源页在首帧绘制前吃掉交棒深浅、直接呈现目标主题，不播动画。交棒场景下源页表面停留的
+     * 旧主题帧是"闪回旧色"（用户刚在二级页看过目标主题），不是揭露动画的合理起点。
+     * 后台错过的系统深浅变化 2026-09-29 起不再走静默：回前台播圆孔揭露（见
+     * [canAnimateFrom]）。闸门消费即清。仅主线程访问。
      */
     private var silentNext = false
 

@@ -109,8 +109,11 @@
     <string name="frame_energy_per_frame">帧能耗</string>
     <string name="frame_jank_rate">卡顿率</string>
     <string name="frame_steady_index">稳帧指数</string>
-    <string name="frame_steady_index_info">稳帧指数 = 帧时间标准差（ms），是 PerfDog 稳帧指数（Smooth，综合帧时间波动评估平稳度）的简化口径：数值越小，帧间隔越均匀，画面越稳。</string>
-    <string name="frame_jank_info">卡顿判定（PerfDog 式口径，按 1 秒粒度）：帧时间大于前 3 秒均值 2× 记小卡顿；再超过 83ms（两倍电影帧耗时）记卡顿；大于均值 3× 且超过 125ms 记严重卡顿。顶部卡顿率 = 卡顿总时长 ÷ 总时长。</string>
+    <string name="frame_steady_index_info">稳帧指数 = 逐帧帧时间标准差（ms）：数值越小，帧间隔越均匀，画面越平稳。逐帧帧时间取自每秒帧间隔分布（present-to-present 直方图）按单帧聚合；是 PerfDog 稳帧指数（Smooth）的简化口径。</string>
+    <string name="frame_jank_info">卡顿判定（PerfDog 式口径，逐帧粒度）：单帧耗时大于前 3 个有效秒均值 2× 记小卡顿；大于 83ms（两倍电影帧耗时）记卡顿；大于 125ms（三倍电影帧耗时）记严重卡顿。图例 = 全场各档卡顿帧数；卡顿率 = 卡顿/严重卡顿帧的耗时总和 ÷ 全部帧耗时。≥1s 的呈现间隔（切页/空闲）按中断处理不计入。</string>
+    <!-- 温度卡 VIR 虚拟温度说明（2026-09-29，Kite virTemp 口径：0.75×电池温度 + 0.25×43.5） -->
+    <string name="frame_card_temp_vir_info_title">VIR 虚拟温度</string>
+    <string name="frame_card_temp_vir_info">手机里没有任何一个热敏电阻装在人手握持的外壳表面——那是最需要知道温度的地方，却是最没法测的地方。VIR 就是为这个空位造出来的数：由实测的电池温度合成，virTemp ≈ 0.75 × 电池温度 + 0.25 × 43.5 ℃，其中 43.5 ℃ 是机身热点温度的实测均值，按常数代入。\n\n曲线略高于电池温度，随机身发热向 43.5 ℃ 收拢。可以把它当作“手握外壳的温感”的近似参考——它不是任何传感器的实测值。</string>
     <string name="frame_variance">方差</string>
     <!-- 详情页卡片标题 / 图例 / 右轴选项（2026-09-27 多语言化，原先硬编码英文） -->
     <string name="frame_card_power">功率(W)</string>
@@ -127,6 +130,15 @@
     <!-- FPS 卡右轴指标选项（Scene 同款命名：CPU/GPU Load，2026-09-27 加 GPU load 切换） -->
     <string name="frame_right_cpu_load" formatted="false">CPU 负载(%)</string>
     <string name="frame_right_gpu_load" formatted="false">GPU 负载(%)</string>
+    <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
+    <string name="frame_source_title">采样源</string>
+    <string name="frame_source_timestats">Timestats</string>
+    <string name="frame_source_latency">SF Latency</string>
+    <string name="frame_source_taskfps">TaskFps</string>
+    <string name="frame_source_desc_timestats">累计帧数差分，全机型可用</string>
+    <string name="frame_source_desc_latency">SurfaceFlinger 逐帧时间戳（Scene 同款解析），无累计计数器上限</string>
+    <string name="frame_source_desc_taskfps">系统主动推送帧率，零采样开销，需 Shizuku（Android 11+）</string>
+    <string name="frame_source_fallback">本机不可用，自动回落 Timestats</string>
     <!-- FPS 卡右上角：切换右轴指标（电量/温度/CPU/GPU load） -->
     <string name="frame_right_axis_switch">切换右轴指标</string>
 

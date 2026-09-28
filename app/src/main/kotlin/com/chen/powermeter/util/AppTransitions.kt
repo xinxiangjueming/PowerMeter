@@ -943,12 +943,20 @@ object AppTransitions {
      * 同方向（横→横，SportLink 原生场景）传 null，锚点原样使用。跨方向的换算不在此
      * 处执行：onPostCreate 时显示方向往往还没转，换算连同截图定位、展开几何一起
      * 推迟到下方 PreDraw 闸门（窗口横屏落地 + 尺寸稳定）里做。旋转等待期容器透明，
-     * 露出整窗截图垫底（pageBitmap 装配段 + [PageSnapshotView]）。
+     * 露出下层（目标页已改半透明窗口主题时 = **实时源页**，见 `underlayForCrossDirection`）。
+     *
+     * [textRectTransform] = 锚点**内部文字矩形**的换算钩子（可选，与 [anchorTransform]
+     * 同源）：跨方向装配下主矩形被换算、文字矩形若原样使用就会错位。目标页把同一套
+     * 旋转映射传进来（TrendFullscreenActivity.mapRectByRotation），文字层即可在跨方向
+     * 场景照常挂载 —— 挂载时机同样推迟到 PreDraw 闸门（此刻 display.rotation 才是终值，
+     * 且 content 原点可能已随旋转改变）。不传 = 跨方向不挂文字层（旧行为），
+     * 同方向（[anchorTransform] == null）不受影响、仍在装配时直接挂。
      */
     fun installWindowTransform(
         activity: Activity,
         anchorTransform: ((Capture) -> Rect)? = null,
         expandOnEnter: Boolean = true,
+        textRectTransform: ((Rect, Capture) -> Rect)? = null,
     ) {
         val content = activity.findViewById<ViewGroup>(android.R.id.content) ?: return
         val capture = consumePendingStart() ?: run {
@@ -980,13 +988,19 @@ object AppTransitions {
             } else {
                 capture.bgColor
             }
-        // 跨方向展开带整窗截图（X 方案，2026-09-28）：旋转等待期容器**透明**，露出垫在
-        // content 底层的"冻结主页"截图（系统旋转期间屏幕上是主页像素跟着转，不再有
-        // 纯色一拍）；横屏装配展开时再切回本底色（见下方 PreDraw 闸门）
-        val underlayForCrossDirection =
-            expandOnEnter && anchorTransform != null && capture.pageBitmap != null
+        // 跨方向展开的旋转等待期容器保持**透明**（2026-09-28 三改）：露出 content 下层。
+        // 旧实现靠垫整窗截图当"冻结主页"（X 方案），其前提是源页在详情页期间被 stopped、
+        // 窗口不许重绘；趋势全屏页改半透明窗口主题后源页只 onPause、全程可见并实时
+        // 跟随旋转与 insets 重排 ⇒ 直接露出**实时主页**（与系统旋转同步、永不过期），
+        // 不再需要整窗截图（它 180° 翻转后不会重绘，反而会把正确的主页盖住）。
+        // 横屏落地后的装配分支再切回本底色（见下方 PreDraw 闸门）。
+        val underlayForCrossDirection = expandOnEnter && anchorTransform != null
+        // 等待期容器**透明**仅在"无整窗截图可垫"时成立：带 pageBitmap 的调用方仍走旧
+        // X 方案（截图垫底 + 容器不透明）；趋势页当前不带截图（源页已半透明窗口、实时
+        // 可见）→ 保持透明，直接露出下层实时主页
+        val underlayTransparent = underlayForCrossDirection && capture.pageBitmap == null
         val w = ClipRevealLayout(activity).apply {
-            setBackgroundColor(if (underlayForCrossDirection) Color.TRANSPARENT else containerColor)
+            setBackgroundColor(if (underlayTransparent) Color.TRANSPARENT else containerColor)
             // 内容遮罩必须与容器底色同源：收拢时按 (1 - pageAlpha / anchorAlpha) 盖住详情页底色
             setVeilColor(containerColor)
             // 本体改纯色填充（2026-09-28）：不再采样锚点位图 —— 位图里任何"非表面色"
@@ -1005,8 +1019,9 @@ object AppTransitions {
             setAnchorCornerRadiusPx(ClipReveal.defaultAnchorRadiusPx(activity))
             // 文字层（可选）：分层绘制 = 卡片本体钉在原位、仅内部文字随窗口上边滑移
             // 渐隐（2026-09-27 SportLink 8452508 新版，修"列表文字整卡上滑/下滑"）。
-            // 仅同方向装配（anchorTransform == null）才挂：跨方向换算钩子只映射主矩形；
-            // 而跨方向页（趋势全屏）的锚点是紧凑按钮类、本就无文字层
+            // 同方向装配（anchorTransform == null）在此直接挂 —— 窗口本就是终态尺寸；
+            // 跨方向装配若提供了 [textRectTransform]，推迟到下方 PreDraw 闸门（方向落地后
+            // display.rotation 才是终值、content 原点也可能已随旋转改变）；未提供 = 不挂
             if (anchorTransform == null) {
                 capture.textBitmap?.let { tb ->
                     val t = capture.textRect ?: return@let
@@ -1118,6 +1133,9 @@ object AppTransitions {
                                         (mapped.bottom - loc[1]).toFloat(),
                                     )
                                     w.clearClip()
+                                    // 等待期容器透明（露出下层实时源页）：超时放弃跨方向展开时
+                                    // 同样要切回真实底色，否则页面内容显示在透明底上
+                                    if (underlayTransparent) w.setBackgroundColor(containerColor)
                                     page.alpha = 1f
                                     return true
                                 }
@@ -1140,8 +1158,8 @@ object AppTransitions {
                         // + 收拢终点登记 + 展开几何，四处共用同一份矩形
                         val mapped = anchorTransform?.invoke(capture) ?: capture.rect
                         host.sourceRect = Rect(mapped)
-                        // 等待期容器透明（露"冻结主页"垫底），装配展开时切回真实底色
-                        if (underlayForCrossDirection) w.setBackgroundColor(containerColor)
+                        // 等待期容器透明（无截图时露出下层实时源页），装配展开时切回真实底色
+                        if (underlayTransparent) w.setBackgroundColor(containerColor)
                         val loc = IntArray(2)
                         w.getLocationInWindow(loc)
                         w.setAnchorBitmap(
@@ -1151,6 +1169,29 @@ object AppTransitions {
                             (mapped.right - loc[0]).toFloat(),
                             (mapped.bottom - loc[1]).toFloat(),
                         )
+                        // 跨方向文字层（textRectTransform，见参数 KDoc）：与主矩形同一映射，
+                        // 且必须此刻登记 —— 方向已落地（rotation 是终值），content 原点
+                        // 也可能已随旋转改变，不能复用装配时那份 contentOrigin
+                        val textTransform = textRectTransform
+                        val textBmp = capture.textBitmap
+                        val textRect = capture.textRect
+                        if (textTransform != null && textBmp != null && textRect != null) {
+                            val textOrigin = IntArray(2)
+                            content.getLocationInWindow(textOrigin)
+                            val tm = textTransform(textRect, capture)
+                            w.setAnchorTextBitmap(
+                                textBmp,
+                                (tm.left - textOrigin[0]).toFloat(),
+                                (tm.top - textOrigin[1]).toFloat(),
+                                (tm.right - textOrigin[0]).toFloat(),
+                                (tm.bottom - textOrigin[1]).toFloat(),
+                            )
+                            Log.i(
+                                TAG,
+                                "cross text layer rect=${textRect.toShortString()} " +
+                                    "→ ${tm.toShortString()}",
+                            )
+                        }
                         val geometry = ClipReveal.buildRevealGeometry(
                             width = w.width.toFloat(),
                             height = w.height.toFloat(),

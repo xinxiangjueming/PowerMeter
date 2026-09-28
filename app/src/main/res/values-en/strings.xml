@@ -106,8 +106,11 @@
     <string name="frame_energy_per_frame">Energy/Frame</string>
     <string name="frame_jank_rate">Jank Rate</string>
     <string name="frame_steady_index">Steady Index</string>
-    <string name="frame_steady_index_info">Steady index = standard deviation of frame time (ms) — a simplified take on PerfDog\'s Smooth metric (overall smoothness from frame-time fluctuation). Lower is steadier.</string>
-    <string name="frame_jank_info">Jank policy (PerfDog-style, per second): frame time over 2× the previous 3-second average counts as small jank; over 83 ms (two movie-frame times) as jank; over 3× and 125 ms as big jank. Stutter rate = stutter duration ÷ total duration.</string>
+    <string name="frame_steady_index_info">Steady index = per-frame standard deviation of frame time (ms): lower means more even frame pacing and steadier rendering. Per-frame frame times come from each second\'s frame-interval distribution (present-to-present histogram), aggregated per frame; a simplified take on PerfDog\'s Smooth metric.</string>
+    <string name="frame_jank_info">Jank policy (PerfDog-style, per frame): a single frame over 2× the previous 3 valid seconds\' average counts as small jank; over 83 ms (two movie-frame times) as jank; over 125 ms (three movie-frame times) as big jank. Legend = janky frame counts; stutter rate = time of jank/big-jank frames ÷ total frame time. Intervals ≥1 s (page switches / idle) are treated as present gaps and excluded.</string>
+    <!-- VIR virtual temperature on the Temperature card (2026-09-29, Kite virTemp: 0.75×battery + 0.25×43.5) -->
+    <string name="frame_card_temp_vir_info_title">VIR virtual temperature</string>
+    <string name="frame_card_temp_vir_info">No phone packs a thermistor on the shell your hand actually holds — the surface you most want to know the temperature of is exactly the one that cannot be measured. VIR is a number invented for that gap: synthesized from the measured battery temperature, virTemp ≈ 0.75 × battery temp + 0.25 × 43.5 °C, where 43.5 °C is the measured average hot-spot temperature, plugged in as a constant.\n\nThe curve runs slightly above the battery temperature and converges toward 43.5 °C as the phone heats up. Treat it as an approximation of the warmth your hand feels on the shell — it is not a reading from any sensor.</string>
     <string name="frame_variance">Variance</string>
     <!-- Detail card titles / legends / right-axis options (localized 2026-09-27, was hardcoded English) -->
     <string name="frame_card_power">Power(W)</string>
@@ -123,6 +126,15 @@
     <string name="frame_card_frame_time" formatted="false">Frame Time(ms)</string>
     <string name="frame_right_cpu_load" formatted="false">CPU Load(%)</string>
     <string name="frame_right_gpu_load" formatted="false">GPU Load(%)</string>
+    <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
+    <string name="frame_source_title">FPS source</string>
+    <string name="frame_source_timestats">Timestats</string>
+    <string name="frame_source_latency">SF Latency</string>
+    <string name="frame_source_taskfps">TaskFps</string>
+    <string name="frame_source_desc_timestats">Cumulative frame-count diff, works on every device</string>
+    <string name="frame_source_desc_latency">Per-frame timestamps from SurfaceFlinger (Scene-style parser), no tracker cap</string>
+    <string name="frame_source_desc_taskfps">System-pushed FPS with zero sampling cost, requires Shizuku (Android 11+)</string>
+    <string name="frame_source_fallback">Unavailable here, falls back to Timestats</string>
     <string name="frame_right_axis_switch">Switch right axis</string>
 
     <!-- ==================== Frame rate monitor: recording overlay ==================== -->

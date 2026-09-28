@@ -43,4 +43,11 @@ data class FrameSession(
     val lowFps1: Double? = null,
     /** 5% Low 帧率：最差 5% 帧的平均帧率，口径同 [lowFps1] */
     val lowFps5: Double? = null,
+    /**
+     * 本场生效的**帧率采样源**（[com.chen.powermeter.data.FpsAlgorithm.key]，2026-09-29 加）：
+     * timestats / sf_latency / task_fps —— FPS 卡曲线与 Frame Time 的口径依据
+     * （sf_latency 的 p2pHist 是逐帧真值、task_fps 的 frameSpaceMs 是 1000/fps 推导值）。
+     * 可空 = 旧会话（该列未采集，按 timestats 口径展示）。
+     */
+    val fpsSource: String? = null,
 )

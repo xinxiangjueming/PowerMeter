@@ -32,7 +32,7 @@ import kotlin.math.abs
  * 字符串用 inlineStr，无需 sharedStrings/styles），零第三方依赖 —— Apache POI 单是
  * 打进 APK 就 10MB 级。产物 Excel / WPS 均可直接打开。
  *
- * ⚠️ 必须在后台线程调用（内含压缩与字符串拼接，4Hz × 30 分钟 ≈ 7200 行 × 30 列）。
+ * ⚠️ 必须在后台线程调用（内含压缩与字符串拼接，4Hz × 30 分钟 ≈ 7200 行 × 31 列）。
  */
 object FrameXlsxExporter {
 
@@ -89,6 +89,7 @@ object FrameXlsxExporter {
         sb.append("<cols>")
         sb.append("<col min=\"2\" max=\"2\" width=\"24\" customWidth=\"1\"/>")
         sb.append("<col min=\"3\" max=\"30\" width=\"13\" customWidth=\"1\"/>")
+        sb.append("<col min=\"31\" max=\"31\" width=\"24\" customWidth=\"1\"/>")
         sb.append("</cols>")
         sb.append("<sheetData>")
 
@@ -101,7 +102,10 @@ object FrameXlsxExporter {
             str(1, "Device Type")
             str(2, Build.MODEL)
             str(3, "Cadence")
-            str(4, if (fpsPoints.isNotEmpty()) "FPS/CPU 250ms, power/temp 1s" else "1s")
+            // Cadence 实况（2026-09-28 定案）：帧率差分 2026-09-27 起回退 1s 完整拍
+            // （真机实测 4Hz 读数异常，用户定案回退），250ms 子拍只剩 CPU 快样；
+            // 完整拍含取数命令超支，实际 ~1.3s/行
+            str(4, if (fpsPoints.isNotEmpty()) "FPS ~1s, CPU 250ms, power/temp 1s" else "1s")
         }
         row(sb, 3) {
             str(1, "Stat")
@@ -125,12 +129,14 @@ object FrameXlsxExporter {
             add("CPU(%)")
             for (i in 0..7) add("CPU$i(%)")
             for (i in 0..7) add("CPU$i(MHz)")
+            add("FrameTimeHist[1s]")
         }
         row(sb, 6) { headers.forEachIndexed { i, h -> str(i + 1, h) } }
 
         // 列号常量（1 起）：与 headers 顺序一一对应
         val colFrameSpace = 4
         val colPower = 6
+        val colHist = 31
 
         val timeFmt = SimpleDateFormat("yyyy-MM-dd_HH:mm:ss.SSS", Locale.US)
 
@@ -165,6 +171,7 @@ object FrameXlsxExporter {
                         s.gpuTempC?.let { num(11, it, 2) }
                         s.capacityPct?.let { num(12, it, 2) }
                         s.gpuLoadPct?.let { num(13, it, 2) }
+                        histText(s.p2pHist)?.let { str(colHist, it) }
                     }
                     c?.let { cc ->
                         cc.totalPct?.let { num(14, it, 1) }
@@ -193,6 +200,7 @@ object FrameXlsxExporter {
                     s.cpuUsagePct?.let { num(14, it, 1) }
                     s.cpuCoreUsagePct.forEachIndexed { core, pct -> pct?.let { num(15 + core, it, 1) } }
                     s.cpuMhz.forEachIndexed { core, mhz -> num(23 + core, mhz, 0) }
+                    histText(s.p2pHist)?.let { str(colHist, it) }
                 }
             }
         }
@@ -203,6 +211,15 @@ object FrameXlsxExporter {
 
     private fun avgPowerMw(samples: List<FrameSample>): Double? =
         samples.mapNotNull { it.powerMw }.takeIf { it.isNotEmpty() }?.average()
+
+    /**
+     * 帧间隔分布 → `ms:count,ms:count`（桶升序，与库里 p2pHist 列同格式）；
+     * 空 = null（该格留空 = 缺测，不是 0）。
+     */
+    private fun histText(hist: Map<Int, Long>): String? {
+        if (hist.isEmpty()) return null
+        return hist.entries.sortedBy { it.key }.joinToString(",") { "${it.key}:${it.value}" }
+    }
 
     /** Sum(Battery)[mWh]：相邻样本的 (平均功率 mW × 间隔 s) ÷ 3600 累加；两侧都有功率才计 */
     private fun batteryMwh(samples: List<FrameSample>): Double? {

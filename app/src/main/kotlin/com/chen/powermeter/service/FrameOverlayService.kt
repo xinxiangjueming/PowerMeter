@@ -123,6 +123,15 @@ class FrameOverlayService : Service() {
          */
         private const val PANEL_SCALE = 2f / 3f
 
+        /**
+         * tab 默认位的纵向比例（2026-09-29 用户口径，二次定稿）：**tab 中心点**落在
+         * 整屏高度**离顶 1/4** 处——用户说的"3/4 位置"是**自底部起算**（首轮按自顶
+         * 3/4 实现落在底部，用户纠正"我要的是顶部位置"），x 贴死屏幕右缘。
+         * 比例的基准是 maximumWindowMetrics 的整屏 bounds（含状态栏/导航条下面的
+         * 区域）——FLAG_LAYOUT_NO_LIMITS 下窗口坐标系就是它。
+         */
+        private const val DEFAULT_Y_RATIO = 0.25f
+
         /** 未选中胶囊的填充：半透明白，压在半透明黑面板上仍能看出边界 */
         private const val COLOR_CHIP_IDLE = 0x33FFFFFF.toInt()
 
@@ -155,6 +164,18 @@ class FrameOverlayService : Service() {
     /** tab 尺寸（attach 时按当前 density 算一次；onConfigurationChanged 重贴边时要用） */
     private var pillW = 0
     private var pillH = 0
+    /**
+     * tab 中心点的纵向比例（中心 y / 整屏高，0..1）：拖动时实时刷新，旋转重贴时按它
+     * 换算新方向的 y —— 高度机制是「比例跟随」而不是像素保持（2026-09-29 用户口径：
+     * 竖屏拖到 1/2 高，横屏也在 1/2 高）。
+     */
+    private var yRatio = DEFAULT_Y_RATIO
+    /**
+     * tab 当前贴哪一侧（false = 右）。旋转重贴必须用它而不能再算「更近侧」：竖屏的
+     * 左右缘物理上映射成横屏的上下缘，旋转后 tab 的横向落点与旧 x 基本无关，
+     * 近侧判定会随旋转方向翻转 —— 显式记住拖动时的侧别才贴得回用户放的那一边。
+     */
+    private var hugLeft = false
     private var panelView: LinearLayout? = null
     private var panelParams: WindowManager.LayoutParams? = null
     private var chipViews: List<TextView> = emptyList()
@@ -251,11 +272,25 @@ class FrameOverlayService : Service() {
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            // 默认位：安全区右缘留 4dp、垂直居中；每次开窗都从这里出发（2026-09-22 用户口径：
-            // 不再记忆上次拖动到哪，位置是每次的现场决定）
+            // ⚠️ fitInsetsTypes=0（2026-09-29 真机实证）：默认 fitTypes（STATUS/NAVIGATION/
+            // CAPTION）下，横屏贴死侧缘会撞上系统侧方 168px 条带，WM 的 fitInsets 机制把
+            // 窗口**平移出屏** —— ROTATION_90 请求 x=3049（贴右缘 3200），实际布局
+            // frame=[3217..3368]，整窗在屏幕外，两个横屏方向 tab 全部"凭空消失"（dumpsys
+            // 报 isVisible=true 也白搭）。置 0 = 窗口不参与 inset 平移/裁剪，NO_LIMITS 之下
+            // 贴哪算哪（minSdk=30 起可用，无需版本分支）。panel 的 params 同款（见 showPanel）。
+            fitInsetsTypes = 0
+            // ⚠️ cutout=ALWAYS（2026-09-29 第二层真机实证）：默认 DEFAULT 模式横屏会把挖孔
+            // 条带一侧的**父布局区**内收 168px —— 窗口 x/y 是相对父区原点算的，贴死右缘的
+            // x=3049 被布局成 frame.x=3217（父区偏移叠加）整个出屏；条带内的窗口内容也不渲染
+            // （ROTATION_270 frame 在屏内同样看不见）。ALWAYS = 允许进挖孔条带布局+渲染、
+            // 父区回到整屏（systemui 侧栏窗口同款），悬浮球贴物理边缘的标准做法。
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            // 默认位：x 贴死屏幕右缘（safe.right 就是右缘减 view 宽，系统栏横向 inset 恒 0）、
+            // tab 中心在整屏高度离顶 1/4 处（2026-09-29 用户口径，"3/4"自底部起算）；
+            // 每次开窗都从这里出发（2026-09-22 用户口径：不再记忆上次拖动到哪，位置是每次的现场决定）
             val safe = safeDragBounds(pillW, pillH)
-            x = (safe.right - dp(4f)).coerceAtLeast(safe.left)
-            y = safe.top + (safe.height() - pillH) / 2
+            x = safe.right
+            y = yForRatio(DEFAULT_Y_RATIO, safe)
         }
         pillParams = params
 
@@ -292,6 +327,9 @@ class FrameOverlayService : Service() {
                             val safe = safeDragBounds(pillW, pillH)
                             p.x = clampInt(startX + dx.toInt(), safe.left, safe.right)
                             p.y = clampInt(startY + dy.toInt(), safe.top, safe.bottom)
+                            // 记下高度比例与贴边侧别：旋转重贴全靠这两个现场值（见字段注释）
+                            yRatio = centerYRatio(p.y)
+                            hugLeft = p.x + pillW / 2f < (safe.left + safe.right) / 2f
                             runCatching { wm.updateViewLayout(pill, p) }
                             // 时长窗口是另一个 overlay 窗口，不会自动跟着 tab 走 —— 手动同步，
                             // 否则拖完 tab 面板会孤零零留在旧位置
@@ -465,6 +503,10 @@ class FrameOverlayService : Service() {
                 PixelFormat.TRANSLUCENT,
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
+                // 同 tab：不参与 inset 平移、允许进挖孔条带（addViews 里两条取证注释），
+                // 否则横屏面板跟着 tab 贴边时也会被平移出屏/条带内不渲染
+                fitInsetsTypes = 0
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
             }
             panelParams = params
             // addView 前先算位置；这一步里的 updateViewLayout 尚未 attach、会被 runCatching 吞掉，
@@ -592,18 +634,37 @@ class FrameOverlayService : Service() {
     }
 
     /**
+     * 纵向定位：tab **中心点**对齐 ratio × 整屏高，再夹进安全区。
+     * 竖屏默认位与旋转重贴共用这一个换算 —— 「屏幕高度的 3/4」这类口径才在两个方向上
+     * 表现一致（2026-09-29 用户口径）。整屏高取 maximumWindowMetrics.bounds：
+     * FLAG_LAYOUT_NO_LIMITS 下窗口坐标系原点就是它的左上角。
+     */
+    private fun yForRatio(ratio: Float, safe: Rect): Int {
+        val wm = windowManager ?: return safe.top
+        val screenH = wm.maximumWindowMetrics.bounds.height()
+        return clampInt((screenH * ratio - pillH / 2f).toInt(), safe.top, safe.bottom)
+    }
+
+    /** 当前 y（窗口左上角）换算回「中心点 / 整屏高」比例，供拖动时实时记进 [yRatio] */
+    private fun centerYRatio(y: Int): Float {
+        val wm = windowManager ?: return DEFAULT_Y_RATIO
+        val screenH = wm.maximumWindowMetrics.bounds.height()
+        if (screenH <= 0) return DEFAULT_Y_RATIO
+        return ((y + pillH / 2f) / screenH).coerceIn(0f, 1f)
+    }
+
+    /**
      * tab / 面板允许的**左上角坐标**范围：整屏 bounds 内、避开系统栏（2026-09-22 起）。
      *
      * 为什么 insets 不能省：`TYPE_APPLICATION_OVERLAY` 在 z 序上**低于**状态栏/导航条，
      * 配合 `FLAG_LAYOUT_NO_LIMITS` 把窗口拖进那两条区域会被系统栏盖住 —— 看得见摸不着。
-     * 所以可放范围 = [maximumWindowMetrics].bounds 再向内收系统栏。
+     * 所以纵向可放范围 = [maximumWindowMetrics].bounds 再向内收系统栏/挖孔。
      *
-     * ⚠️ **横向只避 systemBars，不避 displayCutout**（2026-09-25 用户口径：横屏 tab 要
-     * 贴住左右物理边缘，"按竖屏时的高度放左右两边"）：挖孔条带里没有系统 UI、不拦触摸，
-     * 覆盖窗口在挖孔区域内照样可点 —— 旧实现把挖孔 inset 也算进横向避让，横屏旋转后
-     * 挖孔转到左右两侧，安全区被推离物理边缘，默认位与拖动都贴不了边。系统栏（状态栏/
-     * 导航条）竖屏横屏都在上下短边，横向 systemBars inset 恒为 0，等于全程放开左右贴边。
-     * 纵向保留挖孔避让：竖屏顶部的挖孔条带要避开（别挡前摄）。
+     * ⚠️ **横向贴死物理边缘，不避任何 inset**（2026-09-29 用户口径两连发定稿：
+     * "悬浮tab为什么要避开摄像头区域""横屏不放边缘会遮挡游戏画面"——挖孔条带里
+     * 没有 UI、不拦触摸，贴进去只是贴着前摄旁，不挡游戏画面）。配合
+     * fitInsetsTypes=0（见 addViews 取证注释）：系统不再因侧方 inset 条带把窗口
+     * 平移出屏，横向贴死才真正可见。挖孔避让只在纵向保留：竖屏顶部避开前摄。
      *
      * ⚠️ 必须每次实时取（同拖动时的口径）：`maximumWindowMetrics` 随旋转刷新，
      * 用启动时的快照会出现「只能在旧方向的范围里拖」的陈旧度量问题。
@@ -617,8 +678,8 @@ class FrameOverlayService : Service() {
         val bounds = metrics.bounds
         val bars = metrics.windowInsets.getInsets(WindowInsets.Type.systemBars())
         val cutout = metrics.windowInsets.getInsets(WindowInsets.Type.displayCutout())
-        val left = bounds.left + bars.left
-        val right = (bounds.right - bars.right - viewW).coerceAtLeast(left)
+        val left = bounds.left
+        val right = (bounds.right - viewW).coerceAtLeast(left)
         val top = bounds.top + maxOf(bars.top, cutout.top)
         val bottom = (bounds.bottom - maxOf(bars.bottom, cutout.bottom) - viewH).coerceAtLeast(top)
         return Rect(left, top, right, bottom)
@@ -627,11 +688,13 @@ class FrameOverlayService : Service() {
     private fun clampInt(v: Int, min: Int, max: Int): Int = if (min > max) min else v.coerceIn(min, max)
 
     /**
-     * 旋转后重新贴边（2026-09-25 用户口径：横屏 tab 也要靠边，"按竖屏时的高度放左右两边"）：
-     * 横向贴回更近的那一侧物理边缘（左右两侧都可停靠），纵向保持原高度、夹进新方向的安全区
-     * —— 竖/横屏的安全区都是近似居中的带子，夹取后就是"与竖屏相同的比例高度"。
-     * 同时必须重算面板位置：面板坐标是绝对像素，竖屏算好的 y 一转横屏就可能整体落到
-     * 新屏幕高度之外（用户实测：横屏面板跑出屏幕）。
+     * 旋转后重新定位（2026-09-29 用户口径升级）：纵向按 [yRatio] **比例换算** ——
+     * 竖屏 tab 中心在整屏高的几成，横屏就落在几成（拖到 1/2 高转过来还是 1/2 高，
+     * 不再是旧实现的"保持绝对像素再夹回"）；横向按拖动时记住的侧别（[hugLeft]）
+     * **贴死**物理边缘。竖屏的左右缘物理上映射成横屏的上下缘，旋转后按旧 x 算
+     * 「更近侧」会随旋转方向翻转，故侧别必须显式记忆。同时必须重算面板位置：
+     * 面板坐标是绝对像素，竖屏算好的 y 一转横屏就可能整体落到新屏幕高度之外
+     * （用户实测：横屏面板跑出屏幕）。
      * ⚠️ 回调时 maximumWindowMetrics 个别 ROM 上尚未刷到新方向，post 一拍再取新度量。
      * 面板若在显示，[updatePanelPosition] 内部走同一套 [safeDragBounds] 自行夹取。
      */
@@ -641,9 +704,8 @@ class FrameOverlayService : Service() {
             val p = pillParams ?: return@post
             val wm = windowManager ?: return@post
             val safe = safeDragBounds(pillW, pillH)
-            val hugLeft = p.x + pillW / 2f < (safe.left + safe.right) / 2f
-            p.x = if (hugLeft) safe.left + dp(4f) else safe.right - dp(4f)
-            p.y = clampInt(p.y, safe.top, safe.bottom)
+            p.x = if (hugLeft) safe.left else safe.right
+            p.y = yForRatio(yRatio, safe)
             runCatching { wm.updateViewLayout(pillView, p) }
             updatePanelPosition()
         }
