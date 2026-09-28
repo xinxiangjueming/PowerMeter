@@ -206,14 +206,22 @@ fun PowerMeterScreen(
     // 收拢窗口内的底色与主页连续（View 层主题的 colorBackground 深色模式下不符，不能用）
     val pageBackgroundArgb = MaterialTheme.colorScheme.background.toArgb()
     // 趋势卡 → 全屏：起独立 Activity（真沉浸隐藏系统栏 + 避让摄像头 + **AppTransitions
-    // 一镜到底转场**，SportLink 运动选择 → 室内跑步同款：点击时按钮已经 register 锚点，
-    // 这里截图 + 经 Handoff 交接，目标页把页面根包进 ClipRevealLayout 从按钮矩形四向
-    // 撑开；退出收回到按钮矩形）。锚点矩形与截图全在 AppTransitions 内流转，此处不传参。
+    // 一镜到底转场**，SportLink 运动选择 → 室内跑步同款：点击时趋势卡已经 register 锚点
+    // （整卡矩形，2026-09-28 方案 A：原为 `< >` 胶囊，撑成整页时四边插值失衡），这里
+    // 截图 + 经 Handoff 交接，目标页把页面根包进 ClipRevealLayout，等横屏落地后从趋势卡
+    // 矩形四向撑开；退出收回到趋势卡矩形）。锚点矩形与截图全在 AppTransitions 内流转，此处不传参。
     // 采样数据无需跨页传递：全屏页直接读 SampleStore（实时环形缓冲）/ ImportedSeries 两个单例。
     val openTrendFullscreen: () -> Unit = {
         val act = context as? Activity
         if (act != null) {
-            val capture = AppTransitions.capture(act.window.decorView, pageBackgroundArgb)
+            // keepPageSnapshot = true（X 方案 2026-09-28）：整窗截图随 Handoff 带走供旋转
+            // 等待期垫底 —— 系统旋转期间屏幕上是主页像素跟着转（替代纯色一拍），横屏
+            // 落地后同一张截图按显示旋转转向，撑开/收拢窗口外露的也是"冻结主页"
+            val capture = AppTransitions.capture(
+                act.window.decorView,
+                pageBackgroundArgb,
+                keepPageSnapshot = true,
+            )
             TrendFullscreenActivity.launch(act, metric, capture)
         }
     }
@@ -829,13 +837,19 @@ internal fun TrendCard(
     /** 点击标题行右侧的颜色胶囊：打开该指标的颜色选择面板 */
     onColorClick: () -> Unit,
     shape: RoundedCornerShape,
-    /** 点击标题行右侧的 `< >` 胶囊：把本卡片放大到全屏（锚点由按钮经 AppTransitions 登记） */
+    /** 点击标题行右侧的 `< >` 胶囊：把本卡片放大到全屏（锚点 = 整张趋势卡，见 cardSource） */
     onFullscreenClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // 一镜到底锚点 = 整张趋势卡（2026-09-28 方案 A，原为卡内 `< >` 胶囊）：40×33dp 的
+    // 胶囊跨方向撑成 20:9 整页时四边线性插值速度极不平衡，观感是"拉伸甩动"而非"长大"；
+    // 整卡矩形的面积与长宽比都接近展开起点应有的形态。矩形经 containerSource 持续采集
+    // （滚动/换向自动跟随），由卡内 `< >` 胶囊的点击转发登记（FullscreenPillButton 的
+    // anchorSource）。
+    val cardSource = rememberContainerSource()
     AppCard(
         shape = shape,
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().containerSource(cardSource),
     ) {
         // ⚠️ 外层**只留垂直 padding**，水平内边距下放到各子节点 —— 目的是让指标 tab 行的
         // 滚动视口**撑满到卡片左右边框**。视口若被卡片内边距收窄，chip 会在距边框 16dp 处
@@ -868,7 +882,7 @@ internal fun TrendCard(
                         contentColor = colorButtonContent(),
                         onClick = onColorClick,
                     )
-                    FullscreenPillButton(onClick = onFullscreenClick)
+                    FullscreenPillButton(onClick = onFullscreenClick, anchorSource = cardSource)
                 }
             }
             Spacer(Modifier.height(10.dp))
@@ -968,16 +982,18 @@ internal fun ChartPillButton(
  * 全屏胶囊按钮（`< >`），样式对齐 SportLink `ChartSection.SmallPillButton`：
  * 深色底 #2E7D32 / 浅色底 #C8E6C9，13sp 加粗，圆角走 [LocalCornerRadius]。
  *
- * **容器变换源条目**（2026-09-26 对齐 SportLink）：自身登记为 [AppTransitions.Source]
- * （窗口矩形经 [Modifier.containerSource] 采集），点击时 [AppTransitions.register] 登记
- * 锚点 —— 趋势卡用它作全屏 Activity 的展开起点（截图 + 矩形，见 TrendFullscreenActivity
- * 的 onPostCreate 装配）；其余调用方（✕）也 register，无消费者时锚点按 TTL 过期丢弃。
+ * **容器变换源条目**（2026-09-26 对齐 SportLink）：点击时 [AppTransitions.register] 登记
+ * 锚点 —— 默认登记**按钮自身**（窗口矩形经 [Modifier.containerSource] 采集；✕ 等无
+ * 消费者的调用方也 register，锚点按 TTL 过期丢弃，无害）；趋势卡传 [anchorSource] =
+ * 整张卡片（2026-09-28 方案 A），展开起点/收拢终点从卡片矩形起算。
  */
 @Composable
 internal fun FullscreenPillButton(
     onClick: () -> Unit,
     text: String = "< >",
     modifier: Modifier = Modifier,
+    /** 点击时登记的锚点；null = 登记按钮自身。趋势卡传整卡 source 作一镜到底锚点 */
+    anchorSource: AppTransitions.Source? = null,
 ) {
     val isDark = isSystemInDarkTheme()
     val source = rememberContainerSource()
@@ -986,7 +1002,7 @@ internal fun FullscreenPillButton(
         background = if (isDark) Color(0xFF2E7D32) else Color(0xFFC8E6C9),
         contentColor = if (isDark) Color.White else Color.Black,
         onClick = {
-            AppTransitions.register(source)
+            AppTransitions.register(anchorSource ?: source)
             onClick()
         },
         modifier = modifier.containerSource(source),

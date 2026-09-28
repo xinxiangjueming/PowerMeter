@@ -130,9 +130,13 @@ class TrendFullscreenActivity : ComponentActivity() {
          * 打开趋势全屏页。
          *
          * 进入动画 = **AppTransitions 一镜到底**（SportLink 运动选择 → 室内跑步同款）：
-         * [capture]（`< >` 按钮截图 + 窗口矩形，源页经 [AppTransitions.capture] 产出）
-         * 经 Handoff 单例交接，本页 onPostCreate 把页面根包进 ClipRevealLayout、首帧从
-         * 按钮矩形四向撑开 + 截图交叉淡变；capture == null 时降级为主题窗口滑动。
+         * [capture]（趋势卡 + 整窗截图，源页经 [AppTransitions.capture](keepPageSnapshot)
+         * 产出，锚点 = 整张趋势卡，2026-09-28：原为 `< >` 胶囊，撑成整页时四边插值失衡）
+         * 经 Handoff 单例交接，本页 onPostCreate 把页面根包进 ClipRevealLayout，等显示
+         * 方向落地（横屏 + 尺寸稳定，见 AppTransitions 装配闸门）后从趋势卡矩形四向
+         * 撑开。旋转等待期垫整窗截图（X 方案：竖屏窗口 1:1 铺 = 主页本身跟着系统转，
+         * 不再有纯色一拍；横屏后按显示旋转转向，撑开/收拢窗口外露出同一张"冻结主页"）。
+         * capture == null 时降级为主题窗口滑动。
          * 窗口滑动动画双向压 0（见 onCreate ⑤），窗口内 ClipReveal 是唯一动画。
          */
         // internal：签名含 internal 的 Metric，public 会触发「public function exposes
@@ -193,8 +197,8 @@ class TrendFullscreenActivity : ComponentActivity() {
         setContent {
             PowerMeterTheme(darkTheme = darkThemeState.value) {
                 // 正常渲染全屏页 —— 转场不是覆盖层插入，而是 AppTransitions.installWindowTransform
-                // （onPostCreate）把**这棵页面根**包进 ClipRevealLayout、首帧从按钮矩形撑开
-                // （SportLink TrackActivity 同款结构：包根而非覆盖层，页面即本体）
+                // （onPostCreate）把**这棵页面根**包进 ClipRevealLayout、横屏落地后从趋势卡
+                // 矩形撑开（SportLink TrackActivity 同款结构：包根而非覆盖层，页面即本体）
                 TrendFullscreenScreen(
                     initialMetric = initialMetric,
                     closing = closing,
@@ -220,8 +224,10 @@ class TrendFullscreenActivity : ComponentActivity() {
 
     /**
      * 跨 Activity 一镜到底装配（SportLink TrackActivity 同款时机）：
-     * 有新鲜 Handoff（从趋势卡 `< >` 进入）→ 页面根包进 ClipRevealLayout、首帧从按钮
-     * 矩形四向撑开；无（通知/过期）→ no-op，页面普通显示 + 主题窗口动画。
+     * 有新鲜 Handoff（从趋势卡进入）→ 页面根包进 ClipRevealLayout，等窗口落地为横屏
+     * 且尺寸稳定后从趋势卡矩形四向撑开（2026-09-28 方案 A：竖屏源 → 强制横屏本页的
+     * 跨方向装配必须推迟，首帧即装配会按竖屏窗口算死几何）；无（通知/过期）→ no-op，
+     * 页面普通显示 + 主题窗口动画。
      */
     override fun onPostCreate(savedInstanceState: Bundle?) {
         super.onPostCreate(savedInstanceState)
@@ -230,25 +236,39 @@ class TrendFullscreenActivity : ComponentActivity() {
 
     /**
      * 锚点矩形换算钩子（installWindowTransform 统一应用：截图定位、展开几何、收拢终点）。
+     * 调用时机在 installWindowTransform 的横屏闸门里（窗口已落地为横屏尺寸，见
+     * AppTransitions 的 PreDraw 装配闸门），故 [display.rotation] 必为 90/270（或平板
+     * 等自然方向本就横屏、源窗口也横屏的直通分支）。
      *
      * - **横屏源**（用户横握主页，源窗口与目标窗口同方向）→ 原样使用，SportLink 原生场景；
      * - **竖屏源**（竖屏主页 → 强制横屏本页）→ 纯旋转映射：两侧窗口都全屏 edge-to-edge、
-     *   原点都落在物理屏左上（按各自 orientation 解读），x'/y' 按 rotation 轴交换：
-     *   ROTATION_90（设备逆时针、顶朝左）x'=y, y'=x → Rect(t, l, b, r)；
-     *   ROTATION_270（设备顺时针、顶朝右）x'=源高-y, y'=源宽-x。
-     *   ⚠️ 若装机后锚点飘到对角/镜像位置，优先交换两个 rotation 分支再查其他。
+     *   原点都落在物理屏左上（按各自 orientation 解读）：
+     *   ROTATION_90（设备逆时针转 90°、顶朝左）：x' = y, y' = 源宽 − x
+     *   → Rect(t, 源宽−r, b, 源宽−l)；
+     *   ROTATION_270（设备顺时针、顶朝右）：x' = 源高 − y, y' = x
+     *   → Rect(源高−b, l, 源高−t, r)。
+     *
+     * 推导口径：`Display.getRotation()` 语义 = 设备从自然方向**逆时针**转过的角度；
+     * 把源窗口四角在物理屏上的落位逐角对应到目标窗口坐标系即可自行验证。
+     * 2026-09-28 修纵向镜像（方案 A）：旧版 ROTATION_90 少镜像一次（y'=x）、ROTATION_270
+     * 多镜像一次（y'=源宽−x），映射锚点整体落到屏幕纵向另一侧，展开/收拢对不上真实卡片。
      */
     private fun mapAnchorRect(capture: AppTransitions.Capture): Rect {
         val r = capture.rect
         if (capture.sourceWidth >= capture.sourceHeight) return r
         val rotation = display?.rotation ?: android.view.Surface.ROTATION_0
         val mapped = when (rotation) {
-            android.view.Surface.ROTATION_90 -> Rect(r.top, r.left, r.bottom, r.right)
+            android.view.Surface.ROTATION_90 -> Rect(
+                r.top,
+                capture.sourceWidth - r.right,
+                r.bottom,
+                capture.sourceWidth - r.left,
+            )
             android.view.Surface.ROTATION_270 -> Rect(
                 capture.sourceHeight - r.bottom,
-                capture.sourceWidth - r.right,
+                r.left,
                 capture.sourceHeight - r.top,
-                capture.sourceWidth - r.left,
+                r.right,
             )
             else -> r
         }
@@ -263,7 +283,7 @@ class TrendFullscreenActivity : ComponentActivity() {
      * 关闭全屏页 —— 一镜到底时序：
      *
      * ① [closing] = true（页面内容同步淡出，t=0 立即有可见反馈）；
-     * ② [AppTransitions.collapseAndFinish] 播收拢：整页从当前进度裁剪**收回到 `< >` 按钮
+     * ② [AppTransitions.collapseAndFinish] 播收拢：整页从当前进度裁剪**收回到趋势卡
      *    矩形**（一镜到底的收拢半程，截图淡回），结束时 CollapseHost.finishNow 调
      *    [finish]（窗口关闭转场已压 0）；
      * ③ [finish] 里发现收拢已完成 → [finishClosingSequence]：恢复系统栏 + 解除横屏锁定

@@ -11,6 +11,9 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -57,6 +60,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -284,10 +288,20 @@ class FrameDetailActivity : ComponentActivity() {
                 // 帧率子拍点（250ms 级，2026-09-27 起）；空 = 子拍表建立前录的旧会话 →
                 // FPS 曲线回退 1s 样本
                 var fpsPoints by remember { mutableStateOf<List<FrameFpsSampleEntity>>(emptyList()) }
+                // 数据就绪闸门（2026-09-28 修进场"闪一下才加载好图表"）：读库走
+                // LaunchedEffect，首帧组合必然先于它完成 —— 期间 session=null，详情页会先
+                // 画一帧「not-found 空态」再整页换成图表卡，这个突变即用户看到的闪变。
+                // 加载中不渲染任何占位（半透明窗口透出底下列表）；就绪后内容淡入；读库
+                // 完成且确无记录才显示 not-found 文案（区分「还在加载」与「真没这条记录」）
+                var dataReady by remember { mutableStateOf(false) }
                 // 只在 sessionId 变化时读一次；旋转 / 深浅色切换不重建本 Activity 之外的
                 // 情形（configChanges 与主页同口径）本就不会走到这里
                 LaunchedEffect(sessionId) {
-                    if (sessionId == NO_ID) return@LaunchedEffect
+                    if (sessionId == NO_ID) {
+                        // 缺 / 非法 ID = 必然查无此记录，直接进 not-found（不能停在加载态）
+                        dataReady = true
+                        return@LaunchedEffect
+                    }
                     val loaded = withContext(Dispatchers.IO) {
                         val dao = FrameDatabase
                             .getInstance(this@FrameDetailActivity)
@@ -306,6 +320,7 @@ class FrameDetailActivity : ComponentActivity() {
                     samples = loaded.samples
                     cpuPoints = loaded.cpuPoints
                     fpsPoints = loaded.fpsPoints
+                    dataReady = true
                 }
 
                 // DialogBackdropHost：详情页弹窗（稳帧指数 / Jank ⓘ）走「宿主 + slot」玻璃路径。
@@ -317,6 +332,7 @@ class FrameDetailActivity : ComponentActivity() {
                         samples = samples,
                         cpuPoints = cpuPoints,
                         fpsPoints = fpsPoints,
+                        dataReady = dataReady,
                         onBack = { finish() },
                         onShare = { s, sm, fp, cp -> shareSession(s, sm, fp, cp) },
                     )
@@ -476,6 +492,8 @@ private fun FrameDetailScreen(
     cpuPoints: List<CpuPoint>,
     /** FPS 曲线的绘图点（250ms 子拍差分，旧会话回退 1s 样本，见 [FrameFpsTempCard]） */
     fpsPoints: List<FrameFpsSampleEntity>,
+    /** 读库是否完成（2026-09-28 加载态区分：未就绪不画 not-found 占位，见 Activity 侧说明） */
+    dataReady: Boolean,
     onBack: () -> Unit,
     /** 顶栏分享：按库里原生节奏导出 xlsx 并调起系统分享（Activity 侧实现） */
     onShare: (
@@ -489,6 +507,16 @@ private fun FrameDetailScreen(
     val cardShape = RoundedCornerShape(10.dp)
     val context = LocalContext.current
     SideEffect { ChartPerf.tick("detailScreen.recompose") }
+    // 内容淡入（2026-09-28 修进场"闪一下"）：读库在首帧组合之后才完成，session 从
+    // null→有值时整页图表卡首次组合（大场次组合重），硬切上屏就是闪变 —— 内容 alpha
+    // 0→1 把这次上屏藏进过渡。⚠️ 本常量必须挂在函数体顶层（session 未就绪时就组合），
+    // 放进 else 分支的话首次组合即达目标值 1f，不会有动画。仅 null→有值 动一次，之后
+    // 恒为 1f，滚动 / 深浅色切换不重播
+    val contentAlpha by animateFloatAsState(
+        targetValue = if (session != null) 1f else 0f,
+        animationSpec = tween(durationMillis = 220),
+        label = "frameDetailContentAlpha",
+    )
     // FPS 轴上限 = 设备铺满刷新率 + 2（2026-09-27 用户指定：铺满刷新率的曲线恰好顶在轴顶、
     // 视觉上像溢出，留 2fps 余量 —— 120Hz 铺满 → 0..122。取 supportedModes 最大值，如
     // 120/144；取不到退回录制时的激活刷新率）。remember(session)：supportedModes 是冷数据，
@@ -545,31 +573,45 @@ private fun FrameDetailScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 if (session == null) {
-                    Spacer(Modifier.height(48.dp))
-                    Text(
-                        stringResource(R.string.frame_not_found),
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    // 加载中（dataReady=false）不画任何东西：半透明窗口透出底下列表，比
+                    // 一帧假 not-found 干净；读库完成且确无记录才显示占位 —— 空白页上文字
+                    // 浮现，没有"内容被替换"的突变（2026-09-28）
+                    if (dataReady) {
+                        Spacer(Modifier.height(48.dp))
+                        Text(
+                            stringResource(R.string.frame_not_found),
+                            modifier = Modifier.fillMaxWidth(),
+                            textAlign = TextAlign.Center,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 } else {
-                    // 2026-09-25 重构：按 Kite 报告版式重排（不再照搬电池查看页的卡片区）——
-                    // 顶部统计网格 → 帧率与温度（双轴叠加）→ Frame Time → Jank → Power
-                    // → Temperature → CPU Usage → CPU Frequency（后两卡 2026-09-25 追加置底）
-                    FrameSummaryCard(session, samples, cardShape)
-                    if (samples.size >= 2) {
-                        FrameFpsTempCard(samples, fpsPoints, fpsAxisMax, cardShape)
-                        FrameTimeCard(samples, cardShape)
-                        FrameJankCard(samples, cardShape)
-                        FramePowerCard(samples, cardShape)
-                        FrameTempCard(samples, cardShape)
-                        // CPU 两卡按数据自适应显隐：占用卡在整场连 Total 都没有时隐藏；
-                        // 频率卡有任一核的有效读数即显示。数据源 = 250ms 快样（旧会话回退 1s）
-                        if (cpuPoints.any { it.totalPct != null || it.corePct.any { c -> c != null } }) {
-                            FrameCpuUsageCard(cpuPoints, cardShape)
-                        }
-                        if (cpuPoints.any { p -> p.mhz.any { m -> (m ?: 0.0) > 0.0 } }) {
-                            FrameCpuFreqCard(cpuPoints, cardShape)
+                    // 数据卡整体走 contentAlpha 淡入（见函数体顶层说明）；内层 Column 保持
+                    // 与外层相同的 12dp 卡间距，包一层只为挂 alpha
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .alpha(contentAlpha),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        // 2026-09-25 重构：按 Kite 报告版式重排（不再照搬电池查看页的卡片区）——
+                        // 顶部统计网格 → 帧率与温度（双轴叠加）→ Frame Time → Jank → Power
+                        // → Temperature → CPU Usage → CPU Frequency（后两卡 2026-09-25 追加置底）
+                        FrameSummaryCard(session, samples, cardShape)
+                        if (samples.size >= 2) {
+                            FrameFpsTempCard(samples, fpsPoints, fpsAxisMax, cardShape)
+                            FrameTimeCard(samples, cardShape)
+                            FrameJankCard(samples, cardShape)
+                            FramePowerCard(samples, cardShape)
+                            FrameTempCard(samples, cardShape)
+                            // CPU 两卡按数据自适应显隐：占用卡在整场连 Total 都没有时隐藏；
+                            // 频率卡有任一核的有效读数即显示。数据源 = 250ms 快样（旧会话回退 1s）
+                            if (cpuPoints.any { it.totalPct != null || it.corePct.any { c -> c != null } }) {
+                                FrameCpuUsageCard(cpuPoints, cardShape)
+                            }
+                            if (cpuPoints.any { p -> p.mhz.any { m -> (m ?: 0.0) > 0.0 } }) {
+                                FrameCpuFreqCard(cpuPoints, cardShape)
+                            }
                         }
                     }
                 }
@@ -587,23 +629,31 @@ private fun FrameDetailScreen(
         val topBarContent: @Composable () -> Unit = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text(
-                            session?.appLabel ?: stringResource(R.string.mode_frame),
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                        )
-                        if (session != null) {
+                    // 标题随数据 Crossfade（2026-09-28）：加载中是回退页名，就绪瞬间若硬切
+                    // 成应用名+时间戳副标题，与内容闪变同源 —— 一并用淡入抹平
+                    Crossfade(
+                        targetState = session,
+                        animationSpec = tween(durationMillis = 220),
+                        label = "frameDetailTitle",
+                    ) { s ->
+                        Column {
                             Text(
-                                stringResource(
-                                    R.string.frame_captured_at,
-                                    formatFrameStamp(session.startTime),
-                                ),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontFamily = DetailNumericFont,
+                                s?.appLabel ?: stringResource(R.string.mode_frame),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
                             )
+                            if (s != null) {
+                                Text(
+                                    stringResource(
+                                        R.string.frame_captured_at,
+                                        formatFrameStamp(s.startTime),
+                                    ),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontFamily = DetailNumericFont,
+                                )
+                            }
                         }
                     }
                 },
