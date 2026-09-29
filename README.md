@@ -89,7 +89,7 @@ X 轴按**时间比例**映射（预计算归一化时间分数 `FloatArray`）�
 - **避让挖孔**：窗口声明 `LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS`（否则默认模式会在挖孔侧留黑带），再交由 Compose 的 `WindowInsets.displayCutout` 全边避让 —— 竖屏顶部中央、横屏左右侧一次覆盖
 - 指标**多选**叠加对比，胶囊上带色点标识对应曲线色；至少保留一条（不允许清空）
 - tab 集合与主页同源（`rememberAvailableMetrics()`，PMIC 温度仅真 root 机器可选）；选中项与可用集合求交，交集为空则回落功率 —— 兜住「`rememberSaveable` 里存着本机当前不可用的指标」
-- 进入 / 返回走主题声明的四向水平滑动过渡（300ms）；**关闭时序有讲究**，见 [6.4](#64-趋势全屏页的关闭时序)
+- 进入 / 返回走 **AppTransitions 一镜到底转场**（ClipReveal 裁剪展开/收拢，跨 Activity 进出窗口动画压 0）：进入从趋势卡矩形四向撑开 —— 横屏主页首帧直开，竖屏主页先垫页面底色遮罩、等旋转沉降且主页按新方向重排完成后**现拍**趋势卡横屏矩形再展开；返回按设备朝向分流（横握/平放 = 收拢回卡片当前位置，明确竖握 = 侧滑滑出）。机制与踩坑实录见 [6.4](#64-趋势全屏页的一镜到底转场)
 
 ### 2.5 充电功率监测（默认关闭）
 
@@ -493,22 +493,30 @@ orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fo
 
 **一次性 Intent 必须用 `savedInstanceState == null` 兜住**：CSV 的 `VIEW` / `SEND` Intent 是一次性的，但深浅色切换、字体缩放、进程被杀后恢复都会重建 Activity 并把 intent 原样带回 `onCreate`。不拦一道就会重新解析整份文件、再弹一次 Toast。配合 `launchMode="singleTop"` + `onNewIntent`，应用运行中再从外部打开 CSV 不会在栈顶叠出第二个实例。
 
-### 6.4 趋势全屏页的关闭时序
+### 6.4 趋势全屏页的一镜到底转场
 
-从全屏页返回主页时，主页会**概率性闪一下**。这不是曲线绘制问题，闪的是**布局方向翻转**：
+跨 Activity 的容器变换转场（`util/AppTransitions.kt`，2026-09-30 起对齐 SportLink 图表卡），核心链路：
 
-`TrendFullscreenActivity` 锁的是显示方向（`SENSOR_LANDSCAPE`），被它覆盖的 `MainActivity` 也拿到横屏 Configuration；而 `MainActivity` 的 `configChanges` 含 `orientation|screenSize`（不重建），整页结构由 `LocalConfiguration.orientation` 分支 ⇒ 返回瞬间主页先按**横屏两列**画出来，显示转回后再翻成竖屏单列。
+**源端**：卡片挂 `Modifier.containerSource`（窗口矩形采集）+ `rememberContainerTextSource`（内部内容矩形），点击 `AppTransitions.register` → `capture`（decorView `View.draw` 整窗截图后裁出卡片 + 文字层 + 表面色采样）→ `launchWithTransform`（Handoff 单例 + 压制窗口滑动动画）。
 
-关闭必须四步走，**不能简化成直接 `finish()`**：
+**进场**（目标页 `onPostCreate` 调 `installWindowTransform`）：页面根包进 `ClipRevealLayout`，从源卡片矩形四向撑开（580ms FastOutSlowIn，截图 0→0.22 淡出 / 内容 0.48→0.88 淡入）。
 
-1. 先退出沉浸（系统栏回来，否则主页 `topBarHeight` 会跳一次）
-2. 解锁 `requestedOrientation = UNSPECIFIED` —— 让旋转发生在**内容已淡到主题底色**的纯色屏之下
-3. 等方向落地（`onConfigurationChanged`，关闭中**不**重放沉浸；加 `postDelayed(250ms)` 兜底，覆盖设备本就横握、不产生配置变更的情形）
-4. 才 `finish()`，交给主题声明的过渡动画
+- **横屏主页（同方向）**：首帧 PreDraw 直接撑开 —— 横屏源窗口即终态尺寸，无旋转叠层
+- **竖屏主页（跨方向，目标锁横屏）**：先垫不透明页面底色遮罩 + 整窗零尺寸裁剪，逐帧轮询「旋转沉降 ≥380ms 且主页按新旋转重排完成（活性源矩形落窗内且偏离 Handoff 矩形）」后**现拍**趋势卡的新鲜截图（真实横屏矩形 + 当前主题像素）再展开；超时（时间预算 2.5s）退化全宽中心线。展开完成/开始收拢时拆遮罩
 
-系统返回手势必须挂 `onBackPressedDispatcher.addCallback`，否则默认实现直接 finish，绕过整套时序。
+**返回**（`finish()` 按设备物理朝向分流）：
 
-**打开方向不需要这套处理**：本页是独立窗口，`setRequestedOrientation` 在启动窗口（StartingWindow）之下就生效，首帧即横屏。⇒ 这也是**否掉「单 Activity 覆盖层」重构**的原因：同 Activity 没有新窗口可遮，覆盖层首帧会按旋转前的方向画出来再重排（把坑从主页搬到全屏页）。
+- **横握/平放（显示停留横屏）**：还系统栏等 300ms（半透明窗口下主页被连带排成无栏全高，收拢前现取的锚点必须是还栏后位置 ——「还栏防列表跳动」）→ 收拢前向活性源条目**现取**当前矩形/新截图 → 420ms 收拢回真实卡片，末帧压制窗口过渡无缝切回
+- **明确竖握（显示将转回竖屏）**：不收拢，主题侧滑滑出 —— 收拢播在被本页钉住的横屏窗口里等于「先强制横屏再旋转」（2026-09-30 用户实测否决）
+
+**踩坑实录（每条都有装机日志或 `dumpsys` 实锤）**：
+
+1. **旋转横竖分支重建 → Source 孤儿**：主页 `if (landscape)` 两分支整体重建子树，`remember` 出的 Source 作废、bounds 冻结在竖屏坐标 —— 收拢现取/进场轮询读到的全是旧值（横握返回"直接闪"的根因）。修法 = 进程级 (Activity, siteId) 共享槽位（`AppTransitions.sharedSource`），重建后的新节点续刷同一实例（SportLink 0ad7e29 同款）
+2. **跨方向判定不能用目标页"当前 Configuration"**：锁横屏页的旋转在 `onPostCreate` 时**尚未落地**（配置仍报竖屏）—— 由调用页显式传 `landscapeTarget = true`；跟随方向的详情页不传（恒同方向装配）
+3. **轮询预算用时间不用帧数**：60 帧（SportLink 原值）在 120Hz 下只有 0.5s，而「旋转落地 + pause 态主页重排 + Compose 重组」实测 ~1s，必然误降级中心线。改 2.5s 时间预算（`dumpsys window` 实锤两窗口均已 3200×1440 而帧数预算已耗尽）
+4. **锚点截图必须在装配时挂载**：曾随方案 A 挪进 PreDraw 闸门，而闸门只对展开进场生效 —— `expandOnEnter=false` 的详情页收拢从此丢了卡片本体/文字滑移层，直到 2026-09-30 才发现回修
+5. **`View.draw` 整窗截图遇 `RuntimeShader` 会抛异常**（miuix 毛玻璃 highlight 在软件画布上拒绝绘制）：现拍路径捕获后降级 clip-only 展开（无截图交叉淡变、动画仍在），不会崩
+6. **竖握返回不能收拢**：收拢播在被钉住的横屏窗口里 = 「先强制横屏再旋转」；且加速度计在近水平持机姿势读数 UNKNOWN/抖动，平放必须单独归类为"停留横屏"，否则横握被误判竖握又回到闪退
 
 ### 6.5 Shizuku 集成要点
 
