@@ -1,10 +1,13 @@
 package com.chen.powermeter.ui
 
+import android.app.Activity
+import android.content.ContextWrapper
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalContext
 import com.chen.powermeter.util.AppTransitions
 
 /**
@@ -16,12 +19,19 @@ import com.chen.powermeter.util.AppTransitions
  * 的 decorView `View.draw` 同步绘制后裁出），文字层也只采集矩形（文字截图从同一张
  * 窗口位图上按矩形裁出，见 [rememberContainerTextSource]）。
  *
+ * [siteId] = 页面内唯一站位标识（可选，SportLink 0ad7e29 同款共享槽位）：
+ * **跨组合重建复用同一实例**（AppTransitions.sharedSource 按 Activity+siteId 存取）。
+ * 旋转时横竖屏布局分支切换会整体重建子树，`remember` 出的实例随之作废、坐标冻结在
+ * 旧方向（真机实锤 2026-09-30：趋势页竖→横后轮询/收拢现取读到的全是孤儿实例的旧
+ * 坐标）——共享实例让重建后的新节点继续刷新同一个 Source。列表项/复用组件必须带
+ * 条目键（同屏多实例共站会互相覆盖矩形）；不传 = 局部实例（无跨重建需求的原状）。
+ *
  * 只做采集，**不接管点击** —— 点击仍由调用方自己的 clickable 负责，
  * 不会与既有手势冲突。调用方在自己的点击回调里加一行 `AppTransitions.register(source)`。
  *
  * 用法：
  * ```
- * val source = rememberContainerSource()
+ * val source = rememberContainerSource("trend_card:power")
  * val textSource = rememberContainerTextSource(source)   // 可选：列表行类锚点的文字层
  * SomeCard(
  *     modifier = Modifier.containerSource(source),
@@ -31,7 +41,21 @@ import com.chen.powermeter.util.AppTransitions
  * ```
  */
 @Composable
-fun rememberContainerSource(): AppTransitions.Source = remember { AppTransitions.Source() }
+fun rememberContainerSource(siteId: String? = null): AppTransitions.Source {
+    if (siteId == null) return remember { AppTransitions.Source() }
+    // 页面级隔离：同进程多窗口并存（半透明二级页盖住源页）时，同站位 ID 互不串扰
+    val context = LocalContext.current
+    return AppTransitions.sharedSource(context.findActivityHash(), siteId)
+}
+
+private fun android.content.Context.findActivityHash(): Int? {
+    var ctx: android.content.Context = this
+    while (ctx is ContextWrapper) {
+        if (ctx is Activity) return System.identityHashCode(ctx)
+        ctx = ctx.baseContext
+    }
+    return null
+}
 
 fun Modifier.containerSource(source: AppTransitions.Source): Modifier =
     onGloballyPositioned { coordinates ->

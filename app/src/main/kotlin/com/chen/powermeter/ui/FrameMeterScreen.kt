@@ -25,6 +25,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -762,6 +763,15 @@ private fun FrameSessionCard(
     val textSource = rememberContainerTextSource(source)
     // 容器统一走 AppCard（全 App 唯一卡片实现）：此前这里用 ElevatedCard，其内部 Surface
     // 不传 tonalElevation（=0）→ 不吃 surfaceTint，与功率页 2dp 的卡片同色号却不同观感
+    // 按压预热（2026-09-30）：ACTION_DOWN 就在后台预读该场次数据（比 click 提前一整个
+    // 抬手），详情页首帧组合直接命中 FrameDetailPreheat 缓存 —— 读库等待从进场关键路径
+    // 上整段消失。按压 → capture（整窗截图）→ Activity 启动 → 首帧组合的窗口正好盖住读库
+    val context = LocalContext.current
+    val pressInteraction = remember { MutableInteractionSource() }
+    val pressed by pressInteraction.collectIsPressedAsState()
+    LaunchedEffect(pressed) {
+        if (pressed) FrameDetailPreheat.warm(context, session.id)
+    }
     AppCard(
         shape = shape,
         modifier = modifier
@@ -776,7 +786,7 @@ private fun FrameSessionCard(
                 // 灰色圆形斑块（被卡片圆角裁剪）会被烤进锚点截图、跟着一镜到底全程走
                 // （2026-09-27 用户截图实锤：卡片右端出现波纹形状的灰斑）。点击反馈由转场承担
                 .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
+                    interactionSource = pressInteraction,
                     indication = null,
                 ) {
                     AppTransitions.register(source)

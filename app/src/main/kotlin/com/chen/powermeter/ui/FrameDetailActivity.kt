@@ -56,6 +56,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
@@ -82,6 +83,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
@@ -107,7 +109,9 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
 import dev.chrisbanes.haze.hazeSource
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -136,12 +140,13 @@ private val DetailNumericFont = FontFamily.Monospace
 private const val FRAME_DETAIL_TOPBAR_BLUR = true
 
 /**
- * ⚠️ 临时排查工具（2026-09-28 横屏滑动卡顿问题，定位后移除）：仅主线程调用的轻量计数器。
- * 指标含义：
+ * ⚠️ 临时排查工具（2026-09-28 横屏滑动卡顿问题，定位后移除）：轻量计数器。指标含义：
  * - `*.recompose` = 该 Composable 重组频率（SideEffect 计数）；滑动中持续增长 = 有重组波及；
  * - `lineChart.draw` = FrameLineChart 绘制指令重录频率；滑动中逼近帧率 = 每帧重绘（有失效源）；
  * - `lineChart.buildPaths` = Path 预构建重建事件（期望：仅旋转/数据变化时出现）。
  * 输出行首 [H]/[V] = 横/竖屏（ChartPerf.orientation 由 Activity 维护）。
+ * tick/timed 仅主线程调用（HashMap 未加锁）；logBuild 自 2026-09-30 起也在位图后台构建
+ * 线程调用（只碰 Log 与 orientation 读取，无 Map 访问，线程无关）。
  */
 private object ChartPerf {
     private const val TAG = "FrameDetailPerf"
@@ -308,20 +313,18 @@ class FrameDetailActivity : ComponentActivity() {
                         dataReady = true
                         return@LaunchedEffect
                     }
-                    val loaded = withContext(Dispatchers.IO) {
-                        val dao = FrameDatabase
-                            .getInstance(this@FrameDetailActivity)
-                            .frameDao()
-                        val session = dao.session(sessionId)
-                        val samples = dao.samples(sessionId).map(FrameSampleEntity::toFrameSample)
-                        // 新会话直接吃 250ms 快样；旧会话（无快样行）回退 1s 样本的 CPU 字段
-                        val points = dao.cpuSamples(sessionId).let { fast ->
-                            if (fast.isNotEmpty()) fast.map { it.toCpuPoint() }
-                            else samples.map { it.toCpuPointFallback() }
-                        }
-                        val fps = dao.fpsSamples(sessionId)
-                        DetailData(session, samples, points, fps)
+                    // 预热命中（列表卡片按压时 FrameDetailPreheat 已在后台读好）→ 直接落地，
+                    // 读库等待从进场关键路径上整段消失；未命中走原读库链路
+                    val pre = FrameDetailPreheat.consume(sessionId)
+                    if (pre != null) {
+                        session = pre.session
+                        samples = pre.samples
+                        cpuPoints = pre.cpuPoints
+                        fpsPoints = pre.fpsPoints
+                        dataReady = true
+                        return@LaunchedEffect
                     }
+                    val loaded = loadDetailData(this@FrameDetailActivity, sessionId)
                     session = loaded.session
                     samples = loaded.samples
                     cpuPoints = loaded.cpuPoints
@@ -502,12 +505,70 @@ class FrameDetailActivity : ComponentActivity() {
 }
 
 /** 详情页一次装载的四件套（sessionId 变化时读一次） */
-private class DetailData(
+internal class DetailData(
     val session: FrameSession?,
     val samples: List<FrameSample>,
     val cpuPoints: List<CpuPoint>,
     val fpsPoints: List<FrameFpsSampleEntity>,
 )
+
+/**
+ * 详情页四件套读库（内部已切 IO）。[FrameDetailPreheat] 与 Activity 的 LaunchedEffect
+ * 走同一条链，口径永远一致（实体映射 / CPU 快样回退 / 子拍点读取都在这一处）。
+ */
+internal suspend fun loadDetailData(context: Context, sessionId: Long): DetailData =
+    withContext(Dispatchers.IO) {
+        val dao = FrameDatabase.getInstance(context).frameDao()
+        val session = dao.session(sessionId)
+        val samples = dao.samples(sessionId).map(FrameSampleEntity::toFrameSample)
+        // 新会话直接吃 250ms 快样；旧会话（无快样行）回退 1s 样本的 CPU 字段
+        val points = dao.cpuSamples(sessionId).let { fast ->
+            if (fast.isNotEmpty()) fast.map { it.toCpuPoint() }
+            else samples.map { it.toCpuPointFallback() }
+        }
+        val fps = dao.fpsSamples(sessionId)
+        DetailData(session, samples, points, fps)
+    }
+
+/**
+ * 详情页数据预热（2026-09-30 治展开动画与首帧构建抢 UI 线程的「挪时间窗」半边）：
+ * 列表卡片**按压**（ACTION_DOWN，比 click 提前一整个抬手）就在后台预读该场次四件套，
+ * 详情页首帧组合时 [consume] 命中即用 —— 读库等待从进场关键路径上整段消失，dataReady
+ * 闸门提前放行、展开动画更早起跑。按压 → capture（整窗截图）→ Activity 启动 → 首帧组合
+ * 的窗口（~100-300ms）正好盖住读库耗时。
+ *
+ * 单槽位 + 请求序号：连续按压/换卡时只有**最后一次** warm 的结果落地；consume 一次性
+ * 取走。场次数据落库后不可变（录制停止时一次性写入），缓存不存在陈旧问题。
+ */
+internal object FrameDetailPreheat {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val lock = Any()
+    private var warmed: Pair<Long, DetailData>? = null
+    private var warmSeq = 0L
+
+    fun warm(context: Context, sessionId: Long) {
+        val seq = synchronized(lock) {
+            if (warmed?.first == sessionId) return
+            ++warmSeq
+        }
+        scope.launch {
+            val data = try {
+                loadDetailData(context.applicationContext, sessionId)
+            } catch (e: Exception) {
+                Log.w(TAG, "detail preheat session=$sessionId failed: ${e.message}")
+                null
+            }
+            // 查无此记录不缓存；过期请求（期间又按了别的卡）不落地
+            if (data == null || data.session == null) return@launch
+            synchronized(lock) { if (seq == warmSeq) warmed = sessionId to data }
+        }
+    }
+
+    /** 取走预热数据（仅 sessionId 匹配时）；详情页主线程在 LaunchedEffect 里调用 */
+    fun consume(sessionId: Long): DetailData? = synchronized(lock) {
+        warmed?.takeIf { it.first == sessionId }?.also { warmed = null }?.second
+    }
+}
 
 @Composable
 private fun FrameDetailScreen(
@@ -1246,48 +1307,25 @@ private fun FrameLineChart(
     // 视觉 1:1 无损），每帧只剩一条 drawImage 贴图命令 —— 即「画好存成一张图片」，
     // 成本与线数彻底脱钩。网格 / 轴标签留在实时绘制（命令数少、与线数无关）。
     // 位图仅在 lines / 轴区间 / 尺寸 / 主题色变化时重建（含旋转一次）。
-    val lineBitmap = remember(lines, leftRange, rightRange, chartSize, startInset, endInset, density) {
-        val t0 = System.nanoTime()
-        val maxCount = lines.maxOfOrNull { it.values.size } ?: 0
-        val bmp = if (chartSize.width < 2 || chartSize.height < 2 || maxCount < 2) {
-            null
-        } else {
-            val plotLeft = with(density) { startInset.toPx() }
-            val plotW = (chartSize.width - plotLeft - with(density) { endInset.toPx() })
-                .coerceAtLeast(1f)
-            // ⚠️ 不做 min-max 抽稀（2026-09-28）：位图化后每帧只剩 drawImage、成本与点数
-            // 脱钩，抽稀省的只是重建时一次性的路径构建；而「一桶含任一 null → 整桶断线」
-            // 的口径会在密集会话（点数 > 2×bins）里把零星缺测放大成可见断口，得不偿失。
-            // ⚠️ 「断断续续」的真根因（2026-09-28 晚 xlsx 取证定案）：不是抽稀（518 点的
-            // 会话从未触发抽稀），是 fps=null 的拍被「缺测断线」画成洞——帧率差分 09-27
-            // 起回退 1s 完整拍后，timestats 图层 churn 每 ~8s 打掉一拍（全场 ~19% null、
-            // 几乎全是单拍），点距 ~5px 时每个洞肉眼可见 = 虚线观感。修法 = FPS 线的
-            // bridgeNullRun 短缺测桥接（见 FPS_LINE_BRIDGE_NULL_RUN），与本处无关。
-            val bmp = ImageBitmap(
-                plotW.toInt().coerceAtLeast(1),
-                chartSize.height.coerceAtLeast(1),
-            )
-            // 折线画进位图内坐标系（x 从 0 起）：实时绘制时按 plotLeft 贴回原位置
-            val bmpCanvas = androidx.compose.ui.graphics.Canvas(bmp)
-            CanvasDrawScope().draw(
-                density, LayoutDirection.Ltr, bmpCanvas,
-                Size(bmp.width.toFloat(), bmp.height.toFloat()),
-            ) {
-                clipRect(0f, 0f, size.width, size.height) {
-                    lines.forEach { line ->
-                        val r = (if (line.onRight) rightRange else leftRange) ?: return@forEach
-                        val path = buildChartLinePath(
-                            line.values, 0f, size.width, size.height, r, line.bridgeNullRun,
-                        )
-                        drawPath(path, line.color, style = Stroke(line.strokeWidth))
-                    }
-                }
-            }
-            bmp
+    // ⚠️ 折线位图构建搬后台线程（2026-09-30 治展开动画抢线程的「搬走」半边）：旧实现在
+    // remember 里同步构建（大场次 12 线 × 2400 点的 Path 几何 + 整卡位图填充，十几张卡
+    // 叠加 = 进场首帧重活），与展开动画同帧抢 UI 线程 = 动画全程卡顿（批次七十五装机实测，
+    // 内容就绪闸门治标不治本——重活只是被挪出了动画窗口，还拖慢展开起跑）。现在纯软件
+    // 位图光栅化（ARGB_8888 Bitmap + Canvas，不碰任何 View/Compose 状态）在
+    // Dispatchers.Default 上画，主线程只剩一条 drawImage 贴图指令。键变化时旧位图保留
+    // 继续贴（旋转拉伸口径见绘制处注释），新位图就绪自动替换；网格/轴标签是廉价指令，
+    // 位图未就绪时先画骨架 —— 曲线随后台计算逐卡跟进（进场交叉淡变期内到达，无感）。
+    val lineBitmap by produceState<ImageBitmap?>(
+        initialValue = null,
+        lines, leftRange, rightRange, chartSize, startInset, endInset, density,
+    ) {
+        value = withContext(Dispatchers.Default) {
+            buildLineChartBitmap(lines, leftRange, rightRange, chartSize, startInset, endInset, density)
         }
-        ChartPerf.logBuild("lineChart.buildPaths", lines.size, maxCount, System.nanoTime() - t0)
-        bmp
     }
+    // 数据本身能否成线（与尺寸无关，组合期同步可知）：<2 点没有可画的折线，连网格都不画
+    // （与旧同步位图的 null 口径一致：degenerate 数据卡内空白，不是空网格）
+    val hasDrawableData = (lines.maxOfOrNull { it.values.size } ?: 0) >= 2
     Box(
         modifier
             .fillMaxWidth()
@@ -1296,7 +1334,7 @@ private fun FrameLineChart(
     ) {
         Canvas(Modifier.fillMaxSize()) {
             ChartPerf.tick("lineChart.draw")
-            if (lineBitmap == null) return@Canvas
+            if (!hasDrawableData) return@Canvas
             val plotLeft = startInset.toPx()
             val plotRight = size.width - endInset.toPx()
             val plotW = plotRight - plotLeft
@@ -1382,21 +1420,81 @@ private fun FrameLineChart(
             // 不得越出外框压到轴题上。折线已在组合期渲染进位图（含抽稀），
             // 这里只贴一条 drawImage —— 每帧成本与线数脱钩（2026-09-28 横屏卡顿修复）。
             // ⚠️ dstSize 必须传当前绘图区尺寸（而非默认的位图原尺寸）：旋转瞬间位图
-            // 还是旧方向尺寸、重建要等 onSizeChanged 后下一帧，不拉伸的话旧窄图只会贴在
+            // 还是旧方向尺寸、后台重建要等 onSizeChanged 后一拍，不拉伸的话旧窄图只会贴在
             // 左半边（"半截曲线、半秒后才铺开"的观感 bug）。按 dstSize 拉伸后旧图立即
-            // 铺满全宽（横向拉伸等价于同一时间轴映射，短暂略糊），新图就绪自动 1:1
-            clipRect(left = plotLeft, top = 0f, right = plotRight, bottom = size.height) {
-                drawImage(
-                    image = lineBitmap,
-                    dstOffset = IntOffset(plotLeft.toInt(), 0),
-                    dstSize = IntSize(
-                        (plotRight - plotLeft).toInt().coerceAtLeast(1),
-                        size.height.toInt().coerceAtLeast(1),
-                    ),
-                )
+            // 铺满全宽（横向拉伸等价于同一时间轴映射，短暂略糊），新图就绪自动 1:1。
+            // 位图未就绪（首帧 / 后台重建中）只缺 drawImage —— 网格骨架已在上面先画。
+            lineBitmap?.let { bmp ->
+                clipRect(left = plotLeft, top = 0f, right = plotRight, bottom = size.height) {
+                    drawImage(
+                        image = bmp,
+                        dstOffset = IntOffset(plotLeft.toInt(), 0),
+                        dstSize = IntSize(
+                            (plotRight - plotLeft).toInt().coerceAtLeast(1),
+                            size.height.toInt().coerceAtLeast(1),
+                        ),
+                    )
+                }
             }
         }
     }
+}
+
+/**
+ * 折线位图构建（[FrameLineChart] 的 lineBitmap 生产函数，纯函数无状态）：尺寸/点数不达标
+ * 返回 null。只碰软件 Bitmap + Compose 几何，**主线程或 [Dispatchers.Default] 后台均可调**
+ * —— 不碰任何 View/Compose 状态，ARGB_8888 软件 Bitmap 允许任意线程创建与绘制。
+ * ChartPerf.logBuild 只打 Log，线程无关。
+ */
+private fun buildLineChartBitmap(
+    lines: List<FrameLine>,
+    leftRange: ClosedFloatingPointRange<Double>?,
+    rightRange: ClosedFloatingPointRange<Double>?,
+    chartSize: IntSize,
+    startInset: Dp,
+    endInset: Dp,
+    density: Density,
+): ImageBitmap? {
+    val t0 = System.nanoTime()
+    val maxCount = lines.maxOfOrNull { it.values.size } ?: 0
+    val bmp = if (chartSize.width < 2 || chartSize.height < 2 || maxCount < 2) {
+        null
+    } else {
+        val plotLeft = with(density) { startInset.toPx() }
+        val plotW = (chartSize.width - plotLeft - with(density) { endInset.toPx() })
+            .coerceAtLeast(1f)
+        // ⚠️ 不做 min-max 抽稀（2026-09-28）：位图化后每帧只剩 drawImage、成本与点数
+        // 脱钩，抽稀省的只是重建时一次性的路径构建；而「一桶含任一 null → 整桶断线」
+        // 的口径会在密集会话（点数 > 2×bins）里把零星缺测放大成可见断口，得不偿失。
+        // ⚠️ 「断断续续」的真根因（2026-09-28 晚 xlsx 取证定案）：不是抽稀（518 点的
+        // 会话从未触发抽稀），是 fps=null 的拍被「缺测断线」画成洞——帧率差分 09-27
+        // 起回退 1s 完整拍后，timestats 图层 churn 每 ~8s 打掉一拍（全场 ~19% null、
+        // 几乎全是单拍），点距 ~5px 时每个洞肉眼可见 = 虚线观感。修法 = FPS 线的
+        // bridgeNullRun 短缺测桥接（见 FPS_LINE_BRIDGE_NULL_RUN），与本处无关。
+        val bmp = ImageBitmap(
+            plotW.toInt().coerceAtLeast(1),
+            chartSize.height.coerceAtLeast(1),
+        )
+        // 折线画进位图内坐标系（x 从 0 起）：实时绘制时按 plotLeft 贴回原位置
+        val bmpCanvas = androidx.compose.ui.graphics.Canvas(bmp)
+        CanvasDrawScope().draw(
+            density, LayoutDirection.Ltr, bmpCanvas,
+            Size(bmp.width.toFloat(), bmp.height.toFloat()),
+        ) {
+            clipRect(0f, 0f, size.width, size.height) {
+                lines.forEach { line ->
+                    val r = (if (line.onRight) rightRange else leftRange) ?: return@forEach
+                    val path = buildChartLinePath(
+                        line.values, 0f, size.width, size.height, r, line.bridgeNullRun,
+                    )
+                    drawPath(path, line.color, style = Stroke(line.strokeWidth))
+                }
+            }
+        }
+        bmp
+    }
+    ChartPerf.logBuild("lineChart.buildPaths", lines.size, maxCount, System.nanoTime() - t0)
+    return bmp
 }
 
 /**
@@ -1855,7 +1953,7 @@ private val CpuClusters = listOf(
  * 使用率抖动 / 频率升降挡全部摊平），快样表建立前录的旧会话回退到 1s 样本里的
  * CPU 字段（摊平口径）。
  */
-private class CpuPoint(
+internal class CpuPoint(
     val timeMillis: Long,
     val totalPct: Double?,
     val corePct: List<Double?>,

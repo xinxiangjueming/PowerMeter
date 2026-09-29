@@ -6,7 +6,6 @@ import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -142,6 +141,18 @@ object AppTransitions {
 
     private var anchor: Source? = null
     private var anchorAtMs: Long = 0L
+
+    // ── 共享源槽位（SportLink 0ad7e29 同款）：旋转时横竖屏布局分支切换会整体重建子树，
+    // remember 出的 Source 实例随之作废、bounds 冻结在旧方向（2026-09-30 装机实锤：趋势页
+    // 竖→横后轮询/收拢现取读到的全是孤儿实例的旧坐标）——按页面+站位共享实例，重建后的
+    // 新节点继续刷新同一个 Source，跨方向进场轮询 / 收拢现取才能读到当前真值。
+    private val sharedSources = HashMap<String, WeakReference<Source>>()
+
+    fun sharedSource(pageKey: Int?, siteId: String): Source {
+        val key = "$pageKey|$siteId"
+        sharedSources[key]?.get()?.let { return it }
+        return Source().also { sharedSources[key] = WeakReference(it) }
+    }
 
     /** 源条目在 onClick 内调用（`Modifier.containerSource` 已自动处理，一般不必手写） */
     fun register(source: Source) {
@@ -510,11 +521,13 @@ object AppTransitions {
     private const val CROSS_DIRECTION_MIN_SETTLE_MS = 380L
 
     /**
-     * 跨方向进场轮询的帧预算（SportLink ROTATION_WAIT_MAX_FRAMES 同值照搬）：≈1s 内
-     * 没等到「旋转已沉降 + 源页重排完成的新鲜矩形」就清锚点层退化全宽中心线展开
-     * （分屏/自由窗口下方向请求被系统忽略的兜底）。
+     * 跨方向进场轮询的**时间**预算（ms）。SportLink 原版按帧计数（ROTATION_WAIT_MAX_FRAMES=60），
+     * 帧数预算随刷新率缩水：120Hz 下 60 帧 ≈ 0.5s，而"显示旋转落地 + 源页（pause 态但可见）
+     * 重排 + Compose 重组"实测需要 ~1s（2026-09-30 装机 dumpsys 实锤：两窗口均已 3200×1440
+     * 而轮询已超时）→ 每次进场都误降级全宽中心线。改为纯时间预算，[CollapseHost.tryApplyRotatedAnchor]
+     * 仍逐帧轮询、新鲜判定不变。
      */
-    private const val ROTATION_WAIT_MAX_FRAMES = 60
+    private const val ROTATION_WAIT_BUDGET_MS = 2500L
 
     /** 收拢宿主（每 Activity 一个，装配进场时登记，收拢结束/取消时移除） */
     private class CollapseHost(
@@ -844,7 +857,7 @@ object AppTransitions {
             tryApplyRotatedAnchor(clip, 0)
         }
 
-        /** [ROTATION_WAIT_MAX_FRAMES] 帧（≈1s）内等到「旋转已沉降 + 新鲜矩形」就现拍展开，
+        /** [ROTATION_WAIT_BUDGET_MS] 内等到「旋转已沉降 + 新鲜矩形」就现拍展开，
          *  否则清锚点层退化全宽中心线（SportLink v1 形态） */
         private fun tryApplyRotatedAnchor(clip: ClipRevealLayout, attempt: Int) {
             if (closing || finishRequested) return
@@ -916,12 +929,12 @@ object AppTransitions {
                 beginExpand(buildRotatedGeometry(clip, mapped), clip)
                 return
             }
-            if (attempt < ROTATION_WAIT_MAX_FRAMES) {
+            if (SystemClock.uptimeMillis() - expandPollStartMs < ROTATION_WAIT_BUDGET_MS) {
                 clip.postOnAnimation { tryApplyRotatedAnchor(clip, attempt + 1) }
             } else {
                 Log.w(
                     TAG,
-                    "cross-direction enter: rotation wait timeout ($attempt frames) → center-line expand" +
+                    "cross-direction enter: rotation wait timeout (${attempt} frames, ${settledMs}ms) → center-line expand" +
                         " bounds=${b?.toShortString()}",
                 )
                 // 退化全宽中心线（SportLink v1 形态）：清锚点层 + sourceRect 置空 ——
@@ -1180,7 +1193,7 @@ object AppTransitions {
      *   （= 源页按新旋转重排完成）；
      * ③ 对活性源条目**现拍**新鲜截图（register+capture 复用进场管线：真实横屏矩形 +
      *   当前主题像素 + 文字层）→ 重钉锚点层 → 从真实卡片矩形四向撑开。轮询超时
-     *   （[ROTATION_WAIT_MAX_FRAMES] 帧 ≈1s，分屏/自由窗口方向被忽略）→ 清锚点层
+     *   （时间预算 [ROTATION_WAIT_BUDGET_MS]，分屏/自由窗口方向被忽略）→ 清锚点层
      *   退化全宽中心线展开。遮罩在展开完成（onAnimationEnd）或开始收拢（requestClose）
      *   时拆除，露出真实源页。
      */
@@ -1188,20 +1201,23 @@ object AppTransitions {
         activity: Activity,
         expandOnEnter: Boolean = true,
         waitForContentReady: Boolean = false,
+        /** 本页锁定横屏（onCreate 已设 requestedOrientation，如趋势全屏页）：跨方向判定
+         *  的依据 —— 与源窗口竖屏组合即跨方向。跟随方向页不传（false），恒同方向装配 */
+        landscapeTarget: Boolean = false,
     ) {
         val content = activity.findViewById<ViewGroup>(android.R.id.content) ?: return
         val capture = consumePendingStart() ?: run {
             Log.i(TAG, "installWindowTransform: no fresh handoff, plain display (${activity.componentName?.shortClassName})")
             return
         }
-        // 跨方向判定：源窗口竖屏 + 本页**当前横屏**（SportLink 用 Capture.orientation
-        // 对比目标页方向）。只看源宽高会把"跟随系统方向的详情页从竖屏列表进入"误判成
-        // 跨方向（该判定为锁横屏的趋势页而写）——进场会错误走进旋转等待分支、最终超时
-        // 降级全宽中心线展开，收拢侧转屏守卫（verifySourceWindow）也被误关。目标方向以
-        // 本页 Configuration 为准（锁横屏页 onPostCreate 时必已是横屏；跟随方向页与源
-        // 同向 → false 直用 Handoff 矩形首帧展开）。2026-09-30 详情页进场恢复一镜到底时修正。
-        val crossDirection = capture.sourceWidth < capture.sourceHeight &&
-            activity.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        // 跨方向判定 = 目标页**声明锁定横屏**（[landscapeTarget]）且源窗口竖屏。不能拿
+        // 本页 Configuration 判定（76368f2 曾加"当前横屏"条件）：锁横屏页（趋势全屏页）
+        // 的旋转在 onPostCreate 时**尚未落地**、配置仍报竖屏 —— 装机日志实锤 2026-09-30
+        // （install cross=false → 同方向装配吃进竖屏矩形 → 退出尺寸守卫 → 重定位失败
+        // fade exit = 用户报的"横屏左滑返回直接闪"）。方向请求 onCreate 已设，装配时点
+        // 判不了，只能由调用页声明。跟随方向的详情页传默认 false 恒同方向（源横则横、
+        // 源竖则竖），详情页恢复一镜到底时担心的"竖屏列表进详情误判跨方向"由此参数归零。
+        val crossDirection = landscapeTarget && capture.sourceWidth < capture.sourceHeight
         // expandOnEnter=false（collapse-back，无展开 PreDraw）的收拢终点必须装配时就绪；
         // 该形态均同方向（FrameDetailActivity），原样取用。expandOnEnter=true 时矩形由
         // 进场路径登记：同方向 = Handoff 矩形直用（下方 PreDraw）；跨方向 = 轮询现拍

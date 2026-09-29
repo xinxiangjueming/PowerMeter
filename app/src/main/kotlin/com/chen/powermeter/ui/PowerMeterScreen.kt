@@ -848,8 +848,10 @@ internal fun TrendCard(
     // 胶囊跨方向撑成 20:9 整页时四边线性插值速度极不平衡，观感是"拉伸甩动"而非"长大"；
     // 整卡矩形的面积与长宽比都接近展开起点应有的形态。矩形经 containerSource 持续采集
     // （滚动/换向自动跟随），由卡内 `< >` 胶囊的点击转发登记（FullscreenPillButton 的
-    // anchorSource）。
-    val cardSource = rememberContainerSource()
+    // anchorSource）。⚠️ 必须带 siteId 共享槽位：旋转时横竖屏两分支整体重建子树，局部
+    // remember 的 Source 会作废、bounds 冻结在竖屏方向 —— 全屏页的进场轮询/收拢现取
+    // 读不到横屏真值（2026-09-30 装机实锤），共享实例让重建后的新节点续刷同一 Source。
+    val cardSource = rememberContainerSource("trend_card:power")
     // 文字层（2026-09-28 三改，修"收拢回卡片后需闪一下才出现功率/电压这些 tab"）：
     // 锚点本体走**纯色填充**（见 ClipRevealLayout.setAnchorSolidColor），收拢末段卡片
     // 区域是一块纯色、没有任何内容，覆盖层移除后才补上真实卡片 = 用户看到的"闪一下"。

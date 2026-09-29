@@ -97,13 +97,13 @@ private const val BAR_SETTLE_DELAY_MS = 300L
  * 数据源按 `if (导入非空) 导入 else 实时` 取 —— 与主页面同一口径，
  * 因此从主页面进入本页时看到的一定是同一份数据。
  *
- * **关闭时序（2026-09-29 照抄 SportLink ChartFullscreenActivity，用户定案"进出都完全
- * 照搬"）**：✕ / 返回手势经 [requestClose] 全部路由进 [finish]，按设备物理朝向分流：
- * 横握（finish 后显示停留横屏）= 还栏等 300ms → 收拢前向活性源条目**现取**趋势卡当前
- * 矩形/新截图再收拢（终点与真实卡片逐像素重合，无还栏跳动）；竖握 = **不收拢**，主题
- * 窗口动画（ActivitySlideWindowAnimation）滑出，方向随窗口关闭交还系统。进入/退出的
- * 窗口内转场都由 AppTransitions 的 ClipReveal 裁剪承担（同方向首帧直开；跨方向垫遮罩
- * + 轮询源页重排 + 现拍新鲜锚点再展开），窗口滑动动画在一镜到底路径双向压 0。
+ * **关闭时序（2026-09-30 用户定案：按设备物理朝向分流，判据平放加固）**：✕ / 返回手势
+ * 经 [requestClose] 全部路由进 [finish]：设备横握/平放（finish 后显示停留横屏）= 还栏
+ * 等 300ms → 收拢前向活性源条目**现取**趋势卡当前矩形/新截图再收拢（终点 = 主页横屏
+ * 两列布局里趋势卡的真实位置，无还栏跳动）；明确竖握 = **不收拢**，主题窗口动画滑出
+ * （收拢播在被钉住的横屏窗口里"先强制横屏再旋转"已被用户否决）。进入/退出的窗口内
+ * 转场都由 AppTransitions 的 ClipReveal 裁剪承担（同方向首帧直开；跨方向垫遮罩 + 轮询
+ * 源页重排 + 现拍新鲜锚点再展开），窗口滑动动画在一镜到底路径双向压 0。
  * 打开方向不需要淡出铺底处理：本页是**独立窗口**，`setRequestedOrientation` 的效果在启动
  * 窗口（StartingWindow）底下就生效了，首帧即横屏。
  */
@@ -147,14 +147,13 @@ class TrendFullscreenActivity : ComponentActivity() {
     /**
      * 正在关闭（Compose 可读的 state）。
      *
-     * true = 横屏停留退出的收拢动画已/正在播（覆盖层收回锚点矩形）。竖屏返回退出
-     * **不置位**（SportLink 同款：不收拢直接滑出，页面内容不淡出，由窗口动画整体带走）。
-     * 同时作为弹层卸载闸门（见 TrendFullscreenScreen 的 sheetTarget/selectTarget）。
+     * true = 返回收拢动画已/正在播（覆盖层收回锚点矩形）。同时作为弹层卸载闸门
+     * （见 TrendFullscreenScreen 的 sheetTarget/selectTarget）。
      */
     private var closing by mutableStateOf(false)
 
     /**
-     * 退出时序已启动（含横屏停留退出还栏后的 300ms 等待期）：requestClose 的幂等护栏。
+     * 退出时序已启动（含还栏后的 300ms 等待期）：requestClose 的幂等护栏。
      * 与 [closing] 分开 —— 等待期内容**不能**开始淡出（SportLink 同款：还栏等待期间
      * 全屏页保持完整可见），期间系统栏已恢复，[replayImmersive] 类重放也必须跳过
      * （否则把刚还的栏再收回去）。
@@ -165,13 +164,24 @@ class TrendFullscreenActivity : ComponentActivity() {
      *  finishNow 重入，本标记保证还栏 + 300ms 等待只做一次 */
     private var exitBarRestoreDone = false
 
-    // ── 退出朝向判定（2026-09-29 分流，SportLink ChartFullscreenActivity 同款）────
-    // 本页恒锁 sensorLandscape：resources.orientation 与显示旋转恒为横屏，判不出
-    // "手机此刻竖着拿还是横着拿"，必须跟踪加速度计象限（finish 后显示将转回的朝向：
-    // 自动旋转开 = 传感器方向；关 = 用户锁定旋转）。
+    // ── 退出朝向判定（SportLink ChartFullscreenActivity 同款分流 + 平放加固）────────
+    // 本页恒锁 sensorLandscape：resources.orientation 恒为横屏，判不出"finish 后显示
+    // 将转回的朝向"（自动旋转开 = 传感器方向；关 = 用户锁定旋转），必须跟踪加速度计。
+    //
+    // ⚠️ 平放加固（2026-09-30）：看横屏全屏的自然持机姿势**接近水平**，加速度计在该
+    // 姿势读数 UNKNOWN/抖动 —— 只记象限的话会卡在进场时的初值（竖进 = 0），横握左滑
+    // 被误判成"竖握返回"走了滑出（用户报的"横屏左滑直接闪"）。UNKNOWN 单独记平放
+    // 标记：设备平放 = 显示不会自发转回竖屏 → 按"停留横屏 = 收拢"处理。
+    //
+    // 不分流会怎样（2026-09-30 二轮教训）：竖握返回也收拢 —— 收拢动画播在被本页钉住
+    // 的横屏窗口里（内容横着），finish 后显示再转回竖屏 = "先强制横屏再旋转"，被用户
+    // 否决。分流必须保留，判据必须可靠。
 
-    /** 设备物理朝向象限（0/90/180/270）；初值 = 进场时源页的显示旋转（见 onCreate） */
-    private var deviceOrientationQuadrant: Int = 0
+    /** 最近一次有效加速度计读数的象限（0/90/180/270）；null = 尚未读到过有效读数 */
+    private var sensorQuadrant: Int? = null
+
+    /** 设备是否接近水平（读数 UNKNOWN）：该姿势下显示不会自发旋转 → 停留横屏 */
+    private var sensorFlat = false
 
     // ⚠️ lazy 而非属性初始化器：属性初始化在 Activity 构造期执行、早于 onCreate()，
     // OrientationEventListener 构造内 getSystemService 会抛 "System services not
@@ -180,16 +190,22 @@ class TrendFullscreenActivity : ComponentActivity() {
     private val deviceOrientationListener: OrientationEventListener by lazy {
         object : OrientationEventListener(this, SensorManager.SENSOR_DELAY_NORMAL) {
             override fun onOrientationChanged(orientation: Int) {
-                if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN) return
-                deviceOrientationQuadrant = ((orientation + 45) / 90 * 90) % 360
+                if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN) {
+                    sensorFlat = true
+                    return
+                }
+                sensorFlat = false
+                sensorQuadrant = ((orientation + 45) / 90 * 90) % 360
             }
         }
     }
 
     /**
-     * finish 后显示将回到的朝向是否横屏（= 主页退出后停留的布局方向）。
-     * 无传感器读数 / Settings 读取异常 → false：落回竖屏返回时序（收拢 + 解锁等转回），
-     * 不误触发横屏停留分流。
+     * finish 后显示将回到的朝向是否横屏（= 主页退出后停留的布局方向）：
+     * - 自动旋转关：用户锁定旋转（USER_ROTATION）——确定值；
+     * - 自动旋转开：设备平放（[sensorFlat]，显示不会自发旋转）或传感器明确横象限
+     *   （[sensorQuadrant] 90/270）= 停留横屏；明确竖象限 = 转回竖屏。
+     * 读数异常 → false（落回竖屏返回 = 滑出，SportLink 同款保守兜底）。
      */
     private fun exitWillBeLandscape(): Boolean {
         return try {
@@ -197,7 +213,7 @@ class TrendFullscreenActivity : ComponentActivity() {
                     contentResolver, Settings.System.ACCELEROMETER_ROTATION, 1,
                 ) == 1
             ) {
-                deviceOrientationQuadrant == 90 || deviceOrientationQuadrant == 270
+                sensorFlat || sensorQuadrant == 90 || sensorQuadrant == 270
             } else {
                 when (Settings.System.getInt(contentResolver, Settings.System.USER_ROTATION, 0)) {
                     Surface.ROTATION_90, Surface.ROTATION_270 -> true
@@ -216,13 +232,6 @@ class TrendFullscreenActivity : ComponentActivity() {
         //    用 SENSOR_LANDSCAPE 而非 LANDSCAPE —— 前者允许 landscape ↔ reverseLandscape
         //    随重力自由切换，用户把设备转 180° 也不会被钉死在一个方向。
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-
-        // 进场瞬间本页窗口尚未挂上、显示还没被锁横屏，display rotation = 源页（主页）
-        // 朝向：作加速度计读数就绪前的初值（竖进 = 0，横进 = 90/270），见 exitWillBeLandscape
-        deviceOrientationQuadrant = when (display?.rotation) {
-            Surface.ROTATION_90, Surface.ROTATION_270 -> 90
-            else -> 0
-        }
 
         // ① edge-to-edge：系统栏透明 + 关 contrast + decorFitsSystemWindows(false)
         //    + 注册 decorView insets 监听（180° 翻转不回调 onConfigurationChanged 的兜底）
@@ -260,8 +269,8 @@ class TrendFullscreenActivity : ComponentActivity() {
             }
         }
 
-        // 系统返回手势 / 返回键必须与 ✕ 走同一套关闭时序（requestClose → finish 按朝向
-        // 分流；放行给默认实现会绕过分流，横屏停留时失去收拢/还栏时序）
+        // 系统返回手势 / 返回键必须与 ✕ 走同一套关闭时序（requestClose → finish：
+        // 还栏 + 一镜到底收拢；放行给默认实现会绕过整套时序直接结束）
         onBackPressedDispatcher.addCallback(this) { requestClose() }
 
         // ⑤ 窗口滑动动画双向压 0（一镜到底 = 窗口内 ClipReveal 是唯一动画）：主题
@@ -284,7 +293,9 @@ class TrendFullscreenActivity : ComponentActivity() {
      */
     override fun onPostCreate(savedInstanceState: Bundle?) {
         super.onPostCreate(savedInstanceState)
-        AppTransitions.installWindowTransform(this)
+        // landscapeTarget = 本页锁横屏（onCreate 已设）：跨方向判定据此不走"当前配置"
+        // —— 配置在装配时点仍是竖屏（旋转未落地），详见 AppTransitions.installWindowTransform
+        AppTransitions.installWindowTransform(this, landscapeTarget = true)
     }
 
     /**
@@ -317,11 +328,35 @@ class TrendFullscreenActivity : ComponentActivity() {
         finish()
     }
 
+    /**
+     * 关闭全屏页 —— 按设备物理朝向分流（SportLink ChartFullscreenActivity 同款，且
+     * 判据经平放加固，见 [exitWillBeLandscape]）：
+     *
+     * **停留横屏**（设备横握/平放，finish 后显示仍横屏、主页停留横屏两列布局 = 最终态）：
+     * ⓪ 首次 finish：还系统栏 → 等 [BAR_SETTLE_DELAY_MS]（"还栏防列表跳动"：半透明
+     *    窗口下的主页被连带排成无栏全高布局，收拢前现取的锚点必须是还栏后位置；
+     *    等待期本页内容完整可见、不淡出）；
+     * ① 再次 finish：[closing] 置位 → [AppTransitions.collapseAndFinish](relocateAnchor
+     *    = true) 收拢 —— 收拢前向活性源条目**现取**趋势卡当前矩形/新截图（共享槽位
+     *    修复后读到的必是主页横屏布局的真实卡片，2026-09-30）；
+     * ② 收拢结束 finishNow → finish → 无宿主可收 → `super.finish()`（关闭转场已压 0）。
+     *
+     * **转回竖屏**（设备明确竖握）：**不收拢** —— 收拢动画播在被本页钉住的横屏窗口里
+     * （内容横着），finish 后显示再转回竖屏 = "先强制横屏再旋转"（2026-09-30 用户
+     * 否决）→ `super.finish()` 主题窗口动画滑出，方向随窗口关闭交还系统。
+     *
+     * 无收拢宿主（无 Handoff 降级启动）时停留横屏路径直接落 `super.finish()`。
+     */
     override fun finish() {
         // 退场交棒（2026-09-28 二轮）：把当前深浅留给即将显示的源页（主页），让它在首帧
         // 绘制之前就切成目标主题（口径同 FrameDetailActivity，消费方 MainActivity.onStart）
         ThemeTransition.noteExitTheme(isNightMode())
-        if (!exitBarRestoreDone && exitWillBeLandscape()) {
+        val landscapeExit = exitWillBeLandscape()
+        Log.i(
+            "PowerMeterTransit",
+            "trend exit split: landscapeExit=$landscapeExit quadrant=$sensorQuadrant flat=$sensorFlat",
+        )
+        if (!exitBarRestoreDone && landscapeExit) {
             // ⓪ 还系统栏 + 等主页按"有栏"重排落定（SportLink exitBarRestoreDone 同款：
             // finish() 会被收拢完成后的 finishNow 重入，本标记保证还栏只做一次）
             exitBarRestoreDone = true
@@ -331,14 +366,14 @@ class TrendFullscreenActivity : ComponentActivity() {
             }, BAR_SETTLE_DELAY_MS)
             return
         }
-        if (exitWillBeLandscape()) {
-            // ① 横屏停留：收拢（收拢前现取锚点当前位置，语义见 collapseAndFinish）
+        if (landscapeExit) {
+            // ① 停留横屏：收拢（收拢前现取锚点当前位置，语义见 collapseAndFinish）
             closing = true
             if (AppTransitions.collapseAndFinish(this, relocateAnchor = true)) return
             super.finish()
             return
         }
-        // ② 竖屏返回：不收拢，主题窗口动画滑出（SportLink 同款）
+        // ② 转回竖屏：不收拢，主题窗口动画滑出（SportLink 同款）
         super.finish()
     }
 
@@ -380,7 +415,7 @@ class TrendFullscreenActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 退出朝向判定的数据源：前台期间持续跟踪设备物理朝向象限（见 deviceOrientationListener）
+        // 退出朝向判定的数据源：前台期间持续跟踪设备物理朝向（见 deviceOrientationListener）
         deviceOrientationListener.enable()
         // 后台切换深浅兜底（configChanges 含 uiMode 的已知坑：后台时 ViewRootImpl 不分发
         // 配置）——回前台读 Resources 最新值；不静默（2026-09-29 用户定案，同 MainActivity）：
