@@ -6,16 +6,19 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Rect
+import android.hardware.SensorManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
+import android.view.OrientationEventListener
+import android.view.Surface
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleOut
@@ -50,7 +53,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -67,18 +69,12 @@ import com.chen.powermeter.util.AppTransitions
 import com.chen.powermeter.util.NavigationBarHelper
 
 /**
- * 关闭时内容淡到主题底色的时长。全屏页（[TrendFullscreenScreen]）与 Activity 的关闭时序共用，
- * 故放在文件级而非 companion 内。
+ * 横屏停留退出时「还栏 → 收拢」的等待时长（ms，SportLink ChartFullscreenActivity
+ * barSettleDelayMs 同口径）：半透明窗口下的主页被连带排成无栏全高布局，还栏后要等它
+ * 重排回"有栏"终态，收拢前向活性源条目现取的锚点矩形才是还栏后位置 —— 否则收拢落点
+ * 与真实卡片差一个系统栏高度，finish 恢复后主页再跳一次（"还栏防列表跳动"）。
  */
-private const val CLOSE_FADE_MS = 120
-
-/**
- * 关闭时等待「显示方向转回」落地的最长时间。
- *
- * 解锁方向后若设备本就横握（解锁不产生旋转），`onConfigurationChanged` 不会来 ——
- * 由本超时兜底，避免页面卡在"已淡出但不关闭"的状态。
- */
-private const val ORIENTATION_SETTLE_TIMEOUT_MS = 250L
+private const val BAR_SETTLE_DELAY_MS = 300L
 
 /**
  * 趋势卡全屏页。
@@ -101,15 +97,13 @@ private const val ORIENTATION_SETTLE_TIMEOUT_MS = 250L
  * 数据源按 `if (导入非空) 导入 else 实时` 取 —— 与主页面同一口径，
  * 因此从主页面进入本页时看到的一定是同一份数据。
  *
- * **关闭时序（C+，勿简化回直接 `finish()`）**：
- * 本页把**显示方向**锁成横屏（见 [onCreate] ⓪），而被它覆盖的 MainActivity 是 `configChanges`
- * 含 `orientation|screenSize` 的（不重建）。因此直接 `finish()` 会出现：本页滑出的同时显示才转回
- * 竖屏，主页先按**横屏两列**画出来、随后再翻回竖屏单列 —— 趋势卡宽度与位置同时改变，
- * 观感就是"返回主页闪一下"。关闭必须走 [requestClose]：
- * **覆盖层先收回到锚点矩形（一镜到底）** → 恢复系统栏 + 解锁方向（旋转发生在纯色屏之下）→
- * 等方向落地（`onConfigurationChanged` 或超时兜底）→ `finish()`（无过渡，主页已是正确的
- * 竖屏单列）。进入/退出的转场都由 [ClipReveal] 覆盖层承担（2026-09-26 一镜到底 Container
- * Transform 口径），主题窗口动画不再参与。
+ * **关闭时序（2026-09-29 照抄 SportLink ChartFullscreenActivity，用户定案"进出都完全
+ * 照搬"）**：✕ / 返回手势经 [requestClose] 全部路由进 [finish]，按设备物理朝向分流：
+ * 横握（finish 后显示停留横屏）= 还栏等 300ms → 收拢前向活性源条目**现取**趋势卡当前
+ * 矩形/新截图再收拢（终点与真实卡片逐像素重合，无还栏跳动）；竖握 = **不收拢**，主题
+ * 窗口动画（ActivitySlideWindowAnimation）滑出，方向随窗口关闭交还系统。进入/退出的
+ * 窗口内转场都由 AppTransitions 的 ClipReveal 裁剪承担（同方向首帧直开；跨方向垫遮罩
+ * + 轮询源页重排 + 现拍新鲜锚点再展开），窗口滑动动画在一镜到底路径双向压 0。
  * 打开方向不需要淡出铺底处理：本页是**独立窗口**，`setRequestedOrientation` 的效果在启动
  * 窗口（StartingWindow）底下就生效了，首帧即横屏。
  */
@@ -129,13 +123,13 @@ class TrendFullscreenActivity : ComponentActivity() {
         /**
          * 打开趋势全屏页。
          *
-         * 进入动画 = **AppTransitions 一镜到底**（SportLink 运动选择 → 室内跑步同款）：
-         * [capture]（趋势卡 + 整窗截图，源页经 [AppTransitions.capture](keepPageSnapshot)
-         * 产出，锚点 = 整张趋势卡，2026-09-28：原为 `< >` 胶囊，撑成整页时四边插值失衡）
-         * 经 Handoff 单例交接，本页 onPostCreate 把页面根包进 ClipRevealLayout，等显示
-         * 方向落地（横屏 + 尺寸稳定，见 AppTransitions 装配闸门）后从趋势卡矩形四向
-         * 撑开。旋转等待期垫整窗截图（X 方案：竖屏窗口 1:1 铺 = 主页本身跟着系统转，
-         * 不再有纯色一拍；横屏后按显示旋转转向，撑开/收拢窗口外露出同一张"冻结主页"）。
+         * 进入动画 = **AppTransitions 一镜到底**（2026-09-29 起进出全程照抄 SportLink
+         * 图表卡）：[capture]（趋势卡截图，源页经 [AppTransitions.capture] 产出，锚点 =
+         * 整张趋势卡，2026-09-28：原为 `< >` 胶囊，撑成整页时四边插值失衡）经 Handoff
+         * 单例交接，本页 onPostCreate 把页面根包进 ClipRevealLayout —— 横屏主页（同方向）
+         * 首帧从趋势卡矩形四向撑开；竖屏主页（跨方向）先垫不透明页面底色遮罩 + 整窗
+         * 零裁剪，等旋转沉降且源页按新旋转重排完成后**现拍**趋势卡的新鲜截图（真实横屏
+         * 矩形 + 当前主题像素 + 文字层）再撑开（详见 AppTransitions.installWindowTransform）。
          * capture == null 时降级为主题窗口滑动。
          * 窗口滑动动画双向压 0（见 onCreate ⑤），窗口内 ClipReveal 是唯一动画。
          */
@@ -153,15 +147,67 @@ class TrendFullscreenActivity : ComponentActivity() {
     /**
      * 正在关闭（Compose 可读的 state）。
      *
-     * true = 收拢动画已/正在播（覆盖层收回锚点矩形），结束后恢复系统栏 + 解锁方向，
-     * 等显示方向转回落地后再真正 `finish()`。
-     * 同时作为**幂等护栏**：✕ 与系统返回手势可能在极短时间内都触发一次，重复执行会让
-     * 超时兜底与 `onConfigurationChanged` 两条路径各调一次 `finish()`。
+     * true = 横屏停留退出的收拢动画已/正在播（覆盖层收回锚点矩形）。竖屏返回退出
+     * **不置位**（SportLink 同款：不收拢直接滑出，页面内容不淡出，由窗口动画整体带走）。
+     * 同时作为弹层卸载闸门（见 TrendFullscreenScreen 的 sheetTarget/selectTarget）。
      */
     private var closing by mutableStateOf(false)
 
-    /** 关闭收尾（恢复系统栏 + 解锁方向）是否已启动：收拢结束与超时兜底双路径幂等 */
-    private var closeSequenceStarted = false
+    /**
+     * 退出时序已启动（含横屏停留退出还栏后的 300ms 等待期）：requestClose 的幂等护栏。
+     * 与 [closing] 分开 —— 等待期内容**不能**开始淡出（SportLink 同款：还栏等待期间
+     * 全屏页保持完整可见），期间系统栏已恢复，[replayImmersive] 类重放也必须跳过
+     * （否则把刚还的栏再收回去）。
+     */
+    private var closeRequested = false
+
+    /** 还栏动作是否已做（SportLink exitBarRestoreDone 同款）：finish() 会被收拢完成后的
+     *  finishNow 重入，本标记保证还栏 + 300ms 等待只做一次 */
+    private var exitBarRestoreDone = false
+
+    // ── 退出朝向判定（2026-09-29 分流，SportLink ChartFullscreenActivity 同款）────
+    // 本页恒锁 sensorLandscape：resources.orientation 与显示旋转恒为横屏，判不出
+    // "手机此刻竖着拿还是横着拿"，必须跟踪加速度计象限（finish 后显示将转回的朝向：
+    // 自动旋转开 = 传感器方向；关 = 用户锁定旋转）。
+
+    /** 设备物理朝向象限（0/90/180/270）；初值 = 进场时源页的显示旋转（见 onCreate） */
+    private var deviceOrientationQuadrant: Int = 0
+
+    // ⚠️ lazy 而非属性初始化器：属性初始化在 Activity 构造期执行、早于 onCreate()，
+    // OrientationEventListener 构造内 getSystemService 会抛 "System services not
+    // available to Activities before onCreate()"（SportLink 真机实锤 2026-09-29）；
+    // lazy 到 onResume 首次 enable 时才构造，那时系统服务已就绪
+    private val deviceOrientationListener: OrientationEventListener by lazy {
+        object : OrientationEventListener(this, SensorManager.SENSOR_DELAY_NORMAL) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN) return
+                deviceOrientationQuadrant = ((orientation + 45) / 90 * 90) % 360
+            }
+        }
+    }
+
+    /**
+     * finish 后显示将回到的朝向是否横屏（= 主页退出后停留的布局方向）。
+     * 无传感器读数 / Settings 读取异常 → false：落回竖屏返回时序（收拢 + 解锁等转回），
+     * 不误触发横屏停留分流。
+     */
+    private fun exitWillBeLandscape(): Boolean {
+        return try {
+            if (Settings.System.getInt(
+                    contentResolver, Settings.System.ACCELEROMETER_ROTATION, 1,
+                ) == 1
+            ) {
+                deviceOrientationQuadrant == 90 || deviceOrientationQuadrant == 270
+            } else {
+                when (Settings.System.getInt(contentResolver, Settings.System.USER_ROTATION, 0)) {
+                    Surface.ROTATION_90, Surface.ROTATION_270 -> true
+                    else -> false
+                }
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -170,6 +216,13 @@ class TrendFullscreenActivity : ComponentActivity() {
         //    用 SENSOR_LANDSCAPE 而非 LANDSCAPE —— 前者允许 landscape ↔ reverseLandscape
         //    随重力自由切换，用户把设备转 180° 也不会被钉死在一个方向。
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+
+        // 进场瞬间本页窗口尚未挂上、显示还没被锁横屏，display rotation = 源页（主页）
+        // 朝向：作加速度计读数就绪前的初值（竖进 = 0，横进 = 90/270），见 exitWillBeLandscape
+        deviceOrientationQuadrant = when (display?.rotation) {
+            Surface.ROTATION_90, Surface.ROTATION_270 -> 90
+            else -> 0
+        }
 
         // ① edge-to-edge：系统栏透明 + 关 contrast + decorFitsSystemWindows(false)
         //    + 注册 decorView insets 监听（180° 翻转不回调 onConfigurationChanged 的兜底）
@@ -207,8 +260,8 @@ class TrendFullscreenActivity : ComponentActivity() {
             }
         }
 
-        // 系统返回手势 / 返回键必须走同一套关闭时序：放行给默认实现（直接 finish()）时，
-        // 本页会在显示仍是横屏的状态下被移除 → 主页先按横屏两列画出来再翻回竖屏（返回瞬闪）
+        // 系统返回手势 / 返回键必须与 ✕ 走同一套关闭时序（requestClose → finish 按朝向
+        // 分流；放行给默认实现会绕过分流，横屏停留时失去收拢/还栏时序）
         onBackPressedDispatcher.addCallback(this) { requestClose() }
 
         // ⑤ 窗口滑动动画双向压 0（一镜到底 = 窗口内 ClipReveal 是唯一动画）：主题
@@ -223,152 +276,70 @@ class TrendFullscreenActivity : ComponentActivity() {
     }
 
     /**
-     * 跨 Activity 一镜到底装配（SportLink TrackActivity 同款时机）：
-     * 有新鲜 Handoff（从趋势卡进入）→ 页面根包进 ClipRevealLayout，等窗口落地为横屏
-     * 且尺寸稳定后从趋势卡矩形四向撑开（2026-09-28 方案 A：竖屏源 → 强制横屏本页的
-     * 跨方向装配必须推迟，首帧即装配会按竖屏窗口算死几何）；无（通知/过期）→ no-op，
-     * 页面普通显示 + 主题窗口动画。
+     * 跨 Activity 一镜到底装配（SportLink ChartFullscreenActivity 同款时机与机制）：
+     * 有新鲜 Handoff（从趋势卡进入）→ 页面根包进 ClipRevealLayout —— 同方向（横屏主页）
+     * 首帧从趋势卡矩形四向撑开；跨方向（竖屏主页 → 本页锁横屏）垫不透明页面底色遮罩 +
+     * 整窗零裁剪 + 逐帧轮询源页按新旋转重排，现拍新鲜锚点（真实横屏矩形 + 当前主题像素）
+     * 后再展开；超时退化全宽中心线。无（通知/过期）→ no-op，页面普通显示 + 主题窗口动画。
      */
     override fun onPostCreate(savedInstanceState: Bundle?) {
         super.onPostCreate(savedInstanceState)
-        AppTransitions.installWindowTransform(
-            this,
-            anchorTransform = ::mapAnchorRect,
-            // 文字层（2026-09-28 三改）：锚点 = 整张趋势卡，锚点内文字矩形必须走与主矩形
-            // **同一套**旋转映射，否则跨方向装配下文字层错位（横屏源 → 映射恒等，直接可用）
-            textRectTransform = ::mapRectByRotation,
-        )
+        AppTransitions.installWindowTransform(this)
     }
 
     /**
-     * 锚点矩形换算钩子（installWindowTransform 统一应用：截图定位、展开几何、收拢终点）。
-     * 调用时机在 installWindowTransform 的横屏闸门里（窗口已落地为横屏尺寸，见
-     * AppTransitions 的 PreDraw 装配闸门），故 [display.rotation] 必为 90/270（或平板
-     * 等自然方向本就横屏、源窗口也横屏的直通分支）。
+     * 关闭全屏页 —— 全部路由进 [finish]，控制流照抄 SportLink ChartFullscreenActivity
+     * （2026-09-29 用户定案"进入和退出都完全照搬"）：
      *
-     * - **横屏源**（用户横握主页，源窗口与目标窗口同方向）→ 原样使用，SportLink 原生场景；
-     * - **竖屏源**（竖屏主页 → 强制横屏本页）→ 纯旋转映射：两侧窗口都全屏 edge-to-edge、
-     *   原点都落在物理屏左上（按各自 orientation 解读）：
-     *   ROTATION_90（设备逆时针转 90°、顶朝左）：x' = y, y' = 源宽 − x
-     *   → Rect(t, 源宽−r, b, 源宽−l)；
-     *   ROTATION_270（设备顺时针、顶朝右）：x' = 源高 − y, y' = x
-     *   → Rect(源高−b, l, 源高−t, r)。
+     * **横屏停留退出**（[exitWillBeLandscape] = true，设备横握，finish 后显示仍横屏、
+     * 主页停留横屏两列布局 = 最终态）：
+     * ⓪ 首次 finish：还系统栏 → 等 [BAR_SETTLE_DELAY_MS]（"还栏防列表跳动"：半透明
+     *    窗口下的主页被连带排成无栏全高布局，收拢前现取的锚点必须是还栏后位置；
+     *    等待期本页内容完整可见、不淡出）；等待期内用户可能翻回竖握 → 重评口径同
+     *    SportLink 每次 finish 都重评；
+     * ① 再次 finish：[closing] 置位 → [AppTransitions.collapseAndFinish](relocateAnchor
+     *    = true) 收拢 —— 收拢前向活性源条目**现取**趋势卡当前矩形/新截图，终点与真实
+     *    卡片逐像素重合（跨方向会话的进场锚点已在旋转沉降后现拍过一次，此处再取的是
+     *    还栏后的最终位置）；
+     * ② 收拢结束 finishNow → finish → 无宿主可收 → `super.finish()`，无额外等待。
      *
-     * 推导口径：`Display.getRotation()` 语义 = 设备从自然方向**逆时针**转过的角度；
-     * 把源窗口四角在物理屏上的落位逐角对应到目标窗口坐标系即可自行验证。
-     * 2026-09-28 修纵向镜像（方案 A）：旧版 ROTATION_90 少镜像一次（y'=x）、ROTATION_270
-     * 多镜像一次（y'=源宽−x），映射锚点整体落到屏幕纵向另一侧，展开/收拢对不上真实卡片。
-     */
-    private fun mapAnchorRect(capture: AppTransitions.Capture): Rect =
-        mapRectByRotation(capture.rect, capture)
-
-    /**
-     * 纯旋转映射（2026-09-28 三改抽出）：**主矩形与内部文字矩形共用同一套** ——
-     * 主矩形经 [mapAnchorRect] 交 [AppTransitions.installWindowTransform] 的
-     * `anchorTransform`，文字矩形经本函数交其 `textRectTransform`。两者必须同源：
-     * 跨方向装配只换算主矩形、文字矩形原样使用就会错位（文字层挂在错误的窗口坐标）。
+     * **竖屏返回退出**（设备竖握 / 判定失败）：**不收拢**（SportLink 定案：显示即将
+     * 转回竖屏，任何横屏坐标系里的收拢终点在转回后必然失配）→ `super.finish()` 主题
+     * 窗口动画滑出（Theme.PowerMeter.Transitions 继承 ActivitySlideWindowAnimation，
+     * 300ms 侧滑），显示方向随窗口关闭交还系统（解锁动作不再需要 —— 方向请求随
+     * Activity 销毁失效）。
      *
-     * 横屏源（源窗口已横屏，与目标窗口同方向）→ 恒等返回：不映射即可直接使用，
-     * 用户从横屏主页点 `< >` 的主用场景走这条分支。
-     */
-    private fun mapRectByRotation(r: Rect, capture: AppTransitions.Capture): Rect {
-        if (capture.sourceWidth >= capture.sourceHeight) return r
-        val rotation = display?.rotation ?: android.view.Surface.ROTATION_0
-        val mapped = when (rotation) {
-            android.view.Surface.ROTATION_90 -> Rect(
-                r.top,
-                capture.sourceWidth - r.right,
-                r.bottom,
-                capture.sourceWidth - r.left,
-            )
-            android.view.Surface.ROTATION_270 -> Rect(
-                capture.sourceHeight - r.bottom,
-                r.left,
-                capture.sourceHeight - r.top,
-                r.right,
-            )
-            else -> r
-        }
-        Log.d(
-            "TrendReveal",
-            "mapRectByRotation rotation=$rotation source=${r.toShortString()} mapped=${mapped.toShortString()}",
-        )
-        return mapped
-    }
-
-    /**
-     * 关闭全屏页 —— 一镜到底时序：
-     *
-     * ⓪ **恢复系统栏**（[NavigationBarHelper.exitImmersive]，2026-09-28 三改提前到位）：
-     *    本页改半透明窗口主题后主页全程可见，系统栏隐藏/恢复都会让主页实时重排
-     *    （顶栏高度 = safeDrawing 顶部 inset + 64dp），必须赶在收拢动画之前完成；
-     * ① [closing] = true（页面内容同步淡出，t=0 立即有可见反馈）；
-     * ② [AppTransitions.collapseAndFinish] 播收拢：整页从当前进度裁剪**收回到趋势卡
-     *    矩形**（一镜到底的收拢半程，截图淡回），结束时 CollapseHost.finishNow 调
-     *    [finish]（窗口关闭转场已压 0）；
-     * ③ [finish] 里发现收拢已完成 → [finishClosingSequence]：解除横屏锁定（系统栏已在 ⓪
-     *    恢复，此处幂等重放）—— 旋转发生在纯色屏之下，没有内容可重排；
-     * ④ 等方向落地：`onConfigurationChanged` 接住；设备本就横握时不会触发 → 超时兜底；
-     * ⑤ 方向落地后才真正 `super.finish()`，主页已是正确的竖屏单列。
-     *
-     * 无收拢宿主（无 Handoff 降级启动）时直接走 ③④⑤。
+     * 无收拢宿主（无 Handoff 降级启动）时横屏路径直接落 `super.finish()`，同 SportLink。
      */
     private fun requestClose() {
-        if (closing) return
-        closing = true
-        // ⓪ 系统栏提前恢复（理由见 KDoc）：主页在收拢动画开始前就排定"有系统栏"的终态布局，
-        //    避免收拢末帧与真实主页差一个状态栏高度（用户实测"动画完成后突然避开/跳一下"）。
-        //    本页自身内容只避 displayCutout、不含 systemBars，系统栏回归不改它的内容排布。
-        NavigationBarHelper.exitImmersive(this)
-        if (AppTransitions.collapseAndFinish(this)) return
-        finishClosingSequence()
+        if (closing || closeRequested) return
+        closeRequested = true
+        finish()
     }
 
-    /**
-     * 收拢动画播完后的收尾：系统栏 → 解锁方向 → 超时兜底。
-     * 由 [finish] 的状态机进入（收拢结束时 CollapseHost 调 activity.finish() →
-     * [finish] → collapseAndFinish 已无宿主 → 此处）。
-     */
-    private fun finishClosingSequence() {
-        // closing 统一在此置位：requestClose 路径已提前设过（幂等）；系统返回键在
-        // 装配前的路径到这里才设 —— onConfigurationChanged 的关闭分支、
-        // onWindowFocusChanged 的防重放都依赖它
-        closing = true
-        if (closeSequenceStarted) return
-        closeSequenceStarted = true
-        // ① 系统栏恢复：正常路径已在 [requestClose] ⓪ 提前执行（收拢动画之前 —— 主页据此
-        //    排定终态布局）；本行兜底降级路径（无收拢宿主 / 装配前就触发关闭），重复调用
-        //    幂等。主页顶栏高度 = safeDrawing 顶部 inset + 64dp（PowerMeterScreen.topBarHeight），
-        //    必须早于主页绘制生效，否则首帧先按"无系统栏"排一次、再跳一次
-        NavigationBarHelper.exitImmersive(this)
-        // ② 解锁方向 → 显示开始转回。旋转发生在纯色屏之下，没有内容可重排
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        // ③ 兜底：解锁不产生旋转（设备本就横握）时不会有 onConfigurationChanged
-        window.decorView.postDelayed({ finishIfClosing() }, ORIENTATION_SETTLE_TIMEOUT_MS)
-    }
-
-    /**
-     * 收拢完成的收尾入口。finish() 的完整状态机：
-     * - collapseAndFinish 返回 true：收拢动画接管（本次 finish 意图被它吸收，动画结束
-     *   由 CollapseHost 再调 activity.finish() 走到下一分支）；
-     * - closeSequenceStarted == false：收拢刚完成（或无宿主）→ 先解锁方向等落地；
-     * - 其余：方向已落地 → 真正结束（super.finish()，窗口过渡已压 0）。
-     */
     override fun finish() {
         // 退场交棒（2026-09-28 二轮）：把当前深浅留给即将显示的源页（主页），让它在首帧
         // 绘制之前就切成目标主题（口径同 FrameDetailActivity，消费方 MainActivity.onStart）
         ThemeTransition.noteExitTheme(isNightMode())
-        if (AppTransitions.collapseAndFinish(this)) return
-        if (!closeSequenceStarted) {
-            finishClosingSequence()
+        if (!exitBarRestoreDone && exitWillBeLandscape()) {
+            // ⓪ 还系统栏 + 等主页按"有栏"重排落定（SportLink exitBarRestoreDone 同款：
+            // finish() 会被收拢完成后的 finishNow 重入，本标记保证还栏只做一次）
+            exitBarRestoreDone = true
+            NavigationBarHelper.exitImmersive(this)
+            window.decorView.postDelayed({
+                if (!isDestroyed && !isFinishing) finish()
+            }, BAR_SETTLE_DELAY_MS)
             return
         }
+        if (exitWillBeLandscape()) {
+            // ① 横屏停留：收拢（收拢前现取锚点当前位置，语义见 collapseAndFinish）
+            closing = true
+            if (AppTransitions.collapseAndFinish(this, relocateAnchor = true)) return
+            super.finish()
+            return
+        }
+        // ② 竖屏返回：不收拢，主题窗口动画滑出（SportLink 同款）
         super.finish()
-    }
-
-    /** 方向已落地（或超时）→ finish（经 [finish] 状态机落到 super，窗口过渡已压 0） */
-    private fun finishIfClosing() {
-        if (closing && !isFinishing && !isDestroyed) finish()
     }
 
     /**
@@ -391,9 +362,13 @@ class TrendFullscreenActivity : ComponentActivity() {
             // 首帧判定：宿主已 RESUMED → 播圆孔揭露；仍 paused 可见 → 闸门静默落地
             darkThemeState.value = dark
         }
-        if (closing) {
+        if (closing || closeRequested) {
+            // 关闭中/还栏等待期：系统与 MIUI/HyperOS 会在配置变更后按主题默认值重放
+            // 系统栏属性，这里只重放窗口属性（不 hide）——否则把刚还的栏再收回去
+            // （等待期）或把收拢所需的"有栏"终态打回无栏（收拢中）。180° 翻面（横屏↔
+            // 横屏，orientation 不变）也走这里：收拢中翻面的终点失配为已知遗留（批次
+            // 五十五），还栏等待期翻面由收拢前的现拍兜底
             NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
-            window.decorView.post { finishIfClosing() }
             return
         }
         replayImmersive()
@@ -405,6 +380,8 @@ class TrendFullscreenActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 退出朝向判定的数据源：前台期间持续跟踪设备物理朝向象限（见 deviceOrientationListener）
+        deviceOrientationListener.enable()
         // 后台切换深浅兜底（configChanges 含 uiMode 的已知坑：后台时 ViewRootImpl 不分发
         // 配置）——回前台读 Resources 最新值；不静默（2026-09-29 用户定案，同 MainActivity）：
         // 状态落地后由 PowerMeterTheme 闸门在 onResume 之后的首帧播圆孔揭露动画
@@ -413,10 +390,15 @@ class TrendFullscreenActivity : ComponentActivity() {
         }
     }
 
-    /** 从多任务/锁屏回到前台时系统可能重新显示系统栏，重新隐藏（关闭中不再隐藏） */
+    override fun onPause() {
+        deviceOrientationListener.disable()
+        super.onPause()
+    }
+
+    /** 从多任务/锁屏回到前台时系统可能重新显示系统栏，重新隐藏（关闭中/退出等待期不再隐藏） */
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && !closing) replayImmersive()
+        if (hasFocus && !closing && !closeRequested) replayImmersive()
     }
 
     private fun replayImmersive() {
@@ -436,7 +418,7 @@ class TrendFullscreenActivity : ComponentActivity() {
 @Composable
 private fun TrendFullscreenScreen(
     initialMetric: Metric,
-    /** true = 正在关闭：整页内容淡到主题底色（见 Activity 的 requestClose） */
+    /** true = 正在关闭（横屏停留退出的收拢中）：仅用于卸载弹层，内容淡出由收拢交叉窗承担 */
     closing: Boolean,
     onFinish: () -> Unit,
 ) {
@@ -462,8 +444,8 @@ private fun TrendFullscreenScreen(
         .ifEmpty { listOf(tabs.first()) }
 
     // 曲线序列必须缓存：`toSeries` 是 O(n) 构建（实时态 n 最多 SampleStore.CAPACITY = 7200，导入态 20000），
-    // 而关闭时的淡出动画（animateFloatAsState，120ms）会逐帧驱动重组 —— 不缓存则每帧重建
-    // 全部序列。键里的 samples 在同一份数据下是同一实例，List.equals 走引用快路径 O(1)。
+    // 实时采样每秒都会改 samples —— 不缓存则每帧重建全部序列。
+    // 键里的 samples 在同一份数据下是同一实例，List.equals 走引用快路径 O(1)。
     //
     // 颜色也必须是键的一部分：POWER 的默认色跟随主题 `primary`，且用户可在本页改色。
     // 取色复用 ColorPickerDialog 的 Metric.seriesColor，避免默认色值在这里再写一份。
@@ -485,15 +467,10 @@ private fun TrendFullscreenScreen(
     // （对齐 SportLink showColorPickerForSelection：单列直接开面板，多列先选曲线）
     var colorSelectOpen by remember { mutableStateOf(false) }
     val chartState = remember { TrendChartState() }
-
-    // 关闭中：内容淡到主题底色（DialogBackdropHost 源层铺满主题底色，故淡出即"整页变纯色"）。
-    // 纯色屏没有可重排的内容 —— 紧随其后的显示方向旋转（本页解锁方向后转回竖屏）
-    // 因此完全不可见；窗口尺寸变化时纯色只是重新铺一次。
-    val contentAlpha by animateFloatAsState(
-        targetValue = if (closing) 0f else 1f,
-        animationSpec = tween(durationMillis = CLOSE_FADE_MS),
-        label = "trendFullscreenCloseFade",
-    )
+    // 关闭中的内容退场 = 收拢动画自身的交叉淡变窗（contentAlphaOut，AppTransitions 驱动）
+    // / 竖屏返回的主题窗口滑出 —— 本页不再叠一层自己的淡出（2026-09-29 照抄 SportLink：
+    // SportLink 关闭时无内容淡出；旧淡出服务的"收拢后转屏在纯色屏之下"场景已随竖屏
+    // 路径不收拢而消失）。[closing] 仍用于卸载弹层（见下方 sheetTarget/selectTarget）。
 
     // DialogBackdropHost：提供 miuix backdrop 源 + Haze 源（页面内容层）与弹窗浮层 slot 的
     // 「宿主 + slot」结构 —— 居中玻璃对话框（GlassDialog）作为源兄弟渲染，满足 miuix / Haze
@@ -503,8 +480,6 @@ private fun TrendFullscreenScreen(
         Column(
             Modifier
                 .fillMaxSize()
-                // 关闭淡出：只作用于内容，底色由外层 Box 保留（淡出后即"整页纯色"）
-                .alpha(contentAlpha)
                 // 避开摄像头（竖屏顶部中央打孔 / 横屏左右侧打孔，全边避让一次覆盖）。
                 // 只避 cutout，**不**避 systemBars：系统栏已隐藏，内容必须延伸到屏幕最底，
                 // 这才是真沉浸；用 safeDrawing 全边避让只会把系统栏区域换成一条背景色带。

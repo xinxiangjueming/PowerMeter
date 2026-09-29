@@ -713,11 +713,12 @@ private fun FrameDetailScreen(
 
 // ── 顶部统计卡（Kite 报告同款 4 列网格；2026-09-25 重构，不再照搬电池查看页的卡片区）──
 
-/** 稳帧指数 ⓘ 弹窗的口径文案（卡顿判定同理见 [FrameJankCard]） */
+/** 稳帧指数 ⓘ 弹窗的口径文案（卡顿判定同理见 [FrameJankCard]）；[open] 透传 GlassDialog 按压预备 */
 @Composable
-private fun FrameInfoDialog(title: String, body: String, onDismiss: () -> Unit) {
+private fun FrameInfoDialog(title: String, body: String, onDismiss: () -> Unit, open: Boolean = true) {
     GlassDialog(
         onDismissRequest = onDismiss,
+        open = open,
         title = {
             Text(
                 title,
@@ -976,6 +977,10 @@ private fun FrameSummaryCard(
     ) {
         Column(Modifier.fillMaxWidth().padding(vertical = 20.dp)) {
             var showSteadyInfo by remember { mutableStateOf(false) }
+            // ⓘ 的 interactionSource 提升到此处：按压预备（rememberDialogPressArmed）要在
+            // 按下的那一帧就把弹窗以 2% alpha 组合出来，管线首挂载开销全部付在按压帧
+            val steadyInfoSource = remember { MutableInteractionSource() }
+            val steadyInfoArmed = rememberDialogPressArmed(steadyInfoSource, showSteadyInfo)
 
             SummaryRow {
                 SummaryCell("MAX", session.maxFps.f0(), "FPS", Modifier.weight(1f))
@@ -1009,17 +1014,20 @@ private fun FrameSummaryCard(
                     ftSd?.f1() ?: "—",
                     "ms",
                     Modifier.weight(1f),
-                ) {
-                    showSteadyInfo = !showSteadyInfo
-                }
+                    onInfo = { showSteadyInfo = !showSteadyInfo },
+                    onInfoSource = steadyInfoSource,
+                )
                 Spacer(Modifier.weight(1f))
             }
             // ⓘ 说明弹窗：⚠️ 不能包 AnimatedVisibility —— GlassDialog 是同窗口浮层、自带
             // dialogEnterAnim 入场动效；外层再对**全屏毛玻璃遮罩**做淡入缩放，等于每帧
             // 重渲染一次模糊层，过渡又卡又怪（2026-09-25 用户反馈）。显隐直接交 GlassDialog，
             // 再点一次图标即收起。
-            if (showSteadyInfo) {
+            // 按压预备（2026-09-29）：按住 ⓘ 期间即以 2% alpha 组合弹窗（管线首挂载/
+            // 整页重测/首次模糊全付在按压帧，视觉零变化），松开 open=true 只播入场动画。
+            if (steadyInfoArmed) {
                 FrameInfoDialog(
+                    open = showSteadyInfo,
                     title = stringResource(R.string.frame_steady_index),
                     body = stringResource(R.string.frame_steady_index_info),
                     onDismiss = { showSteadyInfo = false },
@@ -1042,6 +1050,8 @@ private fun SummaryRow(content: @Composable RowScope.() -> Unit) {
 /**
  * 单个统计格：上标签（含可选 ⓘ）+ 大数值 + 下单位。
  * ⓘ 的点击热区就是图标本身（13dp）—— 嵌在网格里放不下 IconButton 的 48dp 最小热区。
+ * [onInfoSource] 由调用方提升（配合 rememberDialogPressArmed 做按压预备）；不传时
+ * ⓘ 内部自备（无预备，行为同旧版）。
  */
 @Composable
 private fun SummaryCell(
@@ -1050,6 +1060,7 @@ private fun SummaryCell(
     unit: String,
     modifier: Modifier = Modifier,
     onInfo: (() -> Unit)? = null,
+    onInfoSource: MutableInteractionSource? = null,
 ) {
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1060,6 +1071,7 @@ private fun SummaryCell(
             )
             if (onInfo != null) {
                 Spacer(Modifier.width(3.dp))
+                val fallbackSource = remember { MutableInteractionSource() }
                 Icon(
                     imageVector = MiuixIcons.Info,
                     contentDescription = stringResource(R.string.frame_steady_index_info),
@@ -1068,7 +1080,7 @@ private fun SummaryCell(
                         .size(13.dp)
                         // 去水波纹：小图标上的 ripple 会溢出成方形闪烁，纯变色即可
                         .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
+                            interactionSource = onInfoSource ?: fallbackSource,
                             indication = null,
                             onClick = onInfo,
                         ),
@@ -1701,6 +1713,9 @@ private fun FramePowerCard(samples: List<FrameSample>, shape: RoundedCornerShape
 @Composable
 private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
     var showInfo by remember { mutableStateOf(false) }
+    // 按压预备：口径同稳帧指数 ⓘ（rememberDialogPressArmed，见 GlassDialog KDoc）
+    val infoSource = remember { MutableInteractionSource() }
+    val infoArmed = rememberDialogPressArmed(infoSource, showInfo)
     val durationMs = samples.last().timeMillis - samples.first().timeMillis
     val hasCpuTemp = samples.any { it.tempVirtualC != null }
     val hasGpuTemp = samples.any { it.gpuTempC != null }
@@ -1728,7 +1743,7 @@ private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape)
                         .padding(end = 16.dp)
                         .size(16.dp)
                         .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
+                            interactionSource = infoSource,
                             indication = null,
                         ) { showInfo = !showInfo },
                 )
@@ -1775,8 +1790,9 @@ private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape)
                 }
             }
             // ⓘ 弹窗直接交 GlassDialog（自带入场动效），不包 AnimatedVisibility —— 理由同稳帧指数 ⓘ
-            if (showInfo) {
+            if (infoArmed) {
                 FrameInfoDialog(
+                    open = showInfo,
                     title = stringResource(R.string.frame_card_temp_vir_info_title),
                     body = stringResource(R.string.frame_card_temp_vir_info),
                     onDismiss = { showInfo = false },
@@ -2280,6 +2296,9 @@ private fun FrameJankCard(
     shape: RoundedCornerShape,
 ) {
     var showInfo by remember { mutableStateOf(false) }
+    // 按压预备：口径同稳帧指数 ⓘ（rememberDialogPressArmed，见 GlassDialog KDoc）
+    val infoSource = remember { MutableInteractionSource() }
+    val infoArmed = rememberDialogPressArmed(infoSource, showInfo)
     val gray = MaterialTheme.colorScheme.onSurfaceVariant
     val blue = MaterialTheme.colorScheme.primary
     // 逐帧口径优先（图例=帧数）；旧会话回退 1s 均值口径（图例=秒数）
@@ -2312,7 +2331,7 @@ private fun FrameJankCard(
                         .size(16.dp)
                         // 同稳帧指数 ⓘ：无水波纹 + 再点一次收起
                         .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
+                            interactionSource = infoSource,
                             indication = null,
                         ) { showInfo = !showInfo },
                 )
@@ -2340,8 +2359,9 @@ private fun FrameJankCard(
             }
             // ⓘ 弹窗直接交 GlassDialog（自带入场动效），不包 AnimatedVisibility ——
             // 理由同稳帧指数 ⓘ（对全屏毛玻璃遮罩做动画 = 每帧重渲染模糊层，卡顿）
-            if (showInfo) {
+            if (infoArmed) {
                 FrameInfoDialog(
+                    open = showInfo,
                     title = "Jank",
                     body = stringResource(R.string.frame_jank_info),
                     onDismiss = { showInfo = false },

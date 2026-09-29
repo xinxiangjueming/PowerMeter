@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -41,6 +42,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import android.content.res.Configuration
@@ -335,23 +337,73 @@ fun DialogOverlay(content: @Composable () -> Unit) {
     }
 }
 
+/** 预备态解除宽限：松开后延迟卸载，避开「松开同帧点击落地」竞态把刚挂好的采样层拆掉 */
+private const val DialogArmedReleaseGraceMs = 250L
+
+/**
+ * 「按压预备」判定（配合 [GlassDialog] 的 `open` 参数实现零卡顿开窗，2026-09-29）。
+ *
+ * 依据（2026-09-28 批次四十三 gfxinfo 取证）：弹窗点击帧要现挂 dialogBackdropSource 的
+ * miuix + Haze 两层整屏录制层、整页重测重录、首次全屏模糊 —— UI 线程 30-51ms × 2 帧，
+ * 管线预热只治好了 shader 编译。同款管线在 SportLink 其页面较轻、这笔税在感知阈内；
+ * 本应用详情页卡片重，120Hz 下 6+ 帧冻结肉眼可见。治法 = 把整笔税搬到**按压帧**：
+ * 返回 true 期间调用方组合真实弹窗（open=false，[DialogArmedAlpha] 不可见），手指松开
+ * open 翻 true 只播入场动画 —— 按压帧再贵也不可见（画面与按下前逐像素一致）。
+ *
+ * 返回值 = 是否应组合弹窗：按住中 / [open] 为 true / 松开或关闭后的宽限期内。
+ * 宽限兜两个场景：①松开与点击落地的同帧竞态（立即卸载会把采样层拆了再重挂）；
+ * ②按住后拖出按钮范围取消（Cancel）时不立刻卸载，避免挂在滚动首帧上。
+ */
+@Composable
+fun rememberDialogPressArmed(
+    interactionSource: MutableInteractionSource,
+    open: Boolean,
+): Boolean {
+    val pressed by interactionSource.collectIsPressedAsState()
+    var armed by remember { mutableStateOf(false) }
+    LaunchedEffect(pressed, open) {
+        if (pressed || open) {
+            armed = true
+        } else {
+            delay(DialogArmedReleaseGraceMs)
+            if (!pressed && !open) armed = false
+        }
+    }
+    return armed
+}
+
+/**
+ * 弹窗「按压预备态」整层透明度：不可见，但子树照常绘制 —— RenderEffect/AGSL 模糊在
+ * 该透明度下正常执行（DialogPipelineWarmup 同款手法），首挂载开销借按压帧付掉。
+ */
+const val DialogArmedAlpha = 0.02f
+
 /**
  * 弹窗卡片进入动画：alpha 0→1（[initialScale] 默认 1f → 不缩放，底部弹层用纯淡入）。
  * 首次组合即可播，规避 AnimatedVisibility(visible=true) 首帧不播动画的问题。
+ *
+ * [playing] = false 为按压预备态（配合 [GlassDialog] 的 `open` 参数）：整层钉在
+ * [DialogArmedAlpha] 不播动画；open 翻 true 时从 0 起播 —— 即弹窗在按下时已组合好
+ * （挂源/整页重测/首次模糊都付在按压帧，视觉零变化），松开那一帧只剩入场动画。
  */
 @Composable
 fun Modifier.dialogEnterAnim(
     durationMillis: Int = 150,
     initialScale: Float = 1f,
+    playing: Boolean = true,
 ): Modifier {
     val alpha = remember { Animatable(0f) }
     val scale = remember { Animatable(initialScale) }
-    LaunchedEffect(Unit) {
-        alpha.animateTo(1f, tween(durationMillis))
-        scale.animateTo(1f, tween(durationMillis, easing = FastOutSlowInEasing))
+    LaunchedEffect(playing) {
+        if (!playing) return@LaunchedEffect
+        // ⚠️ alpha 与 scale 必须并行（SportLink 原版两个 launch 同跑 150ms）。移植时曾
+        // 串行（先淡入完再放大）→ 观感 = 弹窗先以 0.92 窄宽淡入、再变宽（2026-09-29
+        // 用户实指"出现的宽度比较窄，过 0.5s 才变正常宽度"）
+        launch { alpha.animateTo(1f, tween(durationMillis)) }
+        launch { scale.animateTo(1f, tween(durationMillis, easing = FastOutSlowInEasing)) }
     }
     return this.graphicsLayer {
-        this.alpha = alpha.value
+        this.alpha = if (playing) alpha.value else DialogArmedAlpha
         scaleX = scale.value
         scaleY = scale.value
     }
@@ -384,6 +436,12 @@ fun Modifier.dialogCardShadow(elevation: Dp = 8.dp): Modifier =
  * @param containerColor   玻璃卡底色（API<33 实心降级色）
  * @param title            标题（居中），可空
  * @param text             正文（可滚动）；列表 / 色盘等放入此处
+ * @param open             是否正式打开。false = 按压预备态：弹窗已组合、管线已挂源并执行
+ *                         首次模糊，但整层 [DialogArmedAlpha] 不可见，且**不注册任何交互**
+ *                         （scrim/卡片的 clickable、BackHandler 全部跳过，触摸穿透到下层，
+ *                         松开手指的点击才能落到触发按钮上）。open 翻 true 后节点原样切换
+ *                         为可交互并播入场动画 —— 挂源/重测/首次模糊的点击帧开销借此
+ *                         全部转移到按压帧（2026-09-28 gfxinfo 取证 UI 30-51ms×2 帧的治法）。
  */
 @Composable
 fun GlassDialog(
@@ -395,6 +453,7 @@ fun GlassDialog(
     containerColor: Color = MaterialTheme.colorScheme.surfaceContainerHigh,
     title: @Composable (() -> Unit)? = null,
     text: @Composable (() -> Unit)? = null,
+    open: Boolean = true,
 ) {
     val state = LocalDialogBackdrop.current
     val bp = state?.backdrop   // API<33 时 null → 实心卡降级
@@ -471,24 +530,32 @@ fun GlassDialog(
 
     if (state != null) {
         // 主路径：同窗口浮层（与 BlurredAlertDialog 一致），居中
+        val scrimClick = remember { MutableInteractionSource() }
+        val cardClick = remember { MutableInteractionSource() }
         DialogOverlay {
-            BackHandler { onDismissRequest() }
+            BackHandler(enabled = open) { onDismissRequest() }
             // （2026-09-28 曾试验 scrim 模糊延后一帧治弹窗顿挫——压暗→模糊的一帧补变实测
             // 肉眼可见"闪一下"，已回退为出现即全屏模糊。）
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    // 预备态整层 2% alpha（不可见、管线照常跑、无交互不拦触摸）；
+                    // open 后恒 1f，入场动画交给下方卡片自己的 dialogEnterAnim
+                    .graphicsLayer { alpha = if (open) 1f else DialogArmedAlpha }
                     .dialogHazeEffect(state.hazeState)
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                    ) { onDismissRequest() },
+                    .then(
+                        if (open) Modifier.clickable(
+                            interactionSource = scrimClick,
+                            indication = null,
+                        ) { onDismissRequest() }
+                        else Modifier
+                    ),
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
                     modifier = modifier
                         .dialogWidthAdaptive()
-                        .dialogEnterAnim(initialScale = 0.92f)
+                        .dialogEnterAnim(initialScale = 0.92f, playing = open)
                         .dialogCardShadow()
                         .clip(shape)
                         // 玻璃链：外层 clip 必须（miuix 模糊层是节点边界+padding 矩形，不随 shape 裁剪）；
@@ -518,18 +585,24 @@ fun GlassDialog(
                         // ⚠️ 点击拦截（移植自 SportLink）：scrim 是上面的全屏 Box + clickable{onDismissRequest}，
                         // 卡片内容若无消费事件的节点（ColorPalette 色盘轻点、正文空白），点击会冒泡到
                         // scrim 误触发关闭。空 onClick 消费卡片内点击阻断冒泡。
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                        ) { },
+                        // ⚠️ 预备态（open=false）必须跳过：预备卡片悬在触发按钮上方，若消费点击
+                        // 则松开的点击落不到按钮上，弹窗永远打不开。
+                        .then(
+                            if (open) Modifier.clickable(
+                                interactionSource = cardClick,
+                                indication = null,
+                            ) { }
+                            else Modifier
+                        ),
                 ) {
                     content()
                 }
             }
         }
     } else {
-        // 无宿主兜底（本项目全屏页恒挂 DialogBackdropHost，正常不可达；保持可用）
-        Box(
+        // 无宿主兜底（本项目全屏页恒挂 DialogBackdropHost，正常不可达；保持可用）。
+        // 预备态（open=false）无宿主即无管线可预热，直接不渲染
+        if (open) Box(
             modifier = Modifier
                 .fillMaxSize()
                 .clickable(

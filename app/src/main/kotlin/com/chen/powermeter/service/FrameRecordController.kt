@@ -1006,6 +1006,55 @@ object FrameRecordController {
                     pendingFps.add(FrameFpsSampleEntity.from(now, fps1s))
                 }
 
+                // 1s 落库样本组装：fps1s 只喂了 pendingFps 还不够 —— 主样本（含电量 / CPU /
+                // 帧间隔 / 丢帧）必须入 [pending]，否则 finishAndPersist 开头 isEmpty()
+                // 直接 return，会话行都不写、列表永不出现新场次（2026-09-29 子拍化重构
+                // 时本块整块丢失过：pending 恒空且无任何报错，装机后两场录制全没落库）。
+                if (fps1s != null && sessionPkg.isNotEmpty()) {
+                    // 电量四项（电压 / 电流 / 功率 / 电池温度）与帧率**同频**（每秒一次）：
+                    // 要能和帧率逐秒对齐，才能回答"掉帧的那一刻是不是正好在发热 / 拉电流"。
+                    // 数据源 = 功率侧同一条取数链（RootPowerReader），符号口径"正=充电"
+                    val power = RootPowerReader.read()
+                    // 帧间隔口径：timestats / sf_latency 用本拍直方图差集的加权平均（"当秒"
+                    // 帧时间；无基线 / 直方图中途被清 → 0.0 断线，同旧口径）；task_fps 无
+                    // 逐帧真值，用 1000/fps 推导值
+                    val frameSpace = when (effectiveAlgo) {
+                        FpsAlgorithm.TASK_FPS -> frameSpaceDerived ?: 0.0
+                        else -> p2pDeltaWeightedAvg(p2pDelta)
+                    }
+                    // 1s 样本的 CPU 字段 = 本拍窗口内快样的均值（250ms 快样聚合成与 Kite
+                    // 每秒行对齐的口径；250ms 密集明细另有 pendingCpu 落库）
+                    val (cpuTotal, cpuCores, cpuMhzAvg) = aggregateCpuWindow(cpuFastFrom)
+                    pending += FrameSample(
+                        timeMillis = now,
+                        fps = fps1s,
+                        frameSpaceMs = frameSpace,
+                        // 丢帧增量只有 timestats 口径有；sf_latency / task_fps 无此数据源
+                        // 落 0 —— jank 判定已改 p2pHist 逐帧口径，本列只是 timestats 场次
+                        // 的兼容数据
+                        missedFrames = missedDelta,
+                        cpuMhz = cpuMhzAvg,
+                        cpuUsagePct = cpuTotal,
+                        cpuCoreUsagePct = cpuCores,
+                        // 绝对值口径（库与卡片不出现负号，v6 迁移同口径）：取数链本身
+                        // "正=充电"，就地取 abs
+                        currentMa = power?.currentMa?.let(::abs),
+                        // RootPowerReader 返回 V/W，这里 ×1000 统一成毫口径落库
+                        // （mV/mW/mA 与 Kite CSV 表头同源，App 显示时 ÷1000 换回）
+                        voltageMv = power?.voltageV?.times(1_000.0),
+                        powerMw = power?.powerW?.let(::abs)?.times(1_000.0),
+                        tempBatteryC = power?.tempBatteryC,
+                        tempVirtualC = virtualTempC,
+                        gpuTempC = gpuTempC,
+                        // 容量 % 来自功率链的 SOC（0 = 上报缺失，按缺测处理，不画成 0）
+                        capacityPct = power?.socPct?.takeIf { it > 0 }?.toDouble(),
+                        gpuLoadPct = gpuLoadPct,
+                        gpuFreqMhz = gpuFreqMhz,
+                        // 本秒帧间隔分布（详情页逐帧 jank 判定的数据源）；null = 缺测 → 空表
+                        p2pHist = p2pDelta.orEmpty(),
+                    )
+                }
+
                 accFrames = 0L
                 accDtSec = 0.0
                 accHist.clear()
