@@ -163,9 +163,9 @@ fun FrameMeterScreen(
     val pageBackgroundArgb = MaterialTheme.colorScheme.background.toArgb()
 
     // 列表卡片 → 详情页：卡片本体已在 FrameSessionCard 内 register 转场锚点，这里消费
-    // 锚点截图 + 登记 Handoff。与趋势全屏页（launchWithTransform）不同口径：详情页进场
-    // 走主题侧边滑入，截图只供**退场**收拢一镜到底（2026-09-27 用户定稿：大场次整页
-    // 图表卡首帧组合重，进场展开会卡）；截图失败 / 非 Activity 容器 → capture = null 普通启动
+    // 锚点截图 + 登记 Handoff。launchWithTransform（同趋势全屏页口径）：2026-09-30 试验
+    // 进场也一镜到底（2026-09-27 曾因大场次首帧组合重改"进场侧边滑入、退场才收拢"，
+    // 试验观感不佳 revert 对应 commit 即回退）；截图失败 / 非 Activity 容器 → capture = null 普通启动
     val openSession: (Long) -> Unit = { sessionId ->
         val act = context as? Activity
         // keepPageSnapshot=false（2026-09-28 二改）：详情页已改**半透明窗口主题** →

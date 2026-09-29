@@ -58,6 +58,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -223,12 +224,15 @@ private fun Double?.f0OrDash(): String = this?.f0() ?: "—"
  * 窗口动画，与「趋势全屏页」的路径一致。数据源按 sessionId 从 Room 直接读，
  * 不经过进程内单例 —— 详情页是一次性查看，没必要为了它常驻一份列表状态。
  *
- * **转场形态**（2026-09-27 用户定稿：进场侧边滑入、退场一镜到底）：列表卡片点击时
- * [AppTransitions.register] 锚点 → [AppTransitions.capture] 截图 → 本页 [launch] 经
- * [AppTransitions.launchWithCollapseBack] 登记 Handoff，进场走主题窗口侧边滑入（大场次
- * 整页图表卡首帧组合重，ClipReveal 展开要求首帧整页就绪、会卡）；onPostCreate 仍把
- * 页面根包进 ClipRevealLayout（expandOnEnter=false 只装配不展开），返回整页收回卡片
- * 矩形后 finish——一镜到底只在退场侧。
+ * **转场形态**（2026-09-30 试验：进/退场均一镜到底，独立 commit 可整体 revert）：列表
+ * 卡片点击时 [AppTransitions.register] 锚点 → [AppTransitions.capture] 截图 → 本页
+ * [launch] 经 [AppTransitions.launchWithTransform] 登记 Handoff 并压制主题窗口滑动，
+ * 进场从卡片矩形四向撑开（expandOnEnter=true 默认）；返回整页收回卡片矩形后 finish。
+ * 历史：2026-09-27 曾因大场次整页图表卡首帧组合重、ClipReveal 展开要求首帧整页就绪
+ * 会卡，拆成"进场侧边滑入 + 退场才收拢"（launchWithCollapseBack + expandOnEnter=false）；
+ * 本轮试验恢复进场展开，观感不佳时 revert 该 commit 即回到滑入形态。展开动画延后到
+ * 页面内容首帧画完才起跑（waitForContentReady 闸门，2026-09-30 二轮：图表首帧构建与
+ * 展开同帧抢 UI 线程卡顿，等待期窗口停在卡片矩形 = 观感停在列表）。
  * 源页与目标页都跟随系统方向（均不锁横竖屏），同方向无旋转 → 不传 anchorTransform。
  */
 class FrameDetailActivity : ComponentActivity() {
@@ -257,16 +261,16 @@ class FrameDetailActivity : ComponentActivity() {
         private const val NO_ID = -1L
 
         /**
-         * 打开详情页。有 [capture]（列表卡片截图 + 窗口矩形）→ 登记 Handoff 供**退场**
-         * 收拢一镜到底，进场走主题侧边滑入（见类注释）；null（截图失败等）→ 普通启动
-         * （退场也无收拢，主题窗口动画）。
+         * 打开详情页。有 [capture]（列表卡片截图 + 窗口矩形）→ 登记 Handoff 并压制窗口
+         * 滑动，进场/退场均走 ClipReveal 一镜到底（见类注释）；null（截图失败等）→
+         * 普通启动（无收拢，主题窗口动画）。
          */
         fun launch(context: Context, sessionId: Long, capture: AppTransitions.Capture? = null) {
             val intent = Intent(context, FrameDetailActivity::class.java)
                 .putExtra(EXTRA_SESSION_ID, sessionId)
             val act = context as? Activity
             if (capture != null && act != null) {
-                AppTransitions.launchWithCollapseBack(act, intent, capture)
+                AppTransitions.launchWithTransform(act, intent, capture)
             } else {
                 context.startActivity(intent)
             }
@@ -325,6 +329,19 @@ class FrameDetailActivity : ComponentActivity() {
                     dataReady = true
                 }
 
+                // 进场转场放行（2026-09-30 试验批次二）：整页十几张图表卡的位图在首帧
+                // remember 里同步构建（lineChart.buildPaths），展开动画若与它同帧抢 UI
+                // 线程 = 全程卡顿。dataReady 后等两帧 —— 第一帧 = 内容组合+布局+绘制的
+                // 重帧（等待期窗口裁剪停在卡片矩形，屏幕观感停在列表）、第二帧起都是轻帧
+                // —— 再通知 AppTransitions 启动展开。无转场 Handoff（通知/过期启动）时
+                // notify 是 no-op。
+                LaunchedEffect(dataReady) {
+                    if (!dataReady) return@LaunchedEffect
+                    withFrameNanos { }
+                    withFrameNanos { }
+                    AppTransitions.notifyPageReady(this@FrameDetailActivity)
+                }
+
                 // DialogBackdropHost：详情页弹窗（稳帧指数 / Jank ⓘ）走「宿主 + slot」玻璃路径。
                 // ⚠️ 缺宿主时 GlassDialog 降级为**就地渲染**——说明弹窗长在统计卡里，
                 // 出现/消失会瞬间顶开卡片高度（用户实测反馈）。口径同 MainActivity（2026-09-25 补）。
@@ -342,11 +359,14 @@ class FrameDetailActivity : ComponentActivity() {
             }
         }
 
-        // 窗口关闭转场压 0：退场由收拢动画接管（整页裁剪回源卡片矩形，末帧唯一可见
-        // 内容 = 卡片截图，activityClose* 的滑出会把这帧整窗滑出）。OPEN 不压——进场
-        // 走主题侧边滑入（2026-09-27 用户定稿，见类注释）。API 34+ 在此注册；更早版本
-        // 由 CollapseHost.finishNow 的 overridePendingTransition(0,0) 兜底。
+        // 窗口开/关转场双压 0（2026-09-30 试验：进场恢复一镜到底）：进场展开由
+        // installWindowTransform 首帧 PreDraw 手动播放，主题 activityOpen* 侧边滑入
+        // 若不压会与窗口内 ClipReveal 展开叠播（批次三十一 v1 失败根因之一，源侧已在
+        // launchWithTransform 里 overridePendingTransition(0,0)）；退场同理由收拢动画
+        // 接管，activityClose* 的滑出会把收拢末帧整窗滑出。API 34+ 在此注册；更早版本
+        // 由 overridePendingTransition / CollapseHost.finishNow 兜底。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, 0, 0)
             overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
         }
     }
@@ -369,14 +389,16 @@ class FrameDetailActivity : ComponentActivity() {
     }
 
     /**
-     * 跨 Activity 退场收拢装配（SportLink DeviceManageActivity / 本项目 TrendFullscreenActivity
-     * 同款时机）：有新鲜 Handoff（从列表卡片点进）→ 页面根包进 ClipRevealLayout 并钉
-     * 卡片截图（expandOnEnter=false：进场已走主题滑入，这里只服务退场收拢）；无（Handoff
+     * 跨 Activity 转场装配（SportLink DeviceManageActivity / 本项目 TrendFullscreenActivity
+     * 同款时机）：有新鲜 Handoff（从列表卡片点进）→ 页面根包进 ClipRevealLayout，进场
+     * 首帧从卡片矩形四向撑开、返回整页收拢（expandOnEnter 默认 true，2026-09-30 试验
+     * 恢复）；waitForContentReady=true = 展开动画延后到内容首帧画完才起跑（图表页首帧
+     * 重组极重，等待期观感停在列表，见 setContent 里的 notifyPageReady）；无（Handoff
      * 过期/截图失败）→ no-op，页面普通显示。
      */
     override fun onPostCreate(savedInstanceState: Bundle?) {
         super.onPostCreate(savedInstanceState)
-        AppTransitions.installWindowTransform(this, expandOnEnter = false)
+        AppTransitions.installWindowTransform(this, waitForContentReady = true)
     }
 
     /**

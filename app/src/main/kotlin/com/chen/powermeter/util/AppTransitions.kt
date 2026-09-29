@@ -6,6 +6,7 @@ import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -491,6 +492,12 @@ object AppTransitions {
      */
     private const val HANDOFF_TTL_MS = 10_000L
 
+    /**
+     * 进场展开等待页内容就绪的超时兜底（[installWindowTransform] 传 waitForContentReady
+     * 的页）：内容迟迟不通知（读库异常/页面异常）也放行动画，别把用户晾在源列表上。
+     */
+    private const val CONTENT_READY_TIMEOUT_MS = 3_000L
+
     private var handoff: Capture? = null
     private var handoffAtMs = 0L
 
@@ -621,6 +628,13 @@ object AppTransitions {
         /** 展开进度 f ∈ [0,1]：进场动画实时更新；无进场恒为 1（整页） */
         private var progress = 1f
         private var expandSet: Animator? = null
+
+        // 进场展开延后放行（2026-09-30 详情页试验，waitForContentReady 装配）：PreDraw 先摆
+        // f=0 终态（裁剪收进锚点矩形、内容隐藏、锚点截图可见 = 观感停在列表），页面通知
+        // 内容首帧画完后再启动动画 —— 图表页首帧重组/位图构建极重，与展开动画同帧抢 UI
+        // 线程会全程卡顿。双字段置空即「已消费」，通知/超时路径幂等
+        private var pendingExpandGeometry: ClipReveal.RevealGeometry? = null
+        private var pendingExpandClip: ClipRevealLayout? = null
 
         /**
          * 返回收拢：整页从当前进度裁剪收回源条目矩形（与 ui/ClipReveal.Holder 同一套公式）。
@@ -978,6 +992,44 @@ object AppTransitions {
         }
 
         /**
+         * 进场展开的延后形态（[installWindowTransform] 传 waitForContentReady）：只摆 f=0
+         * 终态不启动动画 —— 裁剪收进锚点矩形（页内容不可见）、锚点截图 f=0 可见，观感与
+         * 点击前的源列表逐像素一致；页面内容首帧真正画完后经 [notifyContentReady] 放行
+         * （[startPendingExpand] 复用 [beginExpand]，其 f=0 预置与本状态相同，无跳变）。
+         * [CONTENT_READY_TIMEOUT_MS] 超时兜底放行。
+         */
+        fun beginExpandDeferred(geometry: ClipReveal.RevealGeometry, clip: ClipRevealLayout) {
+            progress = 0f
+            geometry.applyTo(clip, 0f)
+            clip.setAnchorAlpha(ClipReveal.anchorAlphaAt(0f))
+            clip.setContentVeil(0f)
+            page.alpha = ClipReveal.contentAlphaAt(0f)
+            pendingExpandGeometry = geometry
+            pendingExpandClip = clip
+            clip.postDelayed({
+                if (pendingExpandGeometry != null && !closing && !finishRequested) {
+                    Log.w(TAG, "content-ready wait timeout (${CONTENT_READY_TIMEOUT_MS}ms) → expand anyway")
+                    startPendingExpand()
+                }
+            }, CONTENT_READY_TIMEOUT_MS)
+        }
+
+        /** 页面内容首帧已画完（组合+布局+绘制落地）→ 启动展开动画（幂等；无 pending/closing 时 no-op） */
+        fun notifyContentReady() {
+            if (pendingExpandGeometry == null || closing || finishRequested) return
+            // post 一拍：通知常发生在重组/绘制进行中，让当帧收尾、动画从其后的轻帧启动
+            pendingExpandClip?.post { startPendingExpand() }
+        }
+
+        private fun startPendingExpand() {
+            val geometry = pendingExpandGeometry ?: return
+            val clip = pendingExpandClip ?: return
+            pendingExpandGeometry = null
+            pendingExpandClip = null
+            beginExpand(geometry, clip)
+        }
+
+        /**
          * ClipReveal 收拢：整页从当前进度裁剪收回源条目矩形（左右边界收到卡片边缘、
          * 四角圆角收到卡片实际显示圆角），结束 finish。公式/时长/插值与
          * ui/ClipReveal.Holder 同一套（[ClipReveal.buildRevealGeometry]）。
@@ -1108,6 +1160,10 @@ object AppTransitions {
      * Handoff 过期）→ no-op，页面普通显示。
      * [expandOnEnter] = false 时只装配收拢、不播进场展开（FrameDetailActivity 拆分形态：
      * 进场动画交给主题窗口滑动，见 [launchWithCollapseBack]）。
+     * [waitForContentReady] = true 时进场展开延后到页面通知内容就绪（[notifyPageReady]）
+     * 才启动：2026-09-30 详情页试验，图表页首帧重组/位图构建极重，与展开动画同帧抢
+     * UI 线程会全程卡顿 —— 等待期窗口裁剪停在锚点矩形（观感停在源列表，见
+     * [CollapseHost.beginExpandDeferred]），超时 [CONTENT_READY_TIMEOUT_MS] 兜底放行。
      *
      * **同方向进场**（源窗口横屏，2026-09-29 照抄 SportLink）：首帧 PreDraw 直接从
      * Handoff 矩形四向撑开 —— 横屏源窗口本就是终态尺寸、无旋转叠层，无需任何等待。
@@ -1128,15 +1184,24 @@ object AppTransitions {
      *   退化全宽中心线展开。遮罩在展开完成（onAnimationEnd）或开始收拢（requestClose）
      *   时拆除，露出真实源页。
      */
-    fun installWindowTransform(activity: Activity, expandOnEnter: Boolean = true) {
+    fun installWindowTransform(
+        activity: Activity,
+        expandOnEnter: Boolean = true,
+        waitForContentReady: Boolean = false,
+    ) {
         val content = activity.findViewById<ViewGroup>(android.R.id.content) ?: return
         val capture = consumePendingStart() ?: run {
             Log.i(TAG, "installWindowTransform: no fresh handoff, plain display (${activity.componentName?.shortClassName})")
             return
         }
-        // 跨方向判定：源窗口竖屏 + 本页锁横屏（SportLink 用 Capture.orientation 对比
-        // 目标页方向；本项目 Capture 带源窗口宽高，语义等价）
-        val crossDirection = capture.sourceWidth < capture.sourceHeight
+        // 跨方向判定：源窗口竖屏 + 本页**当前横屏**（SportLink 用 Capture.orientation
+        // 对比目标页方向）。只看源宽高会把"跟随系统方向的详情页从竖屏列表进入"误判成
+        // 跨方向（该判定为锁横屏的趋势页而写）——进场会错误走进旋转等待分支、最终超时
+        // 降级全宽中心线展开，收拢侧转屏守卫（verifySourceWindow）也被误关。目标方向以
+        // 本页 Configuration 为准（锁横屏页 onPostCreate 时必已是横屏；跟随方向页与源
+        // 同向 → false 直用 Handoff 矩形首帧展开）。2026-09-30 详情页进场恢复一镜到底时修正。
+        val crossDirection = capture.sourceWidth < capture.sourceHeight &&
+            activity.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         // expandOnEnter=false（collapse-back，无展开 PreDraw）的收拢终点必须装配时就绪；
         // 该形态均同方向（FrameDetailActivity），原样取用。expandOnEnter=true 时矩形由
         // 进场路径登记：同方向 = Handoff 矩形直用（下方 PreDraw）；跨方向 = 轮询现拍
@@ -1304,7 +1369,11 @@ object AppTransitions {
                             clipOriginY = loc[1].toFloat(),
                             activity = activity,
                         )
-                        host.beginExpand(geometry, w)
+                        if (waitForContentReady) {
+                            host.beginExpandDeferred(geometry, w)
+                        } else {
+                            host.beginExpand(geometry, w)
+                        }
                         return false
                     }
                 },
@@ -1315,6 +1384,15 @@ object AppTransitions {
     /** 统一收尾入口：有收拢宿主 → 播收拢动画后 finish；无 → 直接 finish */
     fun finishWithTransform(activity: Activity) {
         if (!collapseAndFinish(activity)) activity.finish()
+    }
+
+    /**
+     * 页面内容首帧就绪通知：[installWindowTransform] 以 waitForContentReady=true 装配的页，
+     * 在内容真正画完（组合+布局+绘制落地）后调用 —— 展开动画从此刻起跑，不再与内容
+     * 首帧的重活抢 UI 线程。无收拢宿主（通知启动/Handoff 过期）= no-op。
+     */
+    fun notifyPageReady(activity: Activity) {
+        collapseHosts[activity]?.notifyContentReady()
     }
 
     /**
