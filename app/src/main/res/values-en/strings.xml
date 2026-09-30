@@ -124,8 +124,7 @@
     <string name="frame_card_cpu_usage" formatted="false">CPU Usage(%)</string>
     <string name="frame_card_cpu_frequency" formatted="false">CPU Frequency(MHz)</string>
     <string name="frame_card_frame_time" formatted="false">Frame Time(ms)</string>
-    <string name="frame_right_cpu_load" formatted="false">CPU Load(%)</string>
-    <string name="frame_right_gpu_load" formatted="false">GPU Load(%)</string>
+    <string name="frame_right_cpu_gpu_load" formatted="false">CPU/GPU Load(%)</string>
     <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
     <string name="frame_source_title">FPS source</string>
     <string name="frame_source_timestats">Timestats</string>

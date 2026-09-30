@@ -122,8 +122,7 @@
     <string name="frame_card_cpu_usage" formatted="false">CPU 使用率(%)</string>
     <string name="frame_card_cpu_frequency" formatted="false">CPU 頻率(MHz)</string>
     <string name="frame_card_frame_time" formatted="false">幀時間(ms)</string>
-    <string name="frame_right_cpu_load" formatted="false">CPU 負載(%)</string>
-    <string name="frame_right_gpu_load" formatted="false">GPU 負載(%)</string>
+    <string name="frame_right_cpu_gpu_load" formatted="false">CPU/GPU 負載(%)</string>
     <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
     <string name="frame_source_title">取樣源</string>
     <string name="frame_source_timestats">Timestats</string>

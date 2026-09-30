@@ -127,9 +127,8 @@
     <string name="frame_card_cpu_usage" formatted="false">CPU 使用率(%)</string>
     <string name="frame_card_cpu_frequency" formatted="false">CPU 频率(MHz)</string>
     <string name="frame_card_frame_time" formatted="false">帧时间(ms)</string>
-    <!-- FPS 卡右轴指标选项（Scene 同款命名：CPU/GPU Load，2026-09-27 加 GPU load 切换） -->
-    <string name="frame_right_cpu_load" formatted="false">CPU 负载(%)</string>
-    <string name="frame_right_gpu_load" formatted="false">GPU 负载(%)</string>
+    <!-- FPS 卡右轴指标选项（Scene 同款命名：CPU/GPU Load） -->
+    <string name="frame_right_cpu_gpu_load" formatted="false">CPU/GPU 负载(%)</string>
     <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
     <string name="frame_source_title">采样源</string>
     <string name="frame_source_timestats">Timestats</string>
