@@ -53,6 +53,17 @@ private val GPU_FREQ_NODES = arrayOf(
 /** 温感区根目录（同 FrameRateSource.THERMAL_ZONE_DIR） */
 private const val THERMAL_ZONE_DIR = "/sys/class/thermal"
 
+/**
+ * DDR 频率候选节点（与 FrameRateSource.DDR_FREQ_NODES 同表同序，两处改动必须同步）。
+ * 候选池逆向 Metric libmetric_daemon.so 定案：QCOM bus_dcvs/DDR/cur_freq（kHz，
+ * 22081212C / SM8475 实测 shell 身份可读、无需 root）/ MTK dvfsrc cur_freq；
+ * debugfs clock_measure 与 helio dump 不进池（口径见 FrameRateSource.DDR_FREQ_NODES 注释）。
+ */
+private val DDR_FREQ_NODES = arrayOf(
+    "/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq",
+    "/sys/class/devfreq/mtk-dvfsrc-devfreq/cur_freq",
+)
+
 private val WHITESPACE_RE = Regex("\\s+")
 
 /**
@@ -216,6 +227,25 @@ class ShellService : IShellService.Stub() {
             val line = readNodeFirstLine(path) ?: continue
             if (line.isEmpty()) continue
             result += "\nfreq ${line.trim()}"
+            break
+        }
+        result
+    } catch (e: Exception) {
+        "ERROR:-1:${e.message}"
+    }
+
+    /**
+     * DDR 频率：候选节点按序探测（与 FrameRateSource.DDR_FREQ_NODES 同序），
+     * 第一个非空值原样回传（单位 kHz/Hz/MHz 不统一，由 FrameRateSource 按量级换算 MHz）。
+     * 全不可读返回空串（= 无数据，非错误）。输出与 [DDR_FREQ_CMD 的 awk]
+     * （FrameRateSource）逐行同构：单行原始值。
+     */
+    override fun readDdrFreq(): String = try {
+        var result = ""
+        for (path in DDR_FREQ_NODES) {
+            val line = readNodeFirstLine(path) ?: continue
+            if (line.isEmpty()) continue
+            result = line.trim()
             break
         }
         result

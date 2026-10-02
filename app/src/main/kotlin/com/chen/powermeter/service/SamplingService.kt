@@ -133,8 +133,11 @@ class SamplingService : Service() {
          * 内核 battery/voltage_now 上报的是**单节**电芯电压，串联机型整组为两节叠加。
          * 电流、容量保持不变（串联电流处处相等，mAh 口径不受影响）。
          * 小米机型内核口径不同，无需开启本开关。
+         *
+         * 帧率录制侧（FrameRecordController 的电量四项取数入口）共用本系数，
+         * 两个界面的整组口径才不会各说各话。
          */
-        private const val SERIES_DUAL_FACTOR = 2.0
+        internal const val SERIES_DUAL_FACTOR = 2.0
 
         /**
          * 采样序列改为**环形缓冲 + 按需快照**（档二-1，见 [SampleStore]）。

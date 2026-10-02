@@ -100,6 +100,13 @@ data class FrameSample(
      */
     val gpuFreqMhz: Double? = null,
     /**
+     * DDR 频率 MHz（2026-10-02 加，候选池逆向 Metric libmetric_daemon.so 定案：
+     * QCOM `/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq`（kHz）/ MTK dvfsrc cur_freq，
+     * 量级换算见 FrameRateSource.readDdrFreqMhz；22081212C 实测 shell 身份可读、无需 root）。
+     * 可空 = 候选节点全不可读 / 旧会话未采集（断线处理）。
+     */
+    val ddrFreqMhz: Double? = null,
+    /**
      * CPU 逐核使用率 %（v9 起采集，/proc/stat 逐核行差分；下标 = 核心号 cpu0..）。
      * null = 该核本周期无有效差分（基线未建立 / 离线核）/ 旧会话未采集（断线处理）。
      * 详情页 CPU Usage 卡按簇聚合画线（0~1 / 2~4 / 5~6 / 7，8 核机型的典型簇划分）。

@@ -24,7 +24,7 @@ import androidx.room.RoomDatabase
  */
 @Database(
     entities = [FrameSession::class, FrameSampleEntity::class, FrameCpuSampleEntity::class, FrameFpsSampleEntity::class],
-    version = 7,
+    version = 8,
     exportSchema = false
 )
 abstract class FrameDatabase : RoomDatabase() {
@@ -141,6 +141,22 @@ abstract class FrameDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v7 → v8（2026-10-02）：frame_samples 加 `ddrFreqMhz` 列（DDR 频率 MHz，2026-10-02
+         * 加的置底第四张频率卡，候选池逆向 Metric libmetric_daemon.so 定案，见
+         * FrameRateSource.readDdrFreqMhz；用户点名"DDR(MHz) 也要支持读取，卡片放到 GPU 频率卡下面"）。
+         *
+         * 真实迁移（装机对比批次的历史不能清）：可空列不带 NOT NULL，ALTER TABLE
+         * ADD COLUMN；旧会话该列为 null，详情页整卡隐藏（口径同 GPU 频率卡）。
+         * DDL 与实体生成 schema 的逐字符核对记录在编译后核对 FrameDatabase_Impl.kt
+         * （批次三十七的教训）。
+         */
+        private val MIGRATION_7_8 = object : androidx.room.migration.Migration(7, 8) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `frame_samples` ADD COLUMN `ddrFreqMhz` REAL")
+            }
+        }
+
         fun getInstance(context: Context): FrameDatabase =
             INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -148,7 +164,7 @@ abstract class FrameDatabase : RoomDatabase() {
                     FrameDatabase::class.java,
                     "frame.db"
                 )
-                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { INSTANCE = it }

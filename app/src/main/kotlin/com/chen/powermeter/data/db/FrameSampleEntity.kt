@@ -86,6 +86,8 @@ data class FrameSampleEntity(
     val gpuLoadPct: Double?,
     /** GPU 频率 MHz（2026-09-29 起，与 gpuLoadPct 同一条命令取回；本机 kgsl 被拦 / 旧会话为 null） */
     val gpuFreqMhz: Double?,
+    /** DDR 频率 MHz（v9 起采集，bus_dcvs/DDR/cur_freq 候选池；节点不可读 / 旧会话为 null） */
+    val ddrFreqMhz: Double?,
     /**
      * 本秒帧间隔分布（presentToPresent 差集直方图，frame.db v5 起采集）。
      * 序列化格式 `ms:count,ms:count`（桶按 ms 升序），如 `8:115,9:3`；
@@ -116,6 +118,7 @@ data class FrameSampleEntity(
         capacityPct = capacityPct,
         gpuLoadPct = gpuLoadPct,
         gpuFreqMhz = gpuFreqMhz,
+        ddrFreqMhz = ddrFreqMhz,
     )
 
     companion object {
@@ -155,6 +158,7 @@ data class FrameSampleEntity(
         capacityPct = s.capacityPct,
         gpuLoadPct = s.gpuLoadPct,
         gpuFreqMhz = s.gpuFreqMhz,
+        ddrFreqMhz = s.ddrFreqMhz,
     )
 
         /** 分布 → `ms:count,ms:count`（桶升序）；空 = null（缺测列） */

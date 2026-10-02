@@ -93,6 +93,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import com.chen.powermeter.R
 import com.chen.powermeter.data.FrameSample
+import com.chen.powermeter.data.FpsAlgorithm
 import com.chen.powermeter.data.db.FrameCpuSampleEntity
 import com.chen.powermeter.data.db.FrameFpsSampleEntity
 import com.chen.powermeter.data.db.FrameSampleEntity
@@ -683,13 +684,20 @@ private fun FrameDetailScreen(
                         // 2026-09-25 重构：按 Kite 报告版式重排（不再照搬电池查看页的卡片区）——
                         // 顶部统计网格 → 帧率与温度（双轴叠加）→ Frame Time → Jank → Power
                         // → Temperature → CPU Usage → CPU Frequency（后两卡 2026-09-25 追加置底）
+                        // → GPU Frequency（2026-10-02 拆自 FPS 卡右轴候选，置底收尾）
                         // 逐帧卡顿/稳帧统计一次算好三卡共用（旧会话为 null，卡内各自回退旧口径）
                         val frameStats = remember(samples) { frameJankStats(samples) }
+                        // 采样源口径（FrameSession.fpsSource，可空 = 旧会话按 timestats 显示）：
+                        // TASK_FPS 只有系统直推 fps、没有逐帧帧间隔（p2pHist 恒空），逐帧 jank
+                        // 判不了 → Jank 卡整卡不显示；卡顿率同口径在 FrameSummaryCard 内隐藏
+                        val jankSupported = session.fpsSource != FpsAlgorithm.TASK_FPS.key
                         FrameSummaryCard(session, samples, frameStats, cardShape)
                         if (samples.size >= 2) {
                             FrameFpsTempCard(samples, fpsPoints, fpsAxisMax, cardShape)
                             FrameTimeCard(samples, frameStats, cardShape)
-                            FrameJankCard(samples, frameStats, cardShape)
+                            if (jankSupported) {
+                                FrameJankCard(samples, frameStats, cardShape)
+                            }
                             FramePowerCard(samples, cardShape)
                             // Temperature 卡按数据显隐：CPU/GPU 温度取 thermal_zone 温感区
                             // （需 root/Shizuku，非 root 机型整场缺失）；2026-09-29 起 VIR 线
@@ -708,6 +716,17 @@ private fun FrameDetailScreen(
                             }
                             if (cpuPoints.any { p -> p.mhz.any { m -> (m ?: 0.0) > 0.0 } }) {
                                 FrameCpuFreqCard(cpuPoints, cardShape)
+                            }
+                            // GPU 频率卡（2026-10-02 从 FPS 卡右轴候选拆出、用户定案置底）：
+                            // gpu_freq 列 v7 起采集，旧会话 / 节点不可读的机器整场缺失 → 整卡隐藏
+                            if (samples.any { it.gpuFreqMhz != null }) {
+                                FrameGpuFreqCard(samples, cardShape)
+                            }
+                            // DDR 频率卡（2026-10-02 加，用户定案置于 GPU 频率卡下）：
+                            // ddr_freq 列 v8 起采集（候选池逆向 Metric libmetric_daemon.so
+                            // 定案），旧会话 / 候选节点全不可读的机器整场缺失 → 整卡隐藏
+                            if (samples.any { it.ddrFreqMhz != null }) {
+                                FrameDdrFreqCard(samples, cardShape)
                             }
                         }
                     }
@@ -1035,8 +1054,12 @@ private fun FrameSummaryCard(
     val fpsVals = samples.map { it.fps }.filter { it > 0.0 }
     val fpsSd = stdev(fpsVals)
     val avgPowerMw = samples.mapNotNull { it.powerMw }.takeIf { it.isNotEmpty() }?.average()
-    // 卡顿率：逐帧口径优先；旧会话回退时长占比
-    val jankRate = frameStats?.jankRatePct ?: run {
+    // 卡顿率：逐帧口径优先；旧会话回退时长占比。TASK_FPS 没有逐帧帧间隔（p2pHist 恒空，
+    // 两种口径都判不出卡顿，只会显示假 0）→ 与 Jank 卡同口径整格隐藏（口径见卡片装配处）
+    val jankSupported = session.fpsSource != FpsAlgorithm.TASK_FPS.key
+    val jankRate = if (!jankSupported) {
+        null
+    } else (frameStats?.jankRatePct ?: run {
         val tiers = jankTiers(samples)
         val spanMs = (samples.last().timeMillis - samples.first().timeMillis).coerceAtLeast(1L)
         val stutterMs = tiers.withIndex().sumOf { (i, tier) ->
@@ -1047,7 +1070,7 @@ private fun FrameSummaryCard(
             }
         }
         stutterMs * 100.0 / spanMs
-    }
+    })
     val energyPerFrameMw =
         if (avgPowerMw != null && session.avgFps > 0.0) avgPowerMw / session.avgFps else null
     val maxBatTemp = samples.mapNotNull { it.tempBatteryC }.maxOrNull()
@@ -1086,12 +1109,14 @@ private fun FrameSummaryCard(
                     "mW",
                     Modifier.weight(1f),
                 )
-                SummaryCell(
-                    stringResource(R.string.frame_jank_rate),
-                    jankRate?.f2() ?: "—",
-                    "%",
-                    Modifier.weight(1f),
-                )
+                if (jankSupported) {
+                    SummaryCell(
+                        stringResource(R.string.frame_jank_rate),
+                        jankRate?.f2() ?: "—",
+                        "%",
+                        Modifier.weight(1f),
+                    )
+                }
                 SummaryCell(
                     stringResource(R.string.frame_steady_index),
                     ftSd?.f1() ?: "—",
@@ -1100,6 +1125,8 @@ private fun FrameSummaryCard(
                     onInfo = { showSteadyInfo = !showSteadyInfo },
                     onInfoSource = steadyInfoSource,
                 )
+                // 隐藏卡顿率时补一个空位，保持与上行对齐的 4 列网格
+                if (!jankSupported) Spacer(Modifier.weight(1f))
                 Spacer(Modifier.weight(1f))
             }
             // ⓘ 说明弹窗：⚠️ 不能包 AnimatedVisibility —— GlassDialog 是同窗口浮层、自带
@@ -1238,10 +1265,13 @@ private fun virTempC(batteryTempC: Double?): Double? =
 /** CPU 占用率线（FPS 卡右轴候选；Kite 图例里的粉色） */
 private val CpuLoadPink = Color(0xFFF48FB1)
 
-/** GPU 占用率线（FPS 卡右轴候选；Kite 图例里的蓝色） */
+/** GPU 负载线（FPS 卡右轴「CPU/GPU 负载」+ GPU 频率卡 Load 线；Kite 图例里的蓝色） */
 private val GpuLoadBlue = Color(0xFF64B5F6)
-/** GPU 频率线（2026-09-29 加，右轴 GPU(MHz) 候选；淡紫与 CpuLoadPink/GpuLoadBlue 区分） */
+/** GPU 频率线（GPU 频率卡主线；2026-09-29~10-01 曾是 FPS 卡右轴候选，2026-10-02 拆出独立成卡） */
 private val GpuFreqPurple = Color(0xFF9575CD)
+
+/** DDR 频率线（DDR 频率卡主线；与 GPU 紫 / CPU 簇四色均不撞色的青绿） */
+private val DdrFreqTeal = Color(0xFF26A69A)
 
 /**
  * CPU Usage / CPU Frequency 两卡的分簇配色（Kite 同款：紫 / 亮青 / 深青 / 橙；
@@ -1561,9 +1591,10 @@ private class RightSeriesOption(
 /**
  * 帧率与温度卡：**双轴 + 右轴多曲线叠加**（Kite 版式，2026-09-28 单选改多选）——
  * FPS 折线走左轴（灰，0 → 设备铺满刷新率），右轴候选电量 / 温度 / CPU/GPU 负载（单图例
- * 双线：粉=CPU、蓝=GPU）/ GPU(MHz)：点底部图例**切换勾选**（可多条同绘，选中高亮、
+ * 双线：粉=CPU、蓝=GPU）：点底部图例**切换勾选**（可多条同绘，选中高亮、
  * 未选压暗），右上角 Refresh 钮轮换到下一候选（收敛为单选）。右轴值域：纯温度 0-50、
  * 纯百分项 0-100；混选（温度+百分项）统一挂 0-100，温度曲线落在轴下半区。
+ * （GPU 频率原是右轴候选之一，2026-10-02 用户定案拆出独立成卡置底 —— [FrameGpuFreqCard]。）
  * ⚠️ 右轴标签区宽度**恒按 0-100 档预留**（用户 2026-09-28：温度 0-50 切换时绘图区宽度跳动）
  * ——右轴标签从绘图区右缘起画，窄标签只是右侧多留白，绘图区宽度稳定不跳。
  * ⚠️ 整场无数据的候选自动不进切换列表（GPU 负载：节点全不可读的机器 / 旧会话缺列）。
@@ -1587,7 +1618,6 @@ private fun FrameFpsTempCard(
     val batteryLabel = stringResource(R.string.frame_card_battery)
     val tempLabel = stringResource(R.string.frame_card_temp)
     val cpuGpuLoadLabel = stringResource(R.string.frame_right_cpu_gpu_load)
-    val gpuFreqLabel = stringResource(R.string.frame_right_gpu_freq)
     // FPS 线数据源：新会话吃 250ms 子拍点（短谷可见），旧会话回退 1s 样本。
     // 右轴序列是 1s 粒度 —— 索引制图要求两条线等长，按索引比例最近邻把 1s 值重采样到
     // 子拍点数（1s 值在 4Hz 网格上呈台阶、形状不变）
@@ -1602,12 +1632,7 @@ private fun FrameFpsTempCard(
         val n = fpsVals.size
         return List(n) { i -> this[((i.toLong() * size) / n).toInt().coerceAtMost(size - 1)] }
     }
-    val rightOptions = remember(samples, fpsPoints, batteryLabel, tempLabel, cpuGpuLoadLabel, gpuFreqLabel) {
-        // GPU 频率（2026-09-29 加）：值域按本场数据自适应取 500MHz 档上限（1000/1500/2000/2500…），
-        // 固定档会顶格裁尖或留大片空白；无数据的机器 / 旧会话整列 null → 选项自动不出现
-        val gpuFreqTop = samples.mapNotNull { it.gpuFreqMhz }.maxOrNull()
-            ?.let { max -> ((max / 500.0).toInt() + 1) * 500.0 }
-            ?: 1500.0
+    val rightOptions = remember(samples, fpsPoints, batteryLabel, tempLabel, cpuGpuLoadLabel) {
         val cpuLoadVals = samples.map { it.cpuUsagePct }.toFpsGrid()
         val gpuLoadVals = samples.map { it.gpuLoadPct }.toFpsGrid()
         listOfNotNull(
@@ -1618,8 +1643,6 @@ private fun FrameFpsTempCard(
                 cpuGpuLoadLabel, 0.0..100.0, CpuLoadPink, cpuLoadVals,
                 color2 = GpuLoadBlue, values2 = gpuLoadVals,
             ).takeIf { o -> o.values.any { it != null } || o.values2!!.any { it != null } },
-            RightSeriesOption(gpuFreqLabel, 0.0..gpuFreqTop, GpuFreqPurple, samples.map { it.gpuFreqMhz }.toFpsGrid())
-                .takeIf { o -> o.values.any { it != null } },
         )
     }
     // 右轴多选叠加：List 保**选择序**（标题按序拼接，后选中的线画在上层）。至少保一个 ——
@@ -1628,9 +1651,8 @@ private fun FrameFpsTempCard(
     var rightSel by remember { mutableStateOf(listOf(0)) }
     val sel = rightSel.filter { it < rightOptions.size }.ifEmpty { listOf(0) }
     // 右轴值域：选中项值域全一致（纯温度 0-50 / 纯百分项 0-100）直接用；混选统一挂
-    // **最宽值域**（2026-09-29 从固定 0-100 改：GPU 频率 0-2500 与温度/百分项混选时，
-    // 固定 0-100 会把频率线压成贴底的直线）—— 值域窄的线落到轴下半区，诚实不裁剪。
-    // 兼容性：原有全部混选组合的最宽值域本就是 0-100（电池/百分项），行为不变。
+    // **最宽值域**（温度 0-50 + 百分项 0-100 → 恒为 0-100）—— 值域窄的线落到轴下半区，
+    // 诚实不裁剪。保留通用取 max 写法：将来值域档位再增减时不必回头改这里。
     val rightRange = remember(sel, rightOptions) {
         val rs = sel.map { rightOptions[it].range }.distinct()
         if (rs.size == 1) rs.first() else 0.0..(rs.maxOf { it.endInclusive })
@@ -1853,10 +1875,15 @@ private fun FramePowerCard(samples: List<FrameSample>, shape: RoundedCornerShape
 
 /**
  * Temperature(°C) 卡：CPU（温感区代表温度，需 root/Shizuku）/ GPU（GPU 温感区，v7 起采集）/
- * BAT（电池）/ VIR（Kite virTemp 口径虚拟温度，见 [virTempC]，电池温度在即有）四线共绘，
- * y 轴固定 0..50（Kite 同款）；缺测断线，旧会话无 GPU 列整线缺失。
- * 卡内单线自适应：某条线整场无任何读数（如机型没有 GPU 温感区）则该线连同图例点不出现，
- * 不画一个只有颜色的空图例。
+ * BAT（电池）/ VIR（Kite virTemp 口径虚拟温度，见 [virTempC]，电池温度在即有）四线共绘。
+ * 缺测断线，旧会话无 GPU 列整线缺失。卡内单线自适应：某条线整场无任何读数（如机型没有
+ * GPU 温感区）则该线连同图例点不出现，不画一个只有颜色的空图例。
+ * 图例**可点击**（2026-10-02 起）：点对应项显示/隐藏该线，隐藏以图例压暗表示，交互同 CPU
+ * 两卡（[FrameCpuMultiLineCard]）；**可点的只有 CPU/GPU/VIR 三条 —— BAT 恒显不可隐藏**
+ * （2026-10-03 用户定案，原话点名清单不含 BAT）。
+ * y 轴随可见线动态（2026-10-03 用户定案）：CPU/GPU 任一可见 → 0-100 每 10 一档（同 CPU
+ * 使用率卡，温感区满载可破 50°C）；CPU/GPU 都藏（只剩 BAT/VIR）→ 轴顶 50，切换带 300ms
+ * 动画；无 CPU+GPU 数据的会话恒 0..50×4 等分（Kite 同款）。
  */
 @Composable
 private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
@@ -1897,23 +1924,55 @@ private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape)
                 )
             }
             Spacer(Modifier.height(8.dp))
-            val (startInset, endInset) = rememberChartInsets(0.0..50.0, null)
-            // ⚠️ lines 必须稳定（remember 住）：FrameLineChart 按 lines 实例记忆折线位图，
-            // 每次重组新建 List 会把位图重建拖回每帧
-            val tempLines = remember(samples, hasCpuTemp, hasGpuTemp, hasBatTemp) {
+            // 候选序列 = 图例与折线共用一份（2026-10-02 图例改可点击：点对应项显示/隐藏该线，
+            // 隐藏以图例压暗表示，交互口径同 CPU 两卡 FrameCpuMultiLineCard）。
+            // ⚠️ series / visible / lines 全链 remember：FrameLineChart 按 lines 实例记忆折线
+            // 位图，每次重组新建 List 会把位图重建拖回每帧
+            val series = remember(samples, hasCpuTemp, hasGpuTemp, hasBatTemp) {
                 buildList {
-                    if (hasCpuTemp) add(FrameLine(samples.map { it.tempVirtualC }, CpuTempBlue))
-                    if (hasGpuTemp) add(FrameLine(samples.map { it.gpuTempC }, GpuTempPurple))
+                    // 图例序 = BAT/VIR 在左、CPU/GPU 在右（2026-10-03 用户定案）；画序随列表
+                    // 序，温感区两条线后画、压在电池/虚拟温度线上层
                     if (hasBatTemp) {
-                        add(FrameLine(samples.map { it.tempBatteryC }, TempOrange))
-                        add(FrameLine(samples.map { virTempC(it.tempBatteryC) }, VirTempGreen))
+                        add(FrameSeries("BAT", TempOrange, samples.map { it.tempBatteryC }))
+                        add(FrameSeries("VIR", VirTempGreen, samples.map { virTempC(it.tempBatteryC) }))
                     }
+                    if (hasCpuTemp) add(FrameSeries("CPU", CpuTempBlue, samples.map { it.tempVirtualC }))
+                    if (hasGpuTemp) add(FrameSeries("GPU", GpuTempPurple, samples.map { it.gpuTempC }))
                 }
             }
+            var hidden by remember(series) { mutableStateOf(setOf<Int>()) }
+            // BAT（电池温度）**恒显不可隐藏**（2026-10-03 用户定案：可点的只有 CPU/GPU/VIR，
+            // 原话点名清单就是这三条）。BAT 在场时其余三条全藏也有底线，"至少留一条"守卫只在
+            // BAT 缺席的会话生效
+            val batIndex = if (hasBatTemp) series.indexOfFirst { it.label == "BAT" } else -1
+            val visible = remember(series, hidden, batIndex) {
+                series.withIndex().filter { (idx, _) -> idx == batIndex || idx !in hidden }
+            }
+            // y 轴随**可见线**动态（2026-10-03 用户定案）：CPU/GPU 任一可见 → 轴顶 100（10 格，
+            // 同 CPU 使用率卡；温感区满载可破 50°C）；CPU/GPU 都藏（只剩 BAT/VIR）→ 轴顶 50。
+            // 切换走 animateFloatAsState 平滑过渡（轴顶/网格标签/曲线随动画逐帧重缩放；折线
+            // 位图键含 leftRange，动画期后台逐帧重光栅化 —— 单卡 ≤4 线成本可接受）。无 CPU+GPU
+            // 数据的会话没有温感区线可藏，维持 0-50×4 等分老口径、轴恒定
+            val hasCpuGpuTemp = hasCpuTemp && hasGpuTemp
+            val axisTopTarget = when {
+                !hasCpuGpuTemp -> 50.0
+                visible.any { (_, s) -> s.label == "CPU" || s.label == "GPU" } -> 100.0
+                else -> 50.0
+            }
+            val axisTop by animateFloatAsState(
+                targetValue = axisTopTarget.toFloat(),
+                animationSpec = tween(300),
+                label = "tempAxisTop",
+            )
+            val leftRange = 0.0..axisTop.toDouble()
+            val leftTickCount = if (hasCpuGpuTemp) 10 else 4
+            val (startInset, endInset) = rememberChartInsets(leftRange, null, leftTickCount = leftTickCount)
+            val tempLines = remember(visible) { visible.map { (_, s) -> FrameLine(s.values, s.color) } }
             FrameLineChart(
                 lines = tempLines,
-                leftRange = 0.0..50.0,
+                leftRange = leftRange,
                 rightRange = null,
+                leftTickCount = leftTickCount,
                 startInset = startInset,
                 endInset = endInset,
                 modifier = Modifier.fillMaxWidth(),
@@ -1925,16 +1984,45 @@ private fun FrameTempCard(samples: List<FrameSample>, shape: RoundedCornerShape)
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                buildList {
-                    if (hasCpuTemp) add(CpuTempBlue to "CPU")
-                    if (hasGpuTemp) add(GpuTempPurple to "GPU")
-                    if (hasBatTemp) {
-                        add(TempOrange to "BAT")
-                        add(VirTempGreen to "VIR")
+                series.forEachIndexed { i, s ->
+                    if (i > 0) Spacer(Modifier.width(12.dp))
+                    if (i == batIndex) {
+                        // BAT 恒显：静态圆点（同 FPS 卡 "FPS" 锚点口径），不可点、不压暗
+                        JankLegendDot(TempOrange, s.label)
+                    } else {
+                        val shown = i !in hidden
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                            ) {
+                                hidden = if (shown) {
+                                    // BAT 在场时其余三条全藏也有底线；BAT 缺席才守"至少留一条"
+                                    if (hasBatTemp || visible.size > 1) hidden + i else hidden
+                                } else {
+                                    hidden - i
+                                }
+                            },
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(8.dp)
+                                    .background(
+                                        s.color.copy(alpha = if (shown) 1f else 0.3f),
+                                        RoundedCornerShape(2.dp),
+                                    ),
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                s.label,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = DetailNumericFont,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    .copy(alpha = if (shown) 1f else 0.4f),
+                            )
+                        }
                     }
-                }.forEachIndexed { index, (color, label) ->
-                    if (index > 0) Spacer(Modifier.width(14.dp))
-                    JankLegendDot(color, label)
                 }
             }
             // ⓘ 弹窗直接交 GlassDialog（自带入场动效），不包 AnimatedVisibility —— 理由同稳帧指数 ⓘ
@@ -2135,6 +2223,150 @@ private fun FrameCpuFreqCard(points: List<CpuPoint>, shape: RoundedCornerShape) 
         leftTickValues = leftTickValues,
     )
     SideEffect { ChartPerf.tick("cpuFreq.recompose") }
+}
+
+/**
+ * GPU Frequency(MHZ) 卡（2026-10-02 加）：**双线恒显**（用户定案：Frequency / Load 两项
+ * 不是图例、不做点击切换，一直显示）—— GPU 频率线（淡紫 [GpuFreqPurple]，左轴 MHz）+
+ * GPU 负载线（蓝 [GpuLoadBlue]，右轴 0-100；数据源 gpuLoadPct，与 FPS 卡「CPU/GPU 负载」
+ * 同一列数据，图例口径随 FPS 卡叫 Load）。
+ * 原 FPS 卡右轴候选之一（2026-09-29~10-01），用户定案拆出独立成卡置底。
+ * 左轴 = 0 → 本场峰值的 500MHz 档上限（1000/1500/2000/2500…，固定档会顶格裁尖或留大片
+ * 空白），刻度 500MHz 一格 + 顶档（[leftTickValues] 口径同 CPU 频率卡的 300MHz 格）。
+ * 数据源 = 1s 样本 gpu_freq / gpu_load 列（v7 起采集，旧会话 / 节点不可读的机器整场缺失 →
+ * 装配处整卡隐藏；负载整列缺 = 只画频率线，右轴与 Load 图例不出现，不画空图例）。
+ */
+@Composable
+private fun FrameGpuFreqCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
+    // freqVals / loadVals / axisMax / 刻度全链 remember（口径同 Power 卡滑动卡顿修复）：
+    // 派生值引用稳定，下游 FrameLineChart 的折线位图缓存不因重组失效
+    val freqVals = remember(samples) { samples.map { it.gpuFreqMhz } }
+    val loadVals = remember(samples) { samples.map { it.gpuLoadPct } }
+    val hasLoad = remember(loadVals) { loadVals.any { it != null } }
+    val axisMax = remember(freqVals) {
+        (freqVals.filterNotNull().maxOrNull() ?: 0.0)
+            .let { max -> ((max / 500.0).toInt() + 1) * 500.0 }
+            .coerceAtLeast(500.0)
+    }
+    // 左轴刻度 = 500MHz 一格；axisMax 本身是 500 整倍数，顶档即最后一格
+    val leftTickValues = remember(axisMax) {
+        buildList {
+            var v = 500.0
+            while (v < axisMax) {
+                add(v)
+                v += 500.0
+            }
+            add(axisMax)
+        }
+    }
+    val durationMs = samples.last().timeMillis - samples.first().timeMillis
+    AppCard(shape = shape, modifier = Modifier.fillMaxWidth()) {
+        // 图表列不吃横向 padding（同 Power/Temperature 卡：轴标签贴边、绘图区加宽）
+        Column(Modifier.padding(vertical = 16.dp)) {
+            Text(
+                stringResource(R.string.frame_card_gpu_frequency),
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+            Spacer(Modifier.height(8.dp))
+            // 右轴 = GPU 负载 0-100（Power 卡左 W 右 % 同款）；负载整列缺测不画右轴
+            val rightRange = if (hasLoad) 0.0..100.0 else null
+            val (startInset, endInset) =
+                rememberChartInsets(0.0..axisMax, rightRange, leftTickValues = leftTickValues)
+            val gpuLines = remember(freqVals, loadVals, hasLoad) {
+                buildList {
+                    add(FrameLine(freqVals, GpuFreqPurple))
+                    if (hasLoad) add(FrameLine(loadVals, GpuLoadBlue, onRight = true))
+                }
+            }
+            FrameLineChart(
+                lines = gpuLines,
+                leftRange = 0.0..axisMax,
+                rightRange = rightRange,
+                startInset = startInset,
+                endInset = endInset,
+                leftTickValues = leftTickValues,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            ClockTicks(durationMs, startInset = startInset, endInset = endInset)
+            Spacer(Modifier.height(6.dp))
+            // 两项只是线色标识（恒显、不可点，同 Power 卡图例口径）
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                JankLegendDot(GpuFreqPurple, stringResource(R.string.frame_card_gpu_freq_name))
+                if (hasLoad) {
+                    Spacer(Modifier.width(14.dp))
+                    JankLegendDot(GpuLoadBlue, stringResource(R.string.frame_card_gpu_load_name))
+                }
+            }
+        }
+    }
+}
+
+/**
+ * DDR 频率卡（2026-10-02 加，用户定案置于 GPU 频率卡下）。
+ * 数据源 = 1s 样本 ddr_freq 列（v8 起采集，候选池逆向 Metric libmetric_daemon.so 定案：
+ * QCOM bus_dcvs/DDR/cur_freq（kHz）/ MTK dvfsrc cur_freq，量级换算见
+ * FrameRateSource.readDdrFreqMhz）—— 旧会话 / 候选节点全不可读的机器整场缺失 → 装配处整卡隐藏。
+ * 版式与 [FrameGpuFreqCard] 同款单线：左轴 0 → 本场峰值的 500MHz 档上限、500MHz 一格刻度，
+ * 单线无右轴；图例一项只是线色标识（恒显、不可点）。
+ */
+@Composable
+private fun FrameDdrFreqCard(samples: List<FrameSample>, shape: RoundedCornerShape) {
+    // freqVals / axisMax / 刻度全链 remember（口径同 Power 卡滑动卡顿修复）：
+    // 派生值引用稳定，下游 FrameLineChart 的折线位图缓存不因重组失效
+    val freqVals = remember(samples) { samples.map { it.ddrFreqMhz } }
+    val axisMax = remember(freqVals) {
+        (freqVals.filterNotNull().maxOrNull() ?: 0.0)
+            .let { max -> ((max / 500.0).toInt() + 1) * 500.0 }
+            .coerceAtLeast(500.0)
+    }
+    val leftTickValues = remember(axisMax) {
+        buildList {
+            var v = 500.0
+            while (v < axisMax) {
+                add(v)
+                v += 500.0
+            }
+            add(axisMax)
+        }
+    }
+    val durationMs = samples.last().timeMillis - samples.first().timeMillis
+    AppCard(shape = shape, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(vertical = 16.dp)) {
+            Text(
+                stringResource(R.string.frame_card_ddr_frequency),
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+            Spacer(Modifier.height(8.dp))
+            val (startInset, endInset) =
+                rememberChartInsets(0.0..axisMax, rightRange = null, leftTickValues = leftTickValues)
+            val ddrLines = remember(freqVals) { listOf(FrameLine(freqVals, DdrFreqTeal)) }
+            FrameLineChart(
+                lines = ddrLines,
+                leftRange = 0.0..axisMax,
+                rightRange = null,
+                startInset = startInset,
+                endInset = endInset,
+                leftTickValues = leftTickValues,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            ClockTicks(durationMs, startInset = startInset, endInset = endInset)
+            Spacer(Modifier.height(6.dp))
+            // 单项只是线色标识（恒显、不可点，同 GPU 频率卡图例口径）
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                JankLegendDot(DdrFreqTeal, "DDR")
+            }
+        }
+    }
 }
 
 /**

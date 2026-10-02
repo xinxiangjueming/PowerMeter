@@ -121,16 +121,21 @@
     <string name="frame_card_battery" formatted="false">電量(%)</string>
     <string name="frame_card_cpu_usage" formatted="false">CPU 使用率(%)</string>
     <string name="frame_card_cpu_frequency" formatted="false">CPU 頻率(MHz)</string>
+    <string name="frame_card_gpu_frequency" formatted="false">GPU 頻率（MHZ）</string>
+    <string name="frame_card_gpu_freq_name" formatted="false">頻率</string>
+    <string name="frame_card_gpu_load_name" formatted="false">負載</string>
+    <string name="frame_card_ddr_frequency" formatted="false">DDR 頻率（MHZ）</string>
     <string name="frame_card_frame_time" formatted="false">幀時間(ms)</string>
     <string name="frame_right_cpu_gpu_load" formatted="false">CPU/GPU 負載(%)</string>
-    <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
     <string name="frame_source_title">取樣源</string>
     <string name="frame_source_timestats">Timestats</string>
     <string name="frame_source_latency">SF Latency</string>
     <string name="frame_source_taskfps">TaskFps</string>
+    <string name="frame_source_ftl">FrameTimeline</string>
     <string name="frame_source_desc_timestats">累計幀數差異，全機型可用</string>
     <string name="frame_source_desc_latency">SurfaceFlinger 逐幀時間戳（Scene 同款解析），無追蹤上限</string>
     <string name="frame_source_desc_taskfps">系統主動推送幀率，零取樣開銷，需 Shizuku（Android 11+）</string>
+    <string name="frame_source_desc_ftl">perfetto frametimeline 逐幀 present 真值，精度最高（Android 12+）</string>
     <string name="frame_source_fallback">本機不可用，自動回落 Timestats</string>
     <string name="frame_right_axis_switch">切換右軸指標</string>
 

@@ -253,6 +253,16 @@ object FrameRecordController {
     @Volatile
     private var taskFpsRegisteredPkg = ""
 
+    /** TASK_FPS：最近一次注册成功时刻（ms）；0 = 尚未注册成功。「从未推送」的踢注册用它判龄 */
+    @Volatile
+    private var taskFpsRegisteredAt = 0L
+
+    /**
+     * TASK_FPS 推送静默踢注册标记：一次静默期只踢一次（unregister + 下子拍重新注册），
+     * 踢完仍无推送（任务真静止）就等下一条推送 / 目标切换复位，**不无限踢**。
+     */
+    private var taskFpsKickDone = false
+
     /**
      * TASK_FPS 推送的**陈旧判定**（ms）：距最近一次推送超过它 = 系统不再上报（典型 =
      * 被测任务静止无帧），本拍按「无帧周期」出 fps=0.0 样本 —— 语义与 timestats 路径的
@@ -261,6 +271,12 @@ object FrameRecordController {
      * 装机后若静止画面恢复时读数正常、恒帧率段却掉 0，把本值放大或改为「任务不变沿用旧值」。
      */
     private const val TASK_FPS_STALE_MS = 2_500L
+
+    /**
+     * 「注册成功却从未收到推送」的踢注册等待（ms）：正常任务一渲染就有推送，超过它仍
+     * 零推送 = 注册时解析的 taskId 大概率已失效（任务重建 / WMS 跟踪丢失）。
+     */
+    private const val TASK_FPS_NEVER_PUSH_KICK_MS = 10_000L
 
     /**
      * 守卫拒收分支内**立即重读刷新率**的节拍：限 ≥1s 一次。「刷新率其实没变但守卫持续
@@ -539,6 +555,9 @@ object FrameRecordController {
         _previewing.value = false
         previewJob?.cancel()
         previewJob = null
+        // FrameTimeline 会话随预览终止（关悬浮窗不留常驻 trace 会话；后续预览/录制的
+        // 子拍分支会自愈式补拉起，见 FRAME_TIMELINE 分支的 isFrameTimelineSessionUp）
+        if (effectiveAlgo == FpsAlgorithm.FRAME_TIMELINE) FrameRateSource.stopFrameTimelineSession()
     }
 
     fun start(limitMinutes: Int?) {
@@ -693,25 +712,53 @@ object FrameRecordController {
     private fun resolveAndSwitchAlgo() {
         val wantedAlgo = FpsAlgorithm.fromKey(Prefs.getFpsAlgorithm(appContext))
         val resolvedAlgo = when (wantedAlgo) {
-            FpsAlgorithm.SF_LATENCY ->
-                if (FrameRateSource.isLatencyDead()) FpsAlgorithm.TIMESTATS else wantedAlgo
+            FpsAlgorithm.SF_LATENCY -> {
+                if (FrameRateSource.isLatencyDead()) {
+                    // 判死不是终态：节流自愈重探（相机唤醒 / 转场结束即恢复 SF_LATENCY，
+                    // 见 FrameRateSource.maybeReviveLatency）；本拍仍死才继续按 timestats 出数
+                    FrameRateSource.maybeReviveLatency(sessionPkg)
+                    if (FrameRateSource.isLatencyDead()) FpsAlgorithm.TIMESTATS else wantedAlgo
+                } else {
+                    wantedAlgo
+                }
+            }
             FpsAlgorithm.TASK_FPS ->
                 if (FrameRateSource.isTaskFpsSupported()) wantedAlgo else FpsAlgorithm.TIMESTATS
+            FpsAlgorithm.FRAME_TIMELINE -> {
+                if (FrameRateSource.isFrameTimelineDead()) {
+                    // 判死不是终态：节流重拉会话自愈（perfetto 被系统杀 / ROM 裁剪后恢复）；
+                    // 本拍仍死才继续按 timestats 出数
+                    FrameRateSource.maybeReviveFrameTimeline()
+                    if (FrameRateSource.isFrameTimelineDead()) FpsAlgorithm.TIMESTATS else wantedAlgo
+                } else if (FrameRateSource.isFrameTimelineSupported()) {
+                    wantedAlgo
+                } else {
+                    FpsAlgorithm.TIMESTATS
+                }
+            }
             FpsAlgorithm.TIMESTATS -> wantedAlgo
         }
         if (resolvedAlgo == effectiveAlgo) return
+        val previousAlgo = effectiveAlgo
         effectiveAlgo = resolvedAlgo
         diffPerLayer = emptyMap()
         diffMissed = 0L
         prevP2p = null
         diffAt = 0L
         FrameRateSource.resetLatency()
+        FrameRateSource.resetFrameTimelineTarget()
         taskFpsLastPushAt = 0L
         taskFpsLastFps = 0f
         taskFpsBeatVals.clear()
+        taskFpsKickDone = false
         if (resolvedAlgo != FpsAlgorithm.TASK_FPS && taskFpsRegisteredPkg.isNotEmpty()) {
             FrameRateSource.taskFpsUnregister()
             taskFpsRegisteredPkg = ""
+        }
+        // FrameTimeline 会话随算法切换启停（预览→录制同算法交棒时幂等续用同一会话）
+        if (resolvedAlgo == FpsAlgorithm.FRAME_TIMELINE) FrameRateSource.startFrameTimelineSession()
+        if (previousAlgo == FpsAlgorithm.FRAME_TIMELINE && resolvedAlgo != FpsAlgorithm.FRAME_TIMELINE) {
+            FrameRateSource.stopFrameTimelineSession()
         }
         Log.i(TAG, "帧率采样源生效切换：effective=$resolvedAlgo（选择=$wantedAlgo）")
     }
@@ -735,8 +782,10 @@ object FrameRecordController {
             FrameRateSource.resetTimestats()
         }
         // 采样源自带状态随目标作废：latency 的时间戳基线与选层缓存；
-        // taskfps 的注册在 TASK_FPS 分支按 taskFpsRegisteredPkg != sessionPkg 自动重注册
+        // taskfps 的注册在 TASK_FPS 分支按 taskFpsRegisteredPkg != sessionPkg 自动重注册；
+        // frametimeline 的逐图层 p2p 边界基线（图层认领口径随包名变了，跨图层间隔不能混算）
         FrameRateSource.resetLatency()
+        FrameRateSource.resetFrameTimelineTarget()
     }
 
     private suspend fun loop(limitMinutes: Int?) {
@@ -750,6 +799,10 @@ object FrameRecordController {
         /** GPU 频率 MHz：快变量，与占用率**同一条命令/直读**取回（2026-09-29 加）；
          *  本机 kgsl 被拦恒 null（预期），节点可读机型自动出数 */
         var gpuFreqMhz: Double? = null
+        /** DDR 频率 MHz：快变量，与 GPU 占用率同拍直读（2026-10-02 加，Metric
+         *  ddrThermalSampler 同款候选池，22081212C 实测 shell 身份可读）；
+         *  候选全不可读的机器恒 null（详情页整卡隐藏） */
+        var ddrFreqMhz: Double? = null
         var tick = 0
         var beat = 0
         /** 本拍 CPU 聚合窗口在 [pendingCpu] 里的起点（上一完整拍结束位置） */
@@ -882,12 +935,66 @@ object FrameRecordController {
                     diffAt = System.currentTimeMillis()
                 }
 
+                FpsAlgorithm.FRAME_TIMELINE -> {
+                    // 会话自愈式补拉起（被系统杀 / stopPreview 收尾后下一子拍即恢复）
+                    if (!FrameRateSource.isFrameTimelineSessionUp()) FrameRateSource.startFrameTimelineSession()
+                    val ls = FrameRateSource.readFrameTimelineSample(sessionPkg)
+                    if (!coroutineContext.isActive) break
+                    if (sessionPkg.isEmpty()) {
+                        _fps.value = Double.NaN
+                    } else if (ls == null) {
+                        // 首拍建边界基线 / 会话刚拉起 trace 未落盘：不出数（不算失败，
+                        // 持续读不到走 FrameRateSource 内部的 strike → 判死回落链）
+                    } else if (ls.frames == 0L) {
+                        // 本子拍无认领帧：读数 0.0（「本周期无合成帧」语义，同 timestats）
+                        _fps.value = 0.0
+                        if (_startFps.value.isNaN()) _startFps.value = 0.0
+                        val wallDt = if (diffAt > 0L) (System.currentTimeMillis() - diffAt) / 1000.0 else 0.0
+                        if (wallDt > 0.0) accDtSec += wallDt
+                    } else {
+                        val dtSec = if (ls.fps > 0) ls.frames / ls.fps else 0.0
+                        if (!checkFpsCeiling(ls.fps, dtSec, "frametimeline")) {
+                            // 守卫拒收：读数保持上一窗（边界基线已推进，下一窗自愈）
+                        } else {
+                            if (_error.value == ERROR_NO_TARGET_APP) _error.value = null
+                            _fps.value = ls.fps
+                            if (_startFps.value.isNaN()) _startFps.value = ls.fps
+                            accFrames += ls.frames
+                            accDtSec += dtSec
+                            // 真实逐帧 present 间隔按子拍累加，1s 样本的 p2pHist = 四子拍合计
+                            for ((ms, cnt) in ls.p2pHistogram) accHist[ms] = (accHist[ms] ?: 0L) + cnt
+                        }
+                    }
+                    diffAt = System.currentTimeMillis()
+                }
+
                 FpsAlgorithm.TASK_FPS -> {
                     // 注册管理：目标变化 / 尚未注册（同包名在 UserService 侧短路幂等）
                     if (sessionPkg.isNotEmpty() && taskFpsRegisteredPkg != sessionPkg) {
                         val (ok, _, err) = FrameRateSource.taskFpsRegister(sessionPkg)
-                        if (ok) taskFpsRegisteredPkg = sessionPkg
-                        else Log.i(TAG, "TaskFps 注册未就绪：$err（下一子拍重试）")
+                        if (ok) {
+                            taskFpsRegisteredPkg = sessionPkg
+                            taskFpsRegisteredAt = System.currentTimeMillis()
+                        } else Log.i(TAG, "TaskFps 注册未就绪：$err（下一子拍重试）")
+                    }
+                    // 推送静默踢注册（2026-10-02 加，K50 Ultra 真机整场 0 样本教训）：WMS 的
+                    // 推送跟踪挂在**注册时解析的 taskId** 上，任务重建后 taskId 变化而包名
+                    // 不变 → 上面的同包名短路让推送永久静默、整场样本全 0。踢一次 =
+                    // unregister + 下子拍重新注册（解析最新 taskId）；一次静默期只踢一次，
+                    // 踢完仍无推送（任务真静止）就等下一条推送 / 目标切换复位，不无限踢。
+                    val kickNow = System.currentTimeMillis()
+                    val pushSilent =
+                        (taskFpsLastPushAt > 0 && kickNow - taskFpsLastPushAt > TASK_FPS_STALE_MS) ||
+                            (taskFpsLastPushAt == 0L && taskFpsRegisteredAt > 0 &&
+                                kickNow - taskFpsRegisteredAt > TASK_FPS_NEVER_PUSH_KICK_MS)
+                    if (!taskFpsKickDone && pushSilent) {
+                        taskFpsKickDone = true
+                        FrameRateSource.taskFpsUnregister()
+                        taskFpsRegisteredPkg = ""
+                        Log.i(
+                            TAG,
+                            "TaskFps 推送静默（${if (taskFpsLastPushAt > 0) "超 ${TASK_FPS_STALE_MS}ms" else "注册后从未推送"}），强制重注册以解析最新 taskId",
+                        )
                     }
                     // 系统推送轮询：新推送**即时发布**（tab 跟随系统节奏，不再等完整拍）
                     FrameRateSource.readTaskFpsSample()?.let { (fps, at) ->
@@ -895,6 +1002,7 @@ object FrameRecordController {
                             taskFpsLastPushAt = at
                             taskFpsLastFps = fps
                             taskFpsBeatVals.add(fps)
+                            taskFpsKickDone = false // 有推送 = 链路活了，静默期结束
                             _fps.value = fps.toDouble()
                         }
                     }
@@ -920,6 +1028,8 @@ object FrameRecordController {
                     load?.let { gpuLoadPct = it }
                     freq?.let { gpuFreqMhz = it }
                 }
+                // DDR 频率：快变量，与 GPU 同拍直读（节点全不可读返回 null，沿用旧值口径同上）
+                FrameRateSource.readDdrFreqMhz()?.let { ddrFreqMhz = it }
                 // 慢速项（前台应用 / 刷新率 / 温度）变化慢、每条都要起进程：按 5 拍抽稀之外，
                 // 三项**错峰**到相邻三拍（0=前台应用、1=刷新率、2=温度），任何一拍至多多跑一条。
                 // ⚠️ 曾经三项同拍执行：单拍叠加 dumpsys activity + dumpsys display + 温感区遍历，
@@ -969,6 +1079,14 @@ object FrameRecordController {
                             p2pDelta = accHist.toMap()
                         }
                     }
+                    FpsAlgorithm.FRAME_TIMELINE -> {
+                        // 口径与 SF_LATENCY 完全同构：Σframes ÷ Σdt + 逐帧 p2p 分布合计
+                        // （数据源 = perfetto frametimeline 的逐帧 present 真值）
+                        if (sessionPkg.isNotEmpty() && accDtSec > 0.0) {
+                            fps1s = accFrames / accDtSec
+                            p2pDelta = accHist.toMap()
+                        }
+                    }
                     FpsAlgorithm.TASK_FPS -> {
                         val fresh = taskFpsBeatVals.toList()
                         taskFpsBeatVals.clear()
@@ -1014,7 +1132,16 @@ object FrameRecordController {
                     // 电量四项（电压 / 电流 / 功率 / 电池温度）与帧率**同频**（每秒一次）：
                     // 要能和帧率逐秒对齐，才能回答"掉帧的那一刻是不是正好在发热 / 拉电流"。
                     // 数据源 = 功率侧同一条取数链（RootPowerReader），符号口径"正=充电"
-                    val power = RootPowerReader.read()
+                    // 串联双电池换算与功率侧同口径（SamplingService 采样入口同款）：电压 / 功率
+                    // ×2、电流不翻（串联回路电流处处相等）—— 在取数入口统一处理，落库 /
+                    // 详情页 / xlsx 导出全部自动同口径，两个界面的整组读数才对得上。
+                    val power = RootPowerReader.read()?.let {
+                        if (Prefs.getSeriesDualBattery(appContext)) it.copy(
+                            voltageV = it.voltageV * SamplingService.SERIES_DUAL_FACTOR,
+                            voltageOcvV = it.voltageOcvV * SamplingService.SERIES_DUAL_FACTOR,
+                            powerW = it.powerW * SamplingService.SERIES_DUAL_FACTOR,
+                        ) else it
+                    }
                     // 帧间隔口径：timestats / sf_latency 用本拍直方图差集的加权平均（"当秒"
                     // 帧时间；无基线 / 直方图中途被清 → 0.0 断线，同旧口径）；task_fps 无
                     // 逐帧真值，用 1000/fps 推导值
@@ -1050,6 +1177,7 @@ object FrameRecordController {
                         capacityPct = power?.socPct?.takeIf { it > 0 }?.toDouble(),
                         gpuLoadPct = gpuLoadPct,
                         gpuFreqMhz = gpuFreqMhz,
+                        ddrFreqMhz = ddrFreqMhz,
                         // 本秒帧间隔分布（详情页逐帧 jank 判定的数据源）；null = 缺测 → 空表
                         p2pHist = p2pDelta.orEmpty(),
                     )
@@ -1229,6 +1357,31 @@ object FrameRecordController {
                     diffAt = System.currentTimeMillis()
                 }
 
+                FpsAlgorithm.FRAME_TIMELINE -> {
+                    if (!FrameRateSource.isFrameTimelineSessionUp()) FrameRateSource.startFrameTimelineSession()
+                    val ls = FrameRateSource.readFrameTimelineSample(sessionPkg)
+                    if (!coroutineContext.isActive) break
+                    if (sessionPkg.isEmpty()) {
+                        _fps.value = Double.NaN
+                        _error.value = ERROR_NO_TARGET_APP
+                    } else if (ls == null) {
+                        // 首拍建边界基线 / 会话刚拉起：读数「—」（持续失败走 strike 判死回落链）
+                        _fps.value = Double.NaN
+                    } else if (ls.frames == 0L) {
+                        _fps.value = 0.0
+                    } else {
+                        val dtSec = if (ls.fps > 0) ls.frames / ls.fps else 0.0
+                        if (checkFpsCeiling(ls.fps, dtSec, "frametimeline")) {
+                            if (_error.value == ERROR_NO_TARGET_APP || _error.value == ERROR_NO_ACCESS) {
+                                _error.value = null
+                                _errorDetail.value = null
+                            }
+                            _fps.value = ls.fps
+                        }
+                    }
+                    diffAt = System.currentTimeMillis()
+                }
+
                 FpsAlgorithm.TASK_FPS -> {
                     if (sessionPkg.isEmpty()) {
                         _fps.value = Double.NaN
@@ -1236,13 +1389,28 @@ object FrameRecordController {
                     } else {
                         if (taskFpsRegisteredPkg != sessionPkg) {
                             val (ok, _, err) = FrameRateSource.taskFpsRegister(sessionPkg)
-                            if (ok) taskFpsRegisteredPkg = sessionPkg
-                            else Log.i(TAG, "预览：TaskFps 注册未就绪：$err（下一子拍重试）")
+                            if (ok) {
+                                taskFpsRegisteredPkg = sessionPkg
+                                taskFpsRegisteredAt = System.currentTimeMillis()
+                            } else Log.i(TAG, "预览：TaskFps 注册未就绪：$err（下一子拍重试）")
+                        }
+                        // 推送静默踢注册（口径同录制循环）：taskId 重建让推送永久静默的自愈
+                        val kickNow = System.currentTimeMillis()
+                        val pushSilent =
+                            (taskFpsLastPushAt > 0 && kickNow - taskFpsLastPushAt > TASK_FPS_STALE_MS) ||
+                                (taskFpsLastPushAt == 0L && taskFpsRegisteredAt > 0 &&
+                                    kickNow - taskFpsRegisteredAt > TASK_FPS_NEVER_PUSH_KICK_MS)
+                        if (!taskFpsKickDone && pushSilent) {
+                            taskFpsKickDone = true
+                            FrameRateSource.taskFpsUnregister()
+                            taskFpsRegisteredPkg = ""
+                            Log.i(TAG, "预览：TaskFps 推送静默，强制重注册以解析最新 taskId")
                         }
                         FrameRateSource.readTaskFpsSample()?.let { (fps, at) ->
                             if (at > taskFpsLastPushAt) {
                                 taskFpsLastPushAt = at
                                 taskFpsLastFps = fps
+                                taskFpsKickDone = false // 有推送 = 链路活了，静默期结束
                                 // 新推送即时发布（tab 跟随系统推送节奏）
                                 _fps.value = fps.toDouble()
                                 if (_error.value == ERROR_NO_TARGET_APP) _error.value = null

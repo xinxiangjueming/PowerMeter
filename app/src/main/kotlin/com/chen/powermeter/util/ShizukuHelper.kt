@@ -312,6 +312,9 @@ object ShizukuHelper {
     /** GPU 占用率候选探测（替代 GPU_LOAD_CMD 的 exec） */
     fun readGpuLoadDirect(): String? = callDirect("readGpuLoad") { it.readGpuLoad() }
 
+    /** DDR 频率候选探测（2026-10-02 加，替代 DDR_FREQ_CMD 的 exec） */
+    fun readDdrFreqDirect(): String? = callDirect("readDdrFreq") { it.readDdrFreq() }
+
     /** 温感区配对行（替代 VIRTUAL_TEMP_CMD 的 exec） */
     fun readThermalTempsDirect(): String? = callDirect("readThermalTemps") { it.readThermalTemps() }
 

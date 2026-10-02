@@ -1,6 +1,7 @@
 package com.chen.powermeter.data
 
 import android.os.Build
+import android.util.Base64
 import android.util.Log
 import com.chen.powermeter.util.ShizukuHelper
 import java.util.Locale
@@ -221,9 +222,9 @@ object FrameRateSource {
     // 实测收窄后整包 ~2KB（304 图层 / 3 个目标图层），空包名时只留全局段 ~0.8KB。
     //
     // ⚠️ `keep` 在图层段之间**不会复位**：最后一个匹配图层段之后出现的任何 `totalFrames=`
-    // 行（ROM 在图层列表后附加的私有统计段）也会被本管道带回 —— 解析侧必须靠行距守卫
-    // （[parseTimestats] 的 FIELD_MAX_LINES_FROM_LAYER）把它们挡在认领之外（2026-09-25 加，
-    // 真机 tab 冒 1000+ 假帧率的候选根因）。
+    // 行（ROM 在图层列表后附加的私有统计段）也会被本管道带回 —— 解析侧必须靠「图层块边界」
+    // （[parseTimestats] + [TIMESTATS_KV_RE]）把它们挡在认领之外（2026-09-25 加，
+    // 真机 tab 冒 1000+ 假帧率的候选根因；2026-10-01 由行距守卫改为块边界）。
     //
     // - `index($0, pkg)` 是字面子串匹配不吃正则，包名里的点不用转义；
     //   pkg 为空时 havePkg=0，一个图层都不认领——与 [parseTimestats] 的空包名守卫同口径。
@@ -296,13 +297,22 @@ object FrameRateSource {
      * 就归属它。这样无论输出是「一行一个字段」还是「一行里逗号分隔多个字段」都能命中 ——
      * 前者 Android 14+ 常见，后者老版本与部分 ROM 常见，写死任一种都会在另一台上全 0。
      *
-     * ⚠️ **行距守卫**（2026-09-25 加，真机 tab 冒 1000+ 假帧率的候选根因）：字段行必须紧跟
-     * `layerName` 行 ≤[FIELD_MAX_LINES_FROM_LAYER] 行才认领。收窄用 awk 的 `keep` 在图层段
-     * 之间**不会主动复位** —— 最后一个匹配图层段之后出现的任何 `totalFrames=` 行（ROM 在
-     * 图层列表后附加的私有统计段，HyperOS 疑似存在）都会被 awk 带回，并归到最后一个目标
-     * 图层头上；那是**全屏所有图层规模**的计数，每秒增长 ≈ 图层数 × 刷新率 ≈ 上千，恰是
-     * tab 冒 1000+ 的量级。原生 AOSP 的图层列表之后没有输出，且 totalFrames 距 layerName
-     * 恰 1 行、droppedFrames 恰 2 行，此守卫对原生格式零影响。
+     * ⚠️ **图层块边界**（2026-10-01 改，真机 24031PN0DC / Android 16 / HyperOS OS3.0.306 实测定案）：
+     * 认领只在「当前图层块内」成立，块的**结束判据 = 出现任何非 `key = value` 行**（段落标题
+     * `Jank payload for this layer:` / `… histogram is as below:`，或直方图数据行 `0ms=21 …`）。
+     * 图层身份属性（layerName / packageName / gameMode）与计数（totalFrames / droppedFrames /
+     * lateAcquireFrames）全是 `key = value`，必然排在本块第一个段落标题之前 → 天然被包在块内；
+     * 而图层列表之后 ROM 追加的私有统计段必然落在直方图之后 → 落在块外，照旧挡掉（旧注释记录的
+     * 「tab 冒 1000+ 假帧率」正是被这类段落的 totalFrames 污染，见 [TIMESTATS_KV_RE]）。
+     *
+     * ⚠️⚠️ 旧实现是**硬编码行距上限 2**（FIELD_MAX_LINES_FROM_LAYER），前提是字段序恒为
+     * `layerName → totalFrames → droppedFrames`（各距 1 / 2 行）。本 ROM 实测字段序为
+     * `layerName → packageName → gameMode → totalFrames → droppedFrames`
+     * （totalFrames 距 **3** 行、droppedFrames 距 **4** 行，`-clear` 前后一致）→
+     * **全部图层的计数被守卫拒绝** → matchedFrames 恒 0 → 上层走「目标已锁定但没认领到图层」
+     * 分支 → 帧率恒「—」。且全局 Legacy 段的 `totalFrames` 已让 [sawAny] 为 true，
+     * 「timestats 未解析到任何 totalFrames 字段」这条 warning **不触发，全程零日志零告警**。
+     * 新判据不依赖字段个数与顺序，ROM 换字段序不再碎。
      *
      * ⚠️ **丢帧逐行认领**（2026-09-25 修）：missedFrames / droppedFrames 在**各自所在行**上
      * 认领，不再挂在 totalFrames 同一行 —— Android 14+ 逐图层段是逐字段一行，totalFrames
@@ -314,8 +324,8 @@ object FrameRateSource {
         var matchedMissed = 0L
         var sawAny = false
         val perLayer = HashMap<String, Long>()
-        // 距最近一条 layerName 行的行数；MAX_VALUE = 还没见过任何图层名（全局段不可认领）
-        var linesSinceLayer = Int.MAX_VALUE
+        // 是否处于某个图层块的「可认领区」；false = 尚未见到 layerName，或已越过本块末尾
+        var inLayerBlock = false
 
         for (rawLine in out.lineSequence()) {
             val line = rawLine.trim()
@@ -323,12 +333,13 @@ object FrameRateSource {
             val layer = LAYER_RE.find(line)?.groupValues?.getOrNull(1)
             if (layer != null) {
                 currentLayer = layer
-                linesSinceLayer = 0
-            } else if (linesSinceLayer != Int.MAX_VALUE) {
-                linesSinceLayer++
+                inLayerBlock = true
+            } else if (inLayerBlock && line.isNotEmpty() && !TIMESTATS_KV_RE.containsMatchIn(line)) {
+                // 段落标题 / 直方图数据行 = 本图层块到此为止（见上方「图层块边界」）
+                inLayerBlock = false
             }
-            val claimable = pkg.isNotEmpty() && currentLayer != null &&
-                linesSinceLayer <= FIELD_MAX_LINES_FROM_LAYER && currentLayer.contains(pkg)
+            val claimable = pkg.isNotEmpty() && inLayerBlock &&
+                currentLayer != null && currentLayer.contains(pkg)
 
             val frames = FRAMES_RE.find(line)?.groupValues?.getOrNull(1)?.toLongOrNull()
             if (frames != null) {
@@ -638,11 +649,15 @@ object FrameRateSource {
     private val HISTOGRAM_RE = Regex("""(\d+)ms\s*=\s*(\d+)""")
 
     /**
-     * 字段行允许距 `layerName` 行的最大行距（行距守卫，见 [parseTimestats]）。
-     * 原生格式下 totalFrames 恰为 1 行、droppedFrames 恰为 2 行；图层段之后附加的
-     * 私有统计段至少再远一行，取 2 恰好把它们挡在认领之外。
+     * timestats 的 `key = value` 行（图层身份属性与计数都是这个形态）。
+     * 不命中 = 段落标题（`Jank payload for this layer:` / `… histogram is as below:`）或
+     * 直方图数据行（`0ms=21 1ms=0 …`，以数字开头）→ 视为当前图层块结束（见 [parseTimestats]）。
+     *
+     * ⚠️ 键名限定为**无空格的标识符**，正是这一点让 `Jank payload for this layer:` 不能命中
+     * （"Jank" 之后是空格 + "payload"，凑不出 `[=:]`）—— 它是本 ROM 每个图层块的第一个段落标题，
+     * 也就是把块关掉的那一行。换成「含 `=` 即算字段行」会把直方图数据行也放进来，守卫失效。
      */
-    private const val FIELD_MAX_LINES_FROM_LAYER = 2
+    private val TIMESTATS_KV_RE = Regex("""^[A-Za-z_][A-Za-z0-9_]*\s*[=:]""")
 
     // ── 虚拟温度（CPU 代表温感区，录制期间按 5s 抽稀）──────────
     //
@@ -855,10 +870,55 @@ object FrameRateSource {
             "if(v!=\"\"){" +
             "if(a[i]~/gpubusy/){split(v,b,\" \");" +
             "if(b[2]+0>0)printf \"%.1f\\n\",b[1]*100.0/b[2];else print \"0\"}" +
-            "else print v;exit}}" +
+            "else print v;break}}" +
             "m=split(\"$GPU_FREQ_NODES\",f,\" \");" +
             "for(i=1;i<=m;i++){v=\"\";getline v < f[i];" +
             "if(v!=\"\"){print \"freq \" v;exit}}}' 2>/dev/null"
+
+    // ── DDR 频率（2026-10-02 加，候选池逆向 Metric libmetric_daemon.so 定案）────────
+    //
+    // Metric 的 ddrThermalSampler（Rust 常驻守护进程）按厂商分叉取 DDR 频率（so 内
+    // 字符串定案）：qcom.cur_freq / qcom.clock_measure / mtk.cur_freq / helio dump。
+    // 候选池取**纯文件读**两支，dump 解析与 debugfs 支不进池：
+    // - QCOM：`/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq` —— 高通 taro 起的总线
+    //   DCVS 挂点，单位 kHz（22081212C / SM8475 实测 547000..3196000，与同目录
+    //   available_frequencies 档位表一致；**shell 身份可读，无需 root**）。本机
+    //   /sys/class/devfreq 下没有 DDR devfreq 条目，只有这个挂点。
+    // - MTK：`/sys/class/devfreq/mtk-dvfsrc-devfreq/cur_freq` —— DVFSRC 挂点。
+    // - （不进池）qcom.clock_measure = `/sys/kernel/debug/clk/measure_only_mccc_clk/
+    //   clk_measure`（Hz 实测值）——要 debugfs 已挂载，普通机器拿不到；helio-dvfsrc 的
+    //   dvfsrc_dump 是多行文本 dump，解析成本高收益低。
+    //
+    // ⚠️ 单位不统一（kHz/Hz/MHz 都可能），解析按量级换算：DDR 实际范围 ~300-4500MHz
+    // —— kHz 档 300000..4500000 与 Hz 档 3e8.. 跨 1e8 分界不会误判（见 [readDdrFreqMhz]）。
+    private const val DDR_FREQ_NODES: String =
+        "/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq " +
+            "/sys/class/devfreq/mtk-dvfsrc-devfreq/cur_freq"
+
+    /** DDR 频率命令：**单进程 awk** 按序探测候选节点，读到第一个非空值原样回传（同行文口径见 GPU_LOAD_CMD） */
+    private val DDR_FREQ_CMD: String =
+        "awk 'BEGIN{" +
+            "n=split(\"$DDR_FREQ_NODES\",a,\" \");" +
+            "for(i=1;i<=n;i++){v=\"\";getline v < a[i];" +
+            "if(v!=\"\"){print v;exit}}}' 2>/dev/null"
+
+    /**
+     * DDR 频率 MHz。null = 候选节点全不可读（节点缺失 / SELinux 拦截）——这是无该节点
+     * 机型的**常态结论**，与 GPU 占用率同口径：详情页整卡隐藏，不按失败处理。
+     *
+     * ⚠️ 必须在后台线程调用（直读 = 进程内文件 IO；回退 exec 时内部起进程）。
+     */
+    fun readDdrFreqMhz(): Double? {
+        val out = ShizukuHelper.readDdrFreqDirect()
+            ?: exec(DDR_FREQ_CMD, allowBlank = true)
+            ?: return null
+        val v = Regex("""\d+(\.\d+)?""").find(out.trim())?.value?.toDoubleOrNull() ?: return null
+        return when {
+            v >= 1e8 -> v / 1e6   // Hz（部分内核 dvfsrc 导 Hz 原始值）
+            v >= 1e5 -> v / 1e3   // kHz（QCOM bus_dcvs 口径，本机 547000 = 547MHz）
+            else -> v             // MHz
+        }
+    }
 
     // ── SF --latency 路径（2026-09-29 加，可选帧率算法 ①）─────────────────
     //
@@ -878,8 +938,9 @@ object FrameRateSource {
     // 代价只是回落 timestats，无损。
     //
     // ⚠️ --list 输出形态随版本分叉：经典 AOSP = 每行一个图层名；AOSP 16 / HyperOS =
-    // `RequestedLayerState{<hash> <name> parentId=<n>}` 内部状态行。解析两种都认
-    // （见 [parseLatencyListLine]），并按 Metric 同款排除无帧镜像层。
+    // `RequestedLayerState{…}` 内部状态行，且**同一份输出里带 hex 句柄与不带句柄两种排布并存**
+    // （前者是容器/镜像层、后者才是真实渲染面）。解析两种都认、两种排布都认
+    // （判据见 [parseLatencyListLine]），并按 Metric 同款排除无帧镜像层。
 
     /** 一次 --latency 差分窗口：fps = ΔF ÷ 时间戳 dt（时间戳自带窗口，免墙钟） */
     data class LatencySample(
@@ -895,8 +956,22 @@ object FrameRateSource {
         val overflow: Boolean,
     )
 
+    // ⚠️ 判死不是一次性的终态（2026-10-02 改，K50 Ultra 真机教训）：目标应用瞬时无活图层
+    // （相机休眠销毁 Surface / 页面转场）同样会让全部候选只回周期行，旧实现当场判死且
+    // **进程级永久**回落 timestats——相机唤醒后 SF_LATENCY 整场失效，重启应用才恢复。
+    // 现口径：连续 [LATENCY_DEAD_STRIKES] 次「有候选却全只回周期行」才判死（≈2.5s @4Hz
+    // 子拍，真死 ROM 的代价只是晚这一会儿回落）；判死后由 [maybeReviveLatency] 每
+    // [LATENCY_REVIVE_PROBE_INTERVAL_MS] 低频重探一次，探到活图层即自愈恢复采样。
     @Volatile
     private var latencyDead = false
+
+    /** 连续「有候选却全只回周期行」的选层次数；任何一次探到活图层（含全零骨架）即清零 */
+    @Volatile
+    private var latencyDeadStrikes = 0
+
+    /** 上次自愈探测时刻（判死期间节流：静止期每 5s 才白跑一轮 --list + ≤3 次 --latency） */
+    @Volatile
+    private var latencyReviveProbeAt = 0L
 
     @Volatile
     private var latencyLayer: String? = null
@@ -913,16 +988,52 @@ object FrameRateSource {
 
     private const val LATENCY_IDLE_REPICK_BEATS = 5
 
+    /**
+     * 判死所需连续全败次数：10 次 × 250ms 子拍 ≈ 2.5s。真死 ROM（如 24031PN0DC / A16）
+     * 从选 SF_LATENCY 到回落 timestats 多等这一会儿；瞬时无活图层（转场 / 相机休眠）
+     * 远撑不满这个数，不会误杀。
+     */
+    private const val LATENCY_DEAD_STRIKES = 10
+
+    /** 判死期间自愈探测的间隔：1 次探测 = 1 次 --list（grep 收窄）+ ≤3 次 --latency，成本可忽略 */
+    private const val LATENCY_REVIVE_PROBE_INTERVAL_MS = 5_000L
+
     /** 目标切换 / 算法切换时清空 latency 侧状态（选层与时间戳基线一并作废） */
     fun resetLatency() {
         latencyLayer = null
         latencyLayerPkg = ""
         latencyLastPresentNs = 0L
         latencyIdleBeats = 0
+        // strike 跨目标不累计：真死 ROM 换目标后重新数满再判死（多花 ~2.5s，可接受）
+        latencyDeadStrikes = 0
     }
 
-    /** 本机/本进程已判定 --latency 不可用（设置页据此展示提示） */
+    /** 本机当前是否判定 --latency 不可用（设置页据此压暗选项；**非终态**——判死后自愈重探，见 [maybeReviveLatency]） */
     fun isLatencyDead(): Boolean = latencyDead
+
+    /**
+     * 判死后的**自愈探测**：采集循环在 SF_LATENCY 被判死回落 timestats 期间每子拍调用，
+     * 内部按 [LATENCY_REVIVE_PROBE_INTERVAL_MS] 节流。重新列层探活，探到活图层
+     * （FIFO 有骨架即可，帧数据随后续渲染填充）即清判死、装填选层缓存——下一拍
+     * resolveAndSwitchAlgo 见 isLatencyDead()=false 自然恢复 SF_LATENCY，读数无缝接回。
+     *
+     * ⚠️ 必须在后台线程调用（内部 exec：最多 1 次 --list + 3 次 --latency）。
+     */
+    fun maybeReviveLatency(pkg: String) {
+        if (!latencyDead || pkg.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (now - latencyReviveProbeAt < LATENCY_REVIVE_PROBE_INTERVAL_MS) return
+        latencyReviveProbeAt = now
+        val (best, anyAlive, _) = probeLatencyLayerCandidates(pkg) ?: return
+        if (!anyAlive || best == null) return // 仍全周期行 / 无候选：维持判死，下个周期再探
+        latencyDead = false
+        latencyDeadStrikes = 0
+        latencyLayer = best
+        latencyLayerPkg = pkg
+        latencyLastPresentNs = 0L
+        latencyIdleBeats = 0
+        Log.i(TAG, "--latency 自愈：重新探测到活图层 $best，恢复采样")
+    }
 
     /**
      * 取一次 --latency 差分窗口。null = 无可出数（首拍建基线 / 图层未渲染 / 本机已判定死），
@@ -1043,10 +1154,38 @@ object FrameRateSource {
 
     /**
      * 从 --list 里选出目标应用的图层（Metric 同款：候选逐个探测 FIFO 帧数，最多者胜）。
-     * 全部候选探测都只回周期行 = 本机死（置 [latencyDead]）；无候选 = 应用没在渲染，返回 null
-     * 但**不**判死（等下一拍目标锁定再试）。
+     * 全部候选探测都只回周期行 = 记一次 strike，连续 [LATENCY_DEAD_STRIKES] 次才判死
+     * （瞬时无活图层不误杀，见 [latencyDead] 注释）；无候选 = 应用没在渲染，返回 null
+     * 且**不**计数（等下一拍目标锁定再试）。
      */
     private fun pickLatencyLayer(pkg: String): String? {
+        val (best, anyAlive, names) = probeLatencyLayerCandidates(pkg) ?: return null
+        if (anyAlive) {
+            latencyDeadStrikes = 0
+        } else {
+            latencyDeadStrikes++
+            if (!latencyDead && latencyDeadStrikes >= LATENCY_DEAD_STRIKES) {
+                latencyDead = true
+                Log.w(
+                    TAG,
+                    "--latency 连续 $latencyDeadStrikes 次全候选只回周期行，判定本机不可用，" +
+                        "回落 timestats（每 ${LATENCY_REVIVE_PROBE_INTERVAL_MS / 1000}s 自愈重探）：candidates=$names",
+                )
+            }
+        }
+        return best
+    }
+
+    /**
+     * 列层 + 探活的核心（[pickLatencyLayer] 与自愈探测 [maybeReviveLatency] 共用）。
+     * 返回 (best, anyAlive, names)：
+     * - best = FIFO 帧数最多的候选图层名（全候选只回周期行时为 null）；
+     * - anyAlive = 是否有任一候选返回了 FIFO 结构（**含全零骨架**——图层在、数据等渲染填充，
+     *   这与「只有周期行」的 ROM 砍功能形态是两种命运，不能混为一谈）；
+     * - names = 参与探测的候选图层名（日志/诊断用）。
+     * 无候选（--list 里 grep 不到目标包名）= null：应用当前没有可探测图层。
+     */
+    private fun probeLatencyLayerCandidates(pkg: String): Triple<String?, Boolean, List<String>>? {
         val needle = pkg.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }
         if (needle.isEmpty()) return null
         // --list 输出可能上百 KB：shell 层 grep 收窄再回传（大输出必须在 shell 层收窄的铁律，
@@ -1067,35 +1206,55 @@ object FrameRateSource {
             val safe = name.filter { it != '\'' && it != '\\' }
             val probe = exec("dumpsys SurfaceFlinger --latency '$safe' 2>/dev/null")
             val actuals = parseLatencyTimestamps(probe)
-            if (actuals == null) continue // 周期行：该图层无数据（或本机死，见循环后判定）
+            if (actuals == null) continue // 周期行：该图层无数据（或本机死，见 strike 判定）
             anyAlive = true
             if (actuals.size > bestFrames) {
                 bestFrames = actuals.size
                 best = safe
             }
         }
-        if (!anyAlive && names.isNotEmpty()) {
-            // 每个候选都只回周期行：与「精确名查询仍死」的本机形态一致 → 判死回落
-            latencyDead = true
-            Log.w(TAG, "--latency 全部候选图层均只返回周期行，本机不可用，永久回落 timestats：candidates=$names")
-        }
-        return best
+        return Triple(best, anyAlive, names)
     }
 
     /**
      * --list 单行 → 图层名。两种形态：
-     * - 经典：整行就是名字（含目标包名才到这里）；
-     * - AOSP 16 / HyperOS：`RequestedLayerState{<hash> <name> parentId=<n>}` —— 剥壳、
-     *   丢弃首 token（hash），截掉 ` parentId=` 起的尾部。
+     * - 经典 AOSP：整行就是名字（含目标包名才到这里）；
+     * - AOSP 16 / HyperOS：`RequestedLayerState{…}` 内部状态行 —— 剥壳后按属性截断、按句柄判首。
      * 排除无帧镜像层：InputSink（输入镜面）、ActivityRecord{（任务镜像）、animation-leash。
+     *
+     * ⚠️⚠️ **剥壳后不能固定取 `tokens[1]`**（2026-10-01 真机 24031PN0DC / Android 16 /
+     * HyperOS OS3.0.306 实测定案，SF_LATENCY 永久置死的根因）。本 ROM 的 `RequestedLayerState`
+     * 有**两种排布并存**（231 行实测：28 行 hex 起头且 ≥3 token、203 行非 hex 起头，两者互斥无歧义）：
+     *
+     * | 排布 | 样例 | 语义 | `--latency` |
+     * |---|---|---|---|
+     * | 带 hex 句柄 | `RequestedLayerState{f13e32b pkg/Act#654976 parentId=654967}` | 容器 / 镜像层 | **只回周期行（无帧）** |
+     * | 不带句柄 | `RequestedLayerState{pkg/Act#654969 parentId=654968}` | **真实渲染面** | **129 行（有帧）** |
+     *
+     * 旧写法固定取 `tokens[1]`（前提「首 token 必为 hash」），于是：哈希形态侥幸取对名字但选中的是
+     * **无帧容器**；非哈希形态——也就是**唯一真正渲染的那一层**——取到的是 `parentId=…}` 这种垃圾名；
+     * `ActivityRecord{…}#654685` 行则取到 `"u0"`。候选集全是容器 + 垃圾名 → 每个 `--latency`
+     * 探测都只回周期行 → [pickLatencyLayer] 的 `anyAlive` 恒 false → **`latencyDead` 置位（进程级
+     * 永久）** → 本机明明可用的 SF_LATENCY 被自动回落 timestats。运行期日志实形：
+     * `--latency 全部候选图层均只返回周期行…candidates=[…MainSettings#654771, u0]`。
+     *
+     * 正确判据 = **先按属性 token 截断，再按「首 token 是否为纯 hex 句柄」决定丢不丢**：
+     * 属性（`parentId=` / `z=` / `relativeParentId=`）之后的内容不属于图层名；首 token 是 hex 句柄
+     * 才丢弃，不是句柄时它本身就是名字（无句柄形态）。名字允许含空格（如
+     * `ActivityRecordInputSink pkg/Act#654976`），故按空格重新拼接。
      */
     private fun parseLatencyListLine(line: String, needle: String): String? {
         val trimmed = line.trim()
         if (!trimmed.contains(needle)) return null
         val name = if (trimmed.startsWith("RequestedLayerState{")) {
             val inner = trimmed.removePrefix("RequestedLayerState{").removeSuffix("}")
-            val tokens = inner.trim().split(WHITESPACE_SPLIT_RE)
-            tokens.getOrNull(1) ?: return null
+            val tokens = inner.trim().split(WHITESPACE_SPLIT_RE).filter { it.isNotEmpty() }
+            // 属性 token 及其后内容不属于名字
+            val attrAt = tokens.indexOfFirst { LATENCY_ATTR_RE.matches(it) }
+            val head = if (attrAt >= 0) tokens.subList(0, attrAt) else tokens
+            // 仅当首 token 是 hex 句柄（且后面还有内容）才丢弃；否则它就是名字本身
+            val startAt = if (head.size >= 2 && LATENCY_HANDLE_RE.matches(head[0])) 1 else 0
+            head.drop(startAt).joinToString(" ").ifEmpty { return null }
         } else {
             trimmed
         }
@@ -1103,6 +1262,20 @@ object FrameRateSource {
         if (EXCLUDED_LATENCY_LAYERS.any { name.contains(it) }) return null
         return name
     }
+
+    /**
+     * `--list` 条目里的属性 token（父层 ID / 相对父层 / z 序）—— 其后的内容不属于图层名。
+     * 用 `matches`（整 token 匹配）而非 `contains`：属性值里可能含路径分隔符，整段比对更稳。
+     */
+    private val LATENCY_ATTR_RE = Regex("""(parentId|relativeParentId|z)=.*""")
+
+    /**
+     * `--list` 条目的 hex 句柄（`RequestedLayerState{<handle> <name> …}` 形态的首 token）。
+     * 实测本机句柄为 7 位小写 hex（`147770c` / `301c218` / `2c739a4` …）；名字里不会出现纯 hex
+     * （真机 231 行全量核对：hex 起头 28 行全部是句柄，无一例外，且与长度 ≥3 token 完全对应）。
+     * 下限取 4 位，避免与 3 字符以内的短名（`abc` 类）混淆。
+     */
+    private val LATENCY_HANDLE_RE = Regex("""[0-9a-f]{4,}""")
 
     private val EXCLUDED_LATENCY_LAYERS = arrayOf("InputSink", "ActivityRecord{", "animation-leash")
 
@@ -1135,4 +1308,449 @@ object FrameRateSource {
 
     /** 整数帧率格式化（Locale.US：小数点是点，不受系统语言影响） */
     internal fun formatFps(fps: Double): String = String.format(Locale.US, "%.0f", fps)
+
+    // ── 系统 FrameTimeline 路径（2026-10-03 加，可选帧率算法 ④）─────────
+    //
+    // `/system/bin/perfetto` 抓 `android.surfaceflinger.frametimeline` 数据源（逆向
+    // Metric 录制链定案的机制；它的实时侧反而不提供这条路）。SF 作为 perfetto
+    // producer 注册该数据源，逐帧 actualPresent 绝对真值直接来自系统 —— 不依赖
+    // --latency 的 127 帧 FIFO（A16 上已死），也不受 timestats 跟踪表上限约束。
+    //
+    // 生命周期 = 一条常驻 trace 会话：录制/预览进入本算法时 [startFrameTimelineSession]
+    // 拉起后台 perfetto（write_into_file 每秒把增量刷进 trace 文件），每个子拍
+    // [readFrameTimelineSample] 用 `tail -c +offset` 只取**新增字节**、喂进增量解析器
+    // （perfetto trace 文件 = `0x0A + varint长度 + TracePacket` 的顺序流，定案过程见
+    // 2026-10-03 会话；真机 pm_ptr.ptrace 832 帧 / 120Hz cadence / jank 位掩码全实证）。
+    // 切走算法 / stopPreview 时 [stopFrameTimelineSession]（kill -INT 优雅收尾 + 删文件）。
+    //
+    // ⚠️ trace 文件与 cfg 写在 shell 可写路径（/data/misc/perfetto-traces 由 traced
+    // 落盘、本通道可读；/data/local/tmp 存 pbtxt 配置）。会话属主 = 拉起它的取数通道
+    // （Shizuku → shell / su → root），读取走同一通道所以权限自洽。
+    //
+    // ⚠️ 二进制安全：trace 是二进制 protobuf，**不能走 exec 的 String 回传**（UTF-16/
+    // UTF-8 往返会损坏）—— 管道尾接 `base64` 再回传，Kotlin 侧解码（体积 ×4/3，子拍
+    // 增量 ~几 KB，远够不着 binder 上限）。
+    //
+    // ⚠️ 静止画面 0 帧是常态（同 timestats 0 帧语义），不算失败；判死只看「trace 文件
+    // 消失」（SIZE=-1，perfetto 被系统杀 / 从未启动成功），连续 [FTL_DEAD_STRIKES]
+    // 次才判死回落 TIMESTATS，判死后 [maybeReviveFrameTimeline] 每 5s 重拉会话自愈。
+    private const val FTL_TRACE_FILE = "/data/misc/perfetto-traces/powermeter_ftl.ptrace"
+    private const val FTL_CFG_FILE = "/data/local/tmp/powermeter_ftl.pbtxt"
+    private const val FTL_PID_FILE = "/data/local/tmp/powermeter_ftl.pid"
+
+    /**
+     * perfetto 文本配置（write_into_file 每秒增量落盘；256MB 上限 ≈ 1.5h 高帧率录制） */
+    private val FTL_CONFIG =
+        "buffers { size_kb: 16384 }\n" +
+            "data_sources { config { name: \"android.surfaceflinger.frametimeline\" } }\n" +
+            "write_into_file: true\n" +
+            "file_write_period_ms: 1000\n" +
+            "max_file_size_bytes: 268435456\n" +
+            "flush_period_ms: 1000\n"
+
+    /**
+     * 后台拉起会话：cfg 写入 /data/local/tmp（printf 单引号字面量，cfg 内只有双引号）
+     * → `setsid sh -c 'echo $$ > pidfile; exec perfetto ...'` 脱离会话常驻。
+     *
+     * ⚠️⚠️ pid 必须经 **pidfile（$$ 在 sh -c 内落盘）** 拿，不能用外层 `echo $!`：
+     * 真机实证（2026-10-03）setsid 会 fork，$! 是 setsid 包装进程、真 perfetto 是
+     * 另一个 pid —— 旧实现收尾 kill 杀错进程 → 旧会话泄漏、两个 perfetto 同写一个
+     * trace 文件 → 混流损坏、解析零帧（装机首翻车根因）。
+     *
+     * ⚠️ 拉起前先 `pgrep -f 'powermeter_ft[l]'` 清扫本应用的残留 perfetto（含上一版
+     * 泄漏的）；`[l]` 字符类防 pgrep 匹配到自身所在 shell 的 cmdline（经典自匹配坑）。
+     * 输出末行 `PID=<perfetto pid>`（sleep 0.3 等 pidfile 落盘）。
+     */
+    private val FTL_SPAWN_CMD: String =
+        "kill -9 \$(pgrep -f 'powermeter_ft[l]') 2>/dev/null; " +
+            "rm -f $FTL_TRACE_FILE $FTL_CFG_FILE $FTL_PID_FILE; " +
+            "printf '%s' '$FTL_CONFIG' > $FTL_CFG_FILE && " +
+            "setsid sh -c 'echo \$\$ > $FTL_PID_FILE; exec perfetto -c $FTL_CFG_FILE --txt -o $FTL_TRACE_FILE' >/dev/null 2>&1 & " +
+            "sleep 0.3; echo PID=\$(cat $FTL_PID_FILE 2>/dev/null)"
+
+    /** 收尾：先 INT 优雅 flush，300ms 后兜底 -9，再按 pgrep 清扫漏网，最后删文件 */
+    private val FTL_STOP_CMD: String =
+        "kill -INT \$(cat $FTL_PID_FILE 2>/dev/null) 2>/dev/null; sleep 0.3; " +
+            "kill -9 \$(cat $FTL_PID_FILE 2>/dev/null) 2>/dev/null; " +
+            "kill -9 \$(pgrep -f 'powermeter_ft[l]') 2>/dev/null; " +
+            "rm -f $FTL_TRACE_FILE $FTL_CFG_FILE $FTL_PID_FILE"
+
+    /** 连续多少拍「trace 文件消失」才判死（≈2.5s @4Hz 子拍，口径同 latency 的 strike） */
+    private const val FTL_DEAD_STRIKES = 10
+
+    /** perfetto 进程 pid；0 = 会话未拉起 */
+    @Volatile
+    private var ftlPid = 0L
+
+    /** 已消费的 trace 文件字节数（tail -c +offset+1 的增量游标） */
+    private var ftlReadOffset = 0L
+
+    /** 上一子拍认领图层的最大 present ts（p2p 边界差分的基线；0 = 尚无基线） */
+    private var ftlPrevLastNs = 0L
+
+    /** 每认领图层的最后 present ts（跨子拍边界间隔；图层销毁重建后旧名自然失活） */
+    private val ftlLastPresentNs = HashMap<String, Long>()
+
+    @Volatile
+    private var ftlDead = false
+
+    private var ftlDeadStrikes = 0
+
+    @Volatile
+    private var ftlReviveProbeAt = 0L
+
+    /** 增量解析器（会话生命周期内持续累积未收尾的字节） */
+    private var ftlParser: FtlStreamParser? = null
+
+    /** 诊断日志节流（装机排查用，随后续修复移除） */
+    @Volatile
+    private var ftlDiagAt = 0L
+
+    /** 本机是否可用：root / Shizuku 任一通道即可（perfetto 由通道身份拉起与读取） */
+    fun isFrameTimelineSupported(): Boolean =
+        RootPowerReader.accessMode != RootPowerReader.AccessMode.NONE
+
+    /** 本机是否已判死（设置页据此压暗选项；非终态，[maybeReviveFrameTimeline] 会自愈重探） */
+    fun isFrameTimelineDead(): Boolean = ftlDead
+
+    /**
+     * 拉起后台 perfetto 会话（幂等：已拉起直接返回 true）。@return true = 会话在跑
+     * （或已在跑）；false = 拉起失败（通道不可用 / 命令失败 —— 计一次 strike）。
+     * 必须在后台线程调用（内部 exec）。
+     */
+    fun startFrameTimelineSession(): Boolean {
+        if (ftlPid != 0L) return true
+        if (!isFrameTimelineSupported()) return false
+        val out = exec(FTL_SPAWN_CMD) ?: run { ftlStrike(); return false }
+        // PID=<perfetto 真身>（pidfile 落盘的真实进程，口径见 FTL_SPAWN_CMD 注释）
+        val pid = Regex("PID=(\\d+)").findAll(out).lastOrNull()?.groupValues?.get(1)?.toLongOrNull()
+        if (pid == null) { ftlStrike(); return false }
+        ftlPid = pid
+        ftlReadOffset = 0L
+        ftlPrevLastNs = 0L
+        ftlLastPresentNs.clear()
+        ftlParser = FtlStreamParser()
+        Log.i(TAG, "FrameTimeline 会话已拉起：pid=$pid")
+        return true
+    }
+
+    /** 会话是否在跑（采样循环据此自愈式补拉起） */
+    fun isFrameTimelineSessionUp(): Boolean = ftlPid != 0L
+
+    /**
+     * 收尾会话：kill -INT 让 perfetto 优雅 flush 后自杀，300ms 后兜底 -9，trace 文件与
+     * 配置一并删除（逐帧数据早已随子拍解析进采样循环，不依赖 trace 文件存活）。
+     * 必须在后台线程调用（内部 exec，含 300ms sleep）。
+     */
+    fun stopFrameTimelineSession() {
+        val pid = ftlPid
+        ftlPid = 0L
+        ftlReadOffset = 0L
+        ftlPrevLastNs = 0L
+        ftlLastPresentNs.clear()
+        ftlParser = null
+        if (pid != 0L) {
+            exec(FTL_STOP_CMD, allowBlank = true)
+            Log.i(TAG, "FrameTimeline 会话已收尾：pid=$pid")
+        }
+    }
+
+    /** 目标切换时清 p2p 边界基线（图层认领口径变了，跨图层的间隔不能混算） */
+    fun resetFrameTimelineTarget() {
+        ftlLastPresentNs.clear()
+        ftlPrevLastNs = 0L
+    }
+
+    private fun ftlStrike() {
+        ftlDeadStrikes++
+        if (!ftlDead && ftlDeadStrikes >= FTL_DEAD_STRIKES) {
+            ftlDead = true
+            Log.w(TAG, "FrameTimeline 连续 $ftlDeadStrikes 拍 trace 文件不可读，判定本机不可用，回落 timestats")
+            stopFrameTimelineSession()
+        }
+    }
+
+    /**
+     * 判死后的自愈：每 5s 节流重拉一次会话，拉起成功即解除判死（口径同 latency 的
+     * [maybeReviveLatency]）。采样循环在判死回落期间每子拍调用。
+     */
+    fun maybeReviveFrameTimeline() {
+        if (!ftlDead) return
+        val now = System.currentTimeMillis()
+        if (now - ftlReviveProbeAt < 5_000L) return
+        ftlReviveProbeAt = now
+        stopFrameTimelineSession()
+        if (startFrameTimelineSession()) {
+            ftlDead = false
+            ftlDeadStrikes = 0
+            Log.i(TAG, "FrameTimeline 自愈：会话重新拉起，恢复采样")
+        }
+    }
+
+    /**
+     * 取一次子拍增量。null = 无可出数（会话未拉起 / 首拍建基线 / 文件暂缺），调用方按
+     * 「本拍无可差分」处理，不算通道失败。返回值复用 [LatencySample]（layerName 恒空，
+     * overflow 恒 false —— 语义同源：真实逐帧 present 间隔的聚合窗）。
+     * 必须在后台线程调用（内部 exec：tail + base64）。
+     */
+    fun readFrameTimelineSample(pkg: String): LatencySample? {
+        if (ftlPid == 0L || ftlDead) return null
+        val out = exec("echo SIZE=\$(stat -c %s $FTL_TRACE_FILE 2>/dev/null || echo -1); tail -c +${ftlReadOffset + 1} $FTL_TRACE_FILE 2>/dev/null | base64")
+            ?: run { ftlStrike(); return null }
+        // 首行 SIZE=<当前文件字节数>；-1 = 文件消失（perfetto 被杀 / 从未写盘）→ 判死链
+        var size = -1L
+        var b64 = out
+        val nl = out.indexOf('\n')
+        if (nl >= 0) {
+            size = out.substring(5, nl).trim().trimEnd('\r').toLongOrNull() ?: -1L
+            b64 = out.substring(nl + 1)
+        }
+        if (size < 0) { ftlStrike(); return null }
+        ftlDeadStrikes = 0
+        if (size < ftlReadOffset) {
+            // 文件被重建（旧会话残留被清）：游标与图层基线全部归零，下一子拍从头读
+            ftlReadOffset = 0L
+            ftlPrevLastNs = 0L
+            ftlLastPresentNs.clear()
+            return null
+        }
+        val b64Compact = b64.filter { it != '\n' && it != '\r' && it != ' ' }
+        if (b64Compact.isEmpty()) return null // 本子拍无新增字节（静止期常态）
+        val bytes = try {
+            Base64.decode(b64Compact, Base64.DEFAULT)
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "FrameTimeline tail base64 解码失败（${b64Compact.length} chars）", e)
+            return null
+        }
+        val parser = ftlParser ?: FtlStreamParser().also { ftlParser = it }
+        parser.feed(bytes)
+        ftlReadOffset += bytes.size
+        // 认领口径同 parseTimestats：图层名含目标包名（"TXH - pkg/..."、"SurfaceView - pkg/..."）
+        val all = parser.drain()
+        val claimed = if (pkg.isEmpty()) emptyList() else all.filter { it.layer.contains(pkg) }
+        // 诊断日志（2s 节流）：装机排查 FrameTimeline 认领链
+        if (System.currentTimeMillis() - ftlDiagAt > 2_000L) {
+            ftlDiagAt = System.currentTimeMillis()
+            Log.i(
+                TAG,
+                "FTL诊断: size=$size offset=$ftlReadOffset all=${all.size} claimed=${claimed.size} " +
+                    "pkg='$pkg' firstLayer=${all.firstOrNull()?.layer?.take(48)}",
+            )
+        }
+        if (claimed.isEmpty()) {
+            // 目标本拍无帧（静止 / 不在前台）：0 帧语义，边界基线推进到本拍最大 ts
+            all.maxOfOrNull { it.ts }?.let { ftlPrevLastNs = it }
+            return LatencySample(0.0, 0L, emptyMap(), "", overflow = false)
+        }
+        val maxTs = claimed.maxOf { it.ts }
+        val dtSec = if (ftlPrevLastNs > 0L) (maxTs - ftlPrevLastNs) / 1e9 else 0.0
+        ftlPrevLastNs = maxTs
+        if (dtSec <= 0.0) return null // 首拍只建基线（同 latency 的基线口径）
+        val fps = claimed.size / dtSec
+        // p2p 直方图：**按图层分组**算相邻间隔（多图层交错会污染间隔分布），跨子拍边界
+        // 用 ftlLastPresentNs 接缝（每图层的最后一帧）
+        val hist = HashMap<Int, Long>()
+        val byLayer = claimed.groupBy { it.layer }
+        for ((layer, frames) in byLayer) {
+            var prev = ftlLastPresentNs[layer] ?: 0L
+            for (frame in frames.sortedBy { it.ts }) {
+                if (prev > 0L && frame.ts > prev) {
+                    val bucket = ((frame.ts - prev) / 1_000_000L).coerceAtLeast(0).toInt()
+                    hist[bucket] = (hist[bucket] ?: 0L) + 1
+                }
+                prev = frame.ts
+            }
+            ftlLastPresentNs[layer] = prev
+        }
+        return LatencySample(fps, claimed.size.toLong(), hist, "", overflow = false)
+    }
+
+    /** FrameTimeline 逐帧事件（认领前的原始形态） */
+    private class FtlFrame(val ts: Long, val layer: String, val jank: Int)
+
+    /**
+     * perfetto trace 增量解析器 —— **手写最小 protobuf 流**（依赖极简口径同 xlsx 导出器）。
+     *
+     * 文件帧格式（真机 v46 实证）：`0x0A + varint(len) + TracePacket 载荷` 的顺序流；
+     * 逐帧数据在 `TracePacket.frame_timeline_event`（field 76）里，其中 **field 4 =
+     * SurfaceFrame（完成态，带图层名 + jank）**：f1=token、f2/f3=vsync id、f4=pid、
+     * f5=图层名、f6=jank_type 位掩码（1=无 2=AppDeadlineMissed 4=AppBufferDelay
+     * 8=SfDeadlineMissed 16=PredictionError 32=SfStuffing 64=DisplayHal 128=SfScheduling）、
+     * f7=present_type（1=onTime）。**逐帧 present 真值 = TracePacket 的 timestamp
+     * （field 8，ns，MONOTONIC 域）** —— 只消费完成态 SurfaceFrame 的包。
+     * field 1/2/5 = DisplayFrame 各阶段 / 批量标记，本路径不消费。
+     *
+     * feed() 追加新字节；跨子拍收尾不齐的半个包留在缓冲里等下一拍续上。desync（首字节
+     * 非 0x0A）逐字节滑窗重找帧头 —— 正常由 traced 落盘不会发生，兜底而已。
+     */
+    private class FtlStreamParser {
+        private var buf = ByteArray(0)
+        private var readPos = 0
+        private val frames = ArrayList<FtlFrame>()
+
+        /** 取走已解析完的事件（调用方每拍 drain 一次） */
+        fun drain(): List<FtlFrame> {
+            val out = ArrayList(frames)
+            frames.clear()
+            return out
+        }
+
+        fun feed(bytes: ByteArray) {
+            buf = if (buf.isEmpty() || readPos >= buf.size) {
+                bytes.copyOf()
+            } else {
+                val merged = ByteArray(buf.size - readPos + bytes.size)
+                System.arraycopy(buf, readPos, merged, 0, buf.size - readPos)
+                System.arraycopy(bytes, 0, merged, buf.size - readPos, bytes.size)
+                merged
+            }
+            readPos = 0
+            parseLoop()
+            // 已消费部分定期丢弃，防止长录制下缓冲无限膨胀
+            if (readPos > (1 shl 20)) {
+                buf = buf.copyOfRange(readPos, buf.size)
+                readPos = 0
+            }
+        }
+
+    private fun parseLoop() {
+        while (readPos < buf.size) {
+            if (buf[readPos] != 0x0A.toByte()) { readPos++; continue } // desync 滑窗
+            var q = readPos + 1
+            var len = 0L
+            var shift = 0
+            var headerDone = false
+            while (q < buf.size) {
+                // ⚠️⚠️ varint 终止判断 = 原始字节的**最高位**。两个坑叠在一起：
+                // ① 先掩码再比较（byte < 0x80 恒真）；② ByteArray.toInt() 对 ≥0x80 的
+                // 字节**符号扩展成负数**（0x8B → -117），负数 < 0x80 同样恒真 —— 两种写法
+                // 都会让多字节 varint 只读首字节，≥128B 的包全部解析失败（装机翻车根因）。
+                // 正解：负数说明最高位是 1（继续），只有 0..0x7F 才收尾。
+                val raw = buf[q].toInt()
+                q++
+                len = len or ((raw and 0x7F).toLong() shl shift)
+                if (raw in 0..0x7F) { headerDone = true; break }
+                shift += 7
+                if (shift > 28) break
+            }
+            if (!headerDone) break // 长度头未收齐，等下一拍
+            if (len > (8 shl 20).toLong()) { readPos = q; continue } // 异常长度，滑窗重找
+            val payloadEnd = q + len.toInt()
+            if (payloadEnd > buf.size) break // 载荷未收齐，等下一拍
+            parsePacket(q, payloadEnd)
+            readPos = payloadEnd
+        }
+    }
+
+    /** 解析一个 TracePacket：取 timestamp（field 8）+ frame_timeline_event（field 76） */
+    private fun parsePacket(start: Int, end: Int) {
+        var ts = 0L
+        var ftlStart = -1
+        var ftlEnd = -1
+        var q = start
+        while (q < end) {
+            val (tag, q1) = readVarint(q)
+            val f = ((tag ushr 3) and 0x1FFFFFFFL).toInt()
+            val wt = (tag and 0x7L).toInt()
+            q = q1
+            when (wt) {
+                // ⚠️ timestamp（field 8）是 **varint（wire type 0）**——值必须在 wt=0 分支
+                // 里取（放在 wt=2 分支里是死代码，ts 恒 0 → 所有包被丢弃，装机二次翻车根因）
+                0 -> {
+                    val (v, q2) = readVarint(q)
+                    q = q2
+                    if (f == 8) ts = v
+                }
+                1 -> q += 8
+                5 -> q += 4
+                2 -> {
+                    val (l, q2) = readVarint(q)
+                    q = q2
+                    val len2 = l.toInt()
+                    if (f == 76) { ftlStart = q; ftlEnd = q + len2 }
+                    q += len2
+                }
+                else -> return
+            }
+            if (q > end) return
+        }
+            if (ftlStart < 0 || ts == 0L) return
+            var q2 = ftlStart
+            while (q2 < ftlEnd) {
+                val (tag, q3) = readVarint(q2)
+                val f = ((tag ushr 3) and 0x1FFFFFFFL).toInt()
+                val wt = (tag and 0x7L).toInt()
+                q2 = q3
+                when (wt) {
+                    0 -> q2 = readVarint(q2).second
+                    1 -> q2 += 8
+                    5 -> q2 += 4
+                    2 -> {
+                        val (l, q4) = readVarint(q2)
+                        q2 = q4
+                        val len2 = l.toInt()
+                        if (f == 4) parseSurfaceFrame(q2, q2 + len2, ts)?.let { frames.add(it) }
+                        q2 += len2
+                    }
+                    else -> return
+                }
+                if (q2 > ftlEnd) return
+            }
+        }
+
+        /** SurfaceFrame（field 4）：f4=pid、f5=图层名、f6=jank 位掩码；f1/f2/f3 本路径不用 */
+        private fun parseSurfaceFrame(start: Int, end: Int, ts: Long): FtlFrame? {
+            var layer = ""
+            var hasLayer = false
+            var jank = 0
+            var q = start
+            while (q < end) {
+                val (tag, q1) = readVarint(q)
+                val f = ((tag ushr 3) and 0x1FFFFFFFL).toInt()
+                val wt = (tag and 0x7L).toInt()
+                q = q1
+                when (wt) {
+                    0 -> {
+                        val (v, q2) = readVarint(q)
+                        q = q2
+                        if (f == 6) jank = v.toInt()
+                    }
+                    1 -> q += 8
+                    5 -> q += 4
+                    2 -> {
+                        val (l, q2) = readVarint(q)
+                        q = q2
+                        val len2 = l.toInt()
+                        if (f == 5) {
+                            layer = String(buf, q, len2, Charsets.UTF_8)
+                            hasLayer = true
+                        }
+                        q += len2
+                    }
+                    else -> return null
+                }
+                if (q > end) return null
+            }
+            if (!hasLayer) return null
+            return FtlFrame(ts, layer, jank)
+        }
+
+        /** 读 [buf] 上 [q0] 起的 varint，返回 (值, 下一位置)。⚠️ 终止判断 = 原始字节最高位
+         *  （toInt() 符号扩展：负数 = 继续位，0..0x7F = 收尾；见 parseLoop 同款注释） */
+        private fun readVarint(q0: Int): Pair<Long, Int> {
+            var v = 0L
+            var shift = 0
+            var q = q0
+            while (true) {
+                if (q >= buf.size) throw IllegalStateException("varint oob")
+                val raw = buf[q].toInt()
+                q++
+                v = v or ((raw and 0x7F).toLong() shl shift)
+                if (raw in 0..0x7F) break
+                shift += 7
+                if (shift > 63) throw IllegalStateException("varint too long")
+            }
+            return v to q
+        }
+    }
 }

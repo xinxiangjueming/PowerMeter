@@ -1,17 +1,19 @@
 package com.chen.powermeter.data
 
 /**
- * 实时帧率**采样源**（2026-09-29 加，对标 Metric 的 realtime_fps_algorithm 三选一）。
+ * 实时帧率**采样源**（2026-09-29 加，对标 Metric 的 realtime_fps_algorithm 三选一；
+ * 2026-10-03 加第四条路 FRAME_TIMELINE，反向超越 Metric：它实时侧没有 frametimeline）。
  *
  * 选择存 [com.chen.powermeter.util.Prefs.getFpsAlgorithm]（字符串 key，口径同
  * MonitorMode：序号会随枚举增删漂移，字符串可读且可安全回落）。采样循环每拍重读：
  * 切换即时生效，跨算法的差分基线由 FrameRecordController 在切换拍作废。
  *
- * ⚠️ 三条路的"原始程度"不同，落库字段的可用性随之分叉（详见各实现）：
+ * ⚠️ 四条路的"原始程度"不同，落库字段的可用性随之分叉（详见各实现）：
  * | 算法 | 帧数来源 | 帧间隔 | 丢帧 |
  * | TIMESTATS | 累计计数差分 | presentToPresent 直方图差分（整 ms 桶） | droppedFrames 差分 |
  * | SF_LATENCY | 原始 present 时间戳 | **真实逐帧间隔** | 无（缺测 0） |
  * | TASK_FPS | 系统直推 fps | 1000/fps 推导 | 无（缺测 0） |
+ * | FRAME_TIMELINE | 逐帧 present 真值（perfetto trace） | **真实逐帧间隔** | 无（缺测 0） |
  */
 enum class FpsAlgorithm(val key: String) {
 
@@ -38,6 +40,18 @@ enum class FpsAlgorithm(val key: String) {
      * 不可用 → 自动回落 TIMESTATS。帧间隔为 1000/fps 推导值（系统不逐帧推时间戳）。
      */
     TASK_FPS("task_fps"),
+
+    /**
+     * 系统 FrameTimeline perfetto 流（2026-10-03 加，逆向 Metric 录制链定案）——
+     * `/system/bin/perfetto` 抓 `android.surfaceflinger.frametimeline` 数据源，从
+     * trace 里解析**逐帧 actualPresent 绝对真值**（packet timestamp）+ SF 自带的逐帧
+     * jank 位掩码。AOSP 12+ 全机型可用（SF 作为 producer 注册该数据源，不依赖
+     * --latency 的 127 帧 FIFO，也不受 timestats 跟踪表上限约束）—— 24031PN0DC
+     * （A16，--latency 已死）上它仍能出数，是精度最高的一条路。
+     * ⚠️ 会话生命周期见 [FrameRateSource.startFrameTimelineSession]；静止画面零帧是
+     * 常态（同 timestats 0 帧语义）。节点 / trace 文件读不动自动回落 TIMESTATS。
+     */
+    FRAME_TIMELINE("frame_timeline"),
     ;
 
     companion object {

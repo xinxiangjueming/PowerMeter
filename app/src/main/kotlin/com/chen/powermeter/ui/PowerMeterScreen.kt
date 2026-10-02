@@ -93,6 +93,7 @@ import com.chen.powermeter.data.SampleStore
 import com.chen.powermeter.data.SessionStats
 import com.chen.powermeter.ui.common.AppCard
 import com.chen.powermeter.ui.common.BlurTopBar
+import com.chen.powermeter.ui.common.rememberLaunchGate
 import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
@@ -211,21 +212,26 @@ fun PowerMeterScreen(
     // 截图 + 经 Handoff 交接，目标页把页面根包进 ClipRevealLayout，等横屏落地后从趋势卡
     // 矩形四向撑开；退出收回到趋势卡矩形）。锚点矩形与截图全在 AppTransitions 内流转，此处不传参。
     // 采样数据无需跨页传递：全屏页直接读 SampleStore（实时环形缓冲）/ ImportedSeries 两个单例。
+    // ⚠️ 重复点击闸门（2026-10-02 报障，帧率列表同款根因）：等待展开期间连点 → 详情页
+    // 叠开 N 层。首点放行即上闸，本页重新 ON_RESUME（从全屏页返回）才复位。
+    val launchGate = rememberLaunchGate()
     val openTrendFullscreen: () -> Unit = {
-        val act = context as? Activity
-        if (act != null) {
-            // keepPageSnapshot = false（2026-09-28 三改）：趋势全屏页已改**半透明窗口主题**
-            // （Theme.PowerMeter.Transitions，与帧率详情页同源）→ 主页只 onPause 不停、
-            // 全程可见并实时跟随旋转/insets/主题，旋转等待期与收拢期间裁剪窗口外露出的
-            // 就是**真实主页**（实时、永不过期），不再需要整窗冻结截图；留着它反而有害
-            // —— 不透明整窗图会把底下的实时主页盖住，且 180° 翻转后快照不会重绘
-            // （PageSnapshotView 只在 overrideBitmap/showSolid 时 invalidate），旧方向的
-            // 避让像素会盖在正确的主页上。同时省下 ~18MB 峰值内存。
-            val capture = AppTransitions.capture(
-                act.window.decorView,
-                pageBackgroundArgb,
-            )
-            TrendFullscreenActivity.launch(act, metric, capture)
+        if (launchGate.tryLaunch()) {
+            val act = context as? Activity
+            if (act != null) {
+                // keepPageSnapshot = false（2026-09-28 三改）：趋势全屏页已改**半透明窗口主题**
+                // （Theme.PowerMeter.Transitions，与帧率详情页同源）→ 主页只 onPause 不停、
+                // 全程可见并实时跟随旋转/insets/主题，旋转等待期与收拢期间裁剪窗口外露出的
+                // 就是**真实主页**（实时、永不过期），不再需要整窗冻结截图；留着它反而有害
+                // —— 不透明整窗图会把底下的实时主页盖住，且 180° 翻转后快照不会重绘
+                // （PageSnapshotView 只在 overrideBitmap/showSolid 时 invalidate），旧方向的
+                // 避让像素会盖在正确的主页上。同时省下 ~18MB 峰值内存。
+                val capture = AppTransitions.capture(
+                    act.window.decorView,
+                    pageBackgroundArgb,
+                )
+                TrendFullscreenActivity.launch(act, metric, capture)
+            }
         }
     }
 

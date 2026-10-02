@@ -100,6 +100,7 @@ import com.chen.powermeter.service.FrameOverlayService
 import com.chen.powermeter.service.FrameRecordController
 import com.chen.powermeter.ui.common.AppCard
 import com.chen.powermeter.ui.common.BlurTopBar
+import com.chen.powermeter.ui.common.rememberLaunchGate
 import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.chen.powermeter.util.AppTransitions
 import com.chen.powermeter.util.Prefs
@@ -167,16 +168,22 @@ fun FrameMeterScreen(
     // 锚点截图 + 登记 Handoff。launchWithTransform（同趋势全屏页口径）：2026-09-30 试验
     // 进场也一镜到底（2026-09-27 曾因大场次首帧组合重改"进场侧边滑入、退场才收拢"，
     // 试验观感不佳 revert 对应 commit 即回退）；截图失败 / 非 Activity 容器 → capture = null 普通启动
+    // ⚠️ 重复点击闸门（2026-10-02 报障）：等待展开期间连点卡片 → startActivity 在启动
+    // 窗口期里被逐次触发、详情页叠开 N 层（返回 N 次才回列表）。首点放行即上闸，本页
+    // 重新 ON_RESUME（从详情返回）才复位，见 rememberLaunchGate。
+    val launchGate = rememberLaunchGate()
     val openSession: (Long) -> Unit = { sessionId ->
-        val act = context as? Activity
-        // keepPageSnapshot=false（2026-09-28 二改）：详情页已改**半透明窗口主题** →
-        // 收拢期间裁剪窗口外直接露出**真实列表**（实时、已跟主题重绘），不再需要整窗
-        // 冻结截图；留着它反而有害——不透明整窗图会把底下的真实列表盖住，且进场侧滑时
-        // 整窗带着"列表像素"滑入（观感错）。整窗图不截也省下 ~18MB 峰值内存。
-        val capture = act?.let {
-            AppTransitions.capture(it.window.decorView, pageBackgroundArgb)
+        if (launchGate.tryLaunch()) {
+            val act = context as? Activity
+            // keepPageSnapshot=false（2026-09-28 二改）：详情页已改**半透明窗口主题** →
+            // 收拢期间裁剪窗口外直接露出**真实列表**（实时、已跟主题重绘），不再需要整窗
+            // 冻结截图；留着它反而有害——不透明整窗图会把底下的真实列表盖住，且进场侧滑时
+            // 整窗带着"列表像素"滑入（观感错）。整窗图不截也省下 ~18MB 峰值内存。
+            val capture = act?.let {
+                AppTransitions.capture(it.window.decorView, pageBackgroundArgb)
+            }
+            FrameDetailActivity.launch(act ?: context, sessionId, capture)
         }
-        FrameDetailActivity.launch(act ?: context, sessionId, capture)
     }
 
     // 内容区水平 insets：只避挖孔，不避导航栏（口径同 PowerMeterScreen）
@@ -490,10 +497,14 @@ private fun FpsSourceSelector(modifier: Modifier = Modifier, shape: Shape) {
     // 可用性在组合期快照即可：判死/绑定状态在一次停留内变化时下一拍也会自动回落，不误导
     val latencyDead = remember { FrameRateSource.isLatencyDead() }
     val taskSupported = remember { FrameRateSource.isTaskFpsSupported() }
+    val ftlAvailable = remember {
+        FrameRateSource.isFrameTimelineSupported() && !FrameRateSource.isFrameTimelineDead()
+    }
     val entries = listOf(
         Triple(FpsAlgorithm.TIMESTATS, stringResource(R.string.frame_source_timestats), true),
         Triple(FpsAlgorithm.SF_LATENCY, stringResource(R.string.frame_source_latency), !latencyDead),
         Triple(FpsAlgorithm.TASK_FPS, stringResource(R.string.frame_source_taskfps), taskSupported),
+        Triple(FpsAlgorithm.FRAME_TIMELINE, stringResource(R.string.frame_source_ftl), ftlAvailable),
     )
     val desc = when (selected) {
         FpsAlgorithm.TIMESTATS -> stringResource(R.string.frame_source_desc_timestats)
@@ -503,6 +514,9 @@ private fun FpsSourceSelector(modifier: Modifier = Modifier, shape: Shape) {
         FpsAlgorithm.TASK_FPS ->
             stringResource(R.string.frame_source_desc_taskfps) +
                 if (!taskSupported) " · " + stringResource(R.string.frame_source_fallback) else ""
+        FpsAlgorithm.FRAME_TIMELINE ->
+            stringResource(R.string.frame_source_desc_ftl) +
+                if (!ftlAvailable) " · " + stringResource(R.string.frame_source_fallback) else ""
     }
     AppCard(modifier = modifier.fillMaxWidth(), shape = shape) {
         // animateContentSize：三段说明文案行数不同（sf_latency/task_fps 还可能拼上
@@ -519,17 +533,23 @@ private fun FpsSourceSelector(modifier: Modifier = Modifier, shape: Shape) {
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                entries.forEach { (algo, label, available) ->
-                    FpsSourceChip(
-                        label = label,
-                        selected = selected == algo,
-                        dimmed = !available,
-                        onClick = {
-                            selected = algo
-                            Prefs.setFpsAlgorithm(context, algo.key)
-                        },
-                    )
+            // 2×2 两行布局（2026-10-03 用户定案"一行只显示两选项"）：单 Row 塞四个胶囊
+            // 会把最长的一个（FrameTimeline）挤压成竖排逐字换行
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                entries.chunked(2).forEach { rowEntries ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        rowEntries.forEach { (algo, label, available) ->
+                            FpsSourceChip(
+                                label = label,
+                                selected = selected == algo,
+                                dimmed = !available,
+                                onClick = {
+                                    selected = algo
+                                    Prefs.setFpsAlgorithm(context, algo.key)
+                                },
+                            )
+                        }
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))

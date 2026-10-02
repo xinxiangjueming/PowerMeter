@@ -25,6 +25,13 @@ interface IShellService {
     /** thermal_zone 的 type/temp 配对行 "type temp"，格式 = VIRTUAL_TEMP_CMD 的 awk 输出 */
     String readThermalTemps() = 4;
 
+    /**
+     * DDR 频率候选节点探测（2026-10-02 加，Metric libmetric_daemon.so 同款候选池），
+     * 第一个非空节点值原样回传（kHz/Hz/MHz 由调用方按量级换算），
+     * 格式 = DDR_FREQ_CMD 的 awk 输出；全不可读返回空串。
+     */
+    String readDdrFreq() = 8;
+
     // ── 系统 TaskFpsCallback 桥（2026-09-29 加，v3）──────────────────────
     //
     // AOSP 的隐藏 AIDL `android.window.ITaskFpsCallback`（oneway void onFpsReported(in float fps)，

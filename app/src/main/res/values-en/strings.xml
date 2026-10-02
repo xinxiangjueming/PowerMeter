@@ -123,16 +123,21 @@
     <string name="frame_card_battery" formatted="false">Battery(%)</string>
     <string name="frame_card_cpu_usage" formatted="false">CPU Usage(%)</string>
     <string name="frame_card_cpu_frequency" formatted="false">CPU Frequency(MHz)</string>
+    <string name="frame_card_gpu_frequency" formatted="false">GPU Frequency(MHZ)</string>
+    <string name="frame_card_gpu_freq_name" formatted="false">Frequency</string>
+    <string name="frame_card_gpu_load_name" formatted="false">Load</string>
+    <string name="frame_card_ddr_frequency" formatted="false">DDR Frequency(MHZ)</string>
     <string name="frame_card_frame_time" formatted="false">Frame Time(ms)</string>
     <string name="frame_right_cpu_gpu_load" formatted="false">CPU/GPU Load(%)</string>
-    <string name="frame_right_gpu_freq" formatted="false">GPU(MHz)</string>
     <string name="frame_source_title">FPS source</string>
     <string name="frame_source_timestats">Timestats</string>
     <string name="frame_source_latency">SF Latency</string>
     <string name="frame_source_taskfps">TaskFps</string>
+    <string name="frame_source_ftl">FrameTimeline</string>
     <string name="frame_source_desc_timestats">Cumulative frame-count diff, works on every device</string>
     <string name="frame_source_desc_latency">Per-frame timestamps from SurfaceFlinger (Scene-style parser), no tracker cap</string>
     <string name="frame_source_desc_taskfps">System-pushed FPS with zero sampling cost, requires Shizuku (Android 11+)</string>
+    <string name="frame_source_desc_ftl">Per-frame present truth via perfetto frametimeline, highest fidelity (Android 12+)</string>
     <string name="frame_source_fallback">Unavailable here, falls back to Timestats</string>
     <string name="frame_right_axis_switch">Switch right axis</string>
 
