@@ -8,7 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.PixelCopy
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
@@ -51,7 +51,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
  *    截取当前窗口像素（旧主题界面）；
  * 2. 截图完成后写入 [snapshot]——同批状态变更、同帧重组：下层界面已是新主题，顶层
  *    叠加「旧快照 + 右下角圆孔」覆盖层，首帧观感与切换前完全一致（旧快照全覆盖），无跳变；
- * 3. 圆孔半径 0 → 屏幕对角线（圆心=右下角顶点，最远点=左上角，800ms easeIn 前慢后快）：
+ * 3. 圆孔半径 0 → 屏幕对角线（圆心=右下角顶点，最远点=左上角，400ms 匀速扩散）：
  *    孔外旧快照，孔内直接透出真实新界面——被扫过的区域颜色立即变为目标颜色；
  *    圆孔边缘经 BlurMaskFilter 羽化（FEATHER_PX 带宽），新旧两色柔和渐变不硬切。
  *    孔径扫满全屏即清除快照层，无收尾淡出阶段。
@@ -219,16 +219,18 @@ object ThemeTransition {
     }
 }
 
-// ==================== 过渡参数（SportLink 用户校准 2026-09-26） ====================
+// ==================== 过渡参数（2026-10-17 SportLink 用户定稿：匀速 400ms） ====================
 /** 总时长 ms */
-private const val TRANSITION_DURATION_MS = 800
+private const val TRANSITION_DURATION_MS = 400
 /** 圆孔边缘羽化带宽 px：被扫过的区域立即显示新界面颜色，边缘新旧两色柔和渐变 */
 private const val FEATHER_PX = 48f
 /**
- * 孔径曲线：easeIn 慢启动——前 500ms 缓慢扩散（easeIn 在 t=0.625 时约走到一半），
- * 后 300ms 加速扩完，节奏「前慢后快」，避免开场从右下角瞬间闪出。
+ * 孔径曲线：匀速（LinearEasing），总时长 400ms。
+ * SportLink 2026-10-17 三轮校准史：easeIn(0.42,0,1,1) 前慢后快 → LinearOutSlowIn 开局太快
+ * → 最终定稿匀速 400ms，无起步段、无减速段。本项目沿用该定稿参数
+ * （同名步骤见 ModeTransition：两者是同一屏幕上的同一套圆孔揭露语言，节奏必须一致）。
  */
-private val REVEAL_EASING = CubicBezierEasing(0.42f, 0f, 1f, 1f)
+private val REVEAL_EASING = LinearEasing
 
 /**
  * 主题切换过渡覆盖层：孔外=旧界面快照，孔内=直接透出真实新界面（被扫过的区域

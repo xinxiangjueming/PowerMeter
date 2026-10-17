@@ -605,10 +605,10 @@ object AppTransitions {
 
         /**
          * 主题过期修复（收拢开始时调用，2026-09-28 用户报"返回动画用旧色"）：
-         * 详情页期间系统深浅变化后，截图类素材（冻结快照 / 容器底色 / 遮罩色 / 锚点卡片
-         * 截图）全部还是拍摄时（旧主题）的像素——逐项换成目标主题：
+         * 详情页期间系统深浅变化后，截图类素材（冻结快照 / 容器底色 / 遮罩色 / 锚点本体
+         * 纯色 / 锚点卡片截图）全部还是拍摄时（旧主题）的像素——逐项换成目标主题：
          * ① 冻结快照已重映射 → 直接可用；未就绪 → 纯主题背景色兜底（宁可无内容不闪旧色）；
-         * ② 容器底色与遮罩色（两者同源）→ 新主题卡片表面色（或源页背景色）；
+         * ② 容器底色 / 遮罩色 / 锚点本体纯色（三处同源）→ 新主题卡片表面色（或源页背景色）；
          * ③ 锚点卡片截图 / 文字层（小图）→ 同步分段亮度重映射。
          */
         fun applyStaleThemeFix(darkTarget: Boolean) {
@@ -618,8 +618,18 @@ object AppTransitions {
             clipView?.let { v ->
                 val color = if (containerColorIsCard) themeCardColor(darkTarget)
                 else themeBackgroundColor(darkTarget)
+                // ⚠️ 三处必须**一起换**（等价 SportLink adfe1c9 的 ClipRevealLayout.applyContainerTheme
+                // 单一入口）：2026-10-17 校准时只刷了容器底色 + 遮罩色，漏掉锚点本体纯色 ——
+                // 深浅切换后返回，收拢窗口已是新主题色，里面的卡片本体仍是装配时（旧主题）
+                // 采样到的色块（SportLink 真机症状"白圆框里浮深灰胶囊"）。本页锚点本体自
+                // 2026-09-28 起恒为纯色绘制（installWindowTransform 必然调用 setAnchorSolidColor），
+                // 因此漏刷必现。
+                // 未提取成 applyContainerTheme 单一入口的原因：装配处（installWindowTransform）
+                // 的本体色允许与容器色不同（无文字层锚点 = 容器走页面色、本体走卡片表面色），
+                // 只有本修复场景才要求三处同色。
                 v.setBackgroundColor(color)
                 v.setVeilColor(color)
+                v.setAnchorSolidColor(color)
                 v.remapAnchorTheme(darkTarget)
             }
         }
