@@ -137,18 +137,33 @@ class ShellService : IShellService.Stub() {
             val pb = ProcessBuilder("sh", "-c", command)
             pb.redirectErrorStream(true)
             val process = pb.start()
-            val output = process.inputStream.bufferedReader().readText()
+            // ⚠️ 读流必须让给守护线程，waitFor 先行 —— 旧实现 readText() 在 waitFor 之前
+            // 无限阻塞：命令的 sh 若不退出（2026-10-04 真机：toybox sh 后台化常驻进程后
+            // sigtimedwait(SIGCHLD) 挂住不退场），EOF 永不到来，30s 超时形同虚设（它排在
+            // readText 之后），调用方（采样循环）被冻死在单次 exec 里、tab 恒「—」。
+            // 现在 30s 读不到退出就 destroyForcibly，已读输出按 timeout 返回，循环最多
+            // 卡 30s 必自愈。
+            val output = StringBuilder()
+            val reader = Thread {
+                runCatching {
+                    process.inputStream.bufferedReader().forEachLine { line ->
+                        synchronized(output) { output.append(line).append('\n') }
+                    }
+                }
+            }.apply { isDaemon = true; start() }
             val finished = process.waitFor(30, TimeUnit.SECONDS)
             if (!finished) {
                 process.destroyForcibly()
-                "ERROR:-1:timeout"
+                reader.join(1_000)
+                return "ERROR:-1:timeout"
+            }
+            reader.join(2_000)
+            val exitCode = process.exitValue()
+            val text = synchronized(output) { output.toString() }
+            if (exitCode == 0) {
+                text
             } else {
-                val exitCode = process.exitValue()
-                if (exitCode == 0) {
-                    output
-                } else {
-                    "ERROR:$exitCode:${output.trim()}"
-                }
+                "ERROR:$exitCode:${text.trim()}"
             }
         } catch (e: Exception) {
             "ERROR:-1:${e.message}"

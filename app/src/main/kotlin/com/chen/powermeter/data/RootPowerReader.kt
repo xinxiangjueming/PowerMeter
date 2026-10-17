@@ -63,6 +63,9 @@ object RootPowerReader {
     @Volatile
     private var appContext: Context? = null
 
+    /** 无 Context 工具类取 applicationContext（PowerMeterApp.onCreate 后可用） */
+    fun appContext(): Context? = appContext
+
     /** 在 Application.onCreate 调用一次（幂等） */
     fun init(context: Context) {
         appContext = context.applicationContext

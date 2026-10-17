@@ -65,6 +65,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -95,6 +96,7 @@ import android.graphics.drawable.Drawable
 import com.chen.powermeter.R
 import com.chen.powermeter.data.FpsAlgorithm
 import com.chen.powermeter.data.FrameRateSource
+import com.chen.powermeter.data.RootPowerReader
 import com.chen.powermeter.data.db.FrameSession
 import com.chen.powermeter.service.FrameOverlayService
 import com.chen.powermeter.service.FrameRecordController
@@ -104,6 +106,7 @@ import com.chen.powermeter.ui.common.rememberLaunchGate
 import com.chen.powermeter.ui.theme.LocalCornerRadius
 import com.chen.powermeter.util.AppTransitions
 import com.chen.powermeter.util.Prefs
+import com.chen.powermeter.util.ShizukuHelper
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import dev.chrisbanes.haze.HazeState
@@ -122,6 +125,7 @@ import top.yukonga.miuix.kmp.basic.ButtonDefaults as MiuixButtonDefaults
 import top.yukonga.miuix.kmp.basic.Text as MiuixText
 import top.yukonga.miuix.kmp.basic.TextButton as MiuixTextButton
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
@@ -331,11 +335,35 @@ fun FrameMeterScreen(
 
         // ── 右下角 FAB：帧率悬浮窗的开关（+ 开 / × 关）──
         val overlayRunning by FrameOverlayService.running.collectAsState()
+        val fabScope = rememberCoroutineScope()
+        // 开窗前闸（2026-10-04）：悬浮窗一出现预览采样就跑（startPreview）、录制更是
+        // 全程依赖 shell 通道，Shizuku/root 都不在位时开窗只会得到一块永远 "—" 的 tab，
+        // 要等点录制才吃到「已中止」Toast —— 在 + 按下、即将开窗的这一刻先拦下。
+        // 判据必须两道：checkAccess() 的 true 是粘性的（Shizuku 事后死掉不复查），
+        // 再用 Shizuku 三态 / su 结论复核（口径同 FrameRecordController.diagnoseNoAccess）。
+        // checkAccess 可能 fork su 探测，必须留在 IO 线程。
+        val startOverlayChecked: () -> Unit = {
+            fabScope.launch {
+                val ready = withContext(Dispatchers.IO) { RootPowerReader.checkAccess() } &&
+                    (ShizukuHelper.serviceBound.value || RootPowerReader.rootAvailable.value)
+                if (!ready) {
+                    val reason = withContext(Dispatchers.IO) { FrameRecordController.diagnoseNoAccess() }
+                    Toast.makeText(context, reason, Toast.LENGTH_LONG).show()
+                    // Shizuku 在运行只是本应用未获授权：顺手拉起授权框（口径同悬浮窗分支
+                    // 「Toast + 引导授权」，用户点完授权再按一次 + 即可）
+                    if (ShizukuHelper.available.value && !ShizukuHelper.granted.value) {
+                        ShizukuHelper.requestPermission()
+                    }
+                    return@launch
+                }
+                FrameOverlayService.start(context)
+            }
+        }
         val overlayPermissionLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.StartActivityForResult(),
         ) {
             // 从系统设置页回来：授了权就立刻把悬浮窗拉起来，用户不必再点一次 +
-            if (Settings.canDrawOverlays(context)) FrameOverlayService.start(context)
+            if (Settings.canDrawOverlays(context)) startOverlayChecked()
         }
         FloatingActionButton(
             onClick = {
@@ -345,7 +373,7 @@ fun FrameMeterScreen(
                         if (recording) FrameRecordController.stop()
                         FrameOverlayService.stop(context)
                     }
-                    Settings.canDrawOverlays(context) -> FrameOverlayService.start(context)
+                    Settings.canDrawOverlays(context) -> startOverlayChecked()
                     else -> {
                         // 「显示在其它应用上层」是特殊权限，没有系统弹窗，只能引导去设置页开关
                         Toast.makeText(

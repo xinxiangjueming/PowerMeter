@@ -372,20 +372,25 @@ object FrameRecordController {
      */
     private fun checkFpsCeiling(fps: Double, dtSec: Double, detail: String): Boolean {
         if (dtSec <= 0.0) return true // 无有效窗口（零帧拍沿用墙钟 dt 的场景外），不在本守卫职责内
-        if (sessionRefreshHz <= 0 || fps <= sessionRefreshHz + 1.0 / dtSec) return true
+        if (sessionRefreshHz > 0 && fps <= sessionRefreshHz + 1.0 / dtSec) return true
         val nowMs = System.currentTimeMillis()
+        // ⚠️ refresh 未知也要探测（同样 1s 限频，首拍 lastGuardProbeAt=0 立即命中）：start()
+        // 把 sessionRefreshHz 清零后、首个慢速拍重读前有一段守卫空窗 —— 真机实证（2026-10-04，
+        // FTL 静默回落 timestats 的装机报障）开录头几秒的假尖峰正是从这道空窗直通的。探测后
+        // 仍读不到（ROM 不报刷新率）才放行，探测成功立即按新上限判定。
         if (nowMs - lastGuardProbeAt >= 1_000L) {
             lastGuardProbeAt = nowMs
             FrameRateSource.readRefreshRateHz().takeIf { it > 0 }?.let { sessionRefreshHz = it }
-            if (fps <= sessionRefreshHz + 1.0 / dtSec) {
+            if (sessionRefreshHz > 0 && fps <= sessionRefreshHz + 1.0 / dtSec) {
                 Log.i(
                     TAG,
-                    "LTPO 档位切换探测命中：刷新率重读为 ${sessionRefreshHz}Hz，" +
+                    "刷新率探测命中：sessionRefreshHz=${sessionRefreshHz}Hz，" +
                         "本次差分放行：raw=${"%.1f".format(fps)} fps, dt=${"%.2f".format(dtSec)}s, $detail",
                 )
                 return true
             }
         }
+        if (sessionRefreshHz <= 0) return true // ROM 不报刷新率：无法判定上限，不拦
         Log.w(
             TAG,
             "帧率差分超刷新率上限，本拍拒绝出数：" +
@@ -537,6 +542,28 @@ object FrameRecordController {
      * 值不值得录、以及被测应用是不是真的在前台。预览与录制共用同一套取数，
      * 所以预览时看到的帧率和录出来的第一条是对得上的。
      */
+    /**
+     * 采样循环的**防崩壳**（2026-10-04 加）：循环体里任何一处抛异常（如 FtlStreamParser
+     * 在流损坏时 readVarint 越界 throw、任何 ROM 私改导致的解析畸形）都不允许静默杀死
+     * 协程 —— 循环一死 tab 永远冻结在最后状态、诊断不更新、会话文件却还活着，装机
+     * 排障时表现为「一切正常就是没读数」（本轮真机事故的形态）。异常 = 记日志 + 1s
+     * 后整体重启循环；取消（stopPreview / stop）照常向上传播。
+     */
+    private suspend fun runSamplingLoop(body: suspend () -> Unit) {
+        while (coroutineContext.isActive) {
+            try {
+                body()
+                return // 正常返回（取消 / 退出条件），不再重启
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "采样循环异常退出，1s 后整体重启（自愈）", e)
+                FrameRateSource.ftlLoopCrashDiag(e)
+                delay(1_000L)
+            }
+        }
+    }
+
     fun startPreview() {
         if (_previewing.value || _recording.value) return
         // ⚠️ 这里**不做**权限预探测：判定通道要 fork su、必须上后台线程，而本函数由 UI 调用。
@@ -546,7 +573,7 @@ object FrameRecordController {
         // 新一场预览从"无读数"开始：上一场残留的旧帧率不许冒充当前值
         _fps.value = Double.NaN
         _previewing.value = true
-        previewJob = scope.launch { previewLoop() }
+        previewJob = scope.launch { runSamplingLoop { previewLoop() } }
     }
 
     /** 停止预览采样 */
@@ -588,7 +615,7 @@ object FrameRecordController {
         deadlineMs = limitMinutes?.let { sessionStartWall + it * 60_000L } ?: 0L
         _recording.value = true
         enterRecordingMode()
-        job = scope.launch { loop(limitMinutes) }
+        job = scope.launch { runSamplingLoop { loop(limitMinutes) } }
     }
 
     /**
@@ -648,9 +675,12 @@ object FrameRecordController {
     /**
      * 判定「读不到数据」的**具体原因**，供 UI 直接展示。
      *
+     * 两个调用方：录制启动失败（本类）与帧率页 + 按钮的开窗前闸（FrameMeterScreen，
+     * 2026-10-04 加：通道不在位就拦下，不让用户开出一块永远 "—" 的悬浮窗）。文案只有
+     * 这一份，两处口径天然一致。
+     *
      * 口径与功率侧完全一致：优先用同一个 [RootPowerReader] 的判定与文案（它失败时会把
-     * `lastError` 写成「Shizuku 已授权但服务未就绪（正在自动重试绑定）」「Shizuku 正在运行但
-     * 本应用未获授权」「无 root 权限且未安装/运行 Shizuku」这类可操作的话）。
+     * `lastError` 写成「Shizuku 未就绪 / 未授权 / 无 root」这类可操作的话）。
      *
      * ⚠️ 两道判据都要看：`checkAccess()` 的 true 可能是**粘性**的（它内部 `if (hasAccess) return true`，
      * 一旦成功过就永久为真，Shizuku 事后死掉也不复查），所以再用 `ShizukuHelper` 的三态复核一次，
@@ -658,7 +688,7 @@ object FrameRecordController {
      *
      * ⚠️ 必须在 IO 线程调用（`checkAccess()` 在需要时会 fork 一次 su 做探测）。
      */
-    private fun diagnoseNoAccess(): String {
+    internal fun diagnoseNoAccess(): String {
         val access = RootPowerReader.checkAccess()
         Log.w(
             TAG,
@@ -1365,8 +1395,13 @@ object FrameRecordController {
                         _fps.value = Double.NaN
                         _error.value = ERROR_NO_TARGET_APP
                     } else if (ls == null) {
-                        // 首拍建边界基线 / 会话刚拉起：读数「—」（持续失败走 strike 判死回落链）
-                        _fps.value = Double.NaN
+                        // 首拍建基线 / 会话刚拉起 / **WIF 每秒才增量落盘一次**（file_write_period_ms=
+                        // 1000，子拍 4Hz 大多读到零新增字节 → null）：保持上一读数不动。旧实现在这里
+                        // 置 NaN —— 4Hz 下 3/4 拍都被打成「—」，tab 观感 = 一直没数（2026-10-04 装机
+                        // 报障）。首拍本就是 NaN 照样显示「—」；出过数后落盘间隙不再闪「—」，与
+                        // timestats 守卫拒收的「读数保持上一拍」口径一致。1s 样本合成不受影响：
+                        // null 拍不进 accFrames / accDtSec（录制循环本就如此，跨间隙的窗口由
+                        // present 基线天然 telescoping 补齐）。
                     } else if (ls.frames == 0L) {
                         _fps.value = 0.0
                     } else {

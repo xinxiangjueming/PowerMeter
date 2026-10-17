@@ -1323,9 +1323,13 @@ object FrameRateSource {
     // 2026-10-03 会话；真机 pm_ptr.ptrace 832 帧 / 120Hz cadence / jank 位掩码全实证）。
     // 切走算法 / stopPreview 时 [stopFrameTimelineSession]（kill -INT 优雅收尾 + 删文件）。
     //
-    // ⚠️ trace 文件与 cfg 写在 shell 可写路径（/data/misc/perfetto-traces 由 traced
-    // 落盘、本通道可读；/data/local/tmp 存 pbtxt 配置）。会话属主 = 拉起它的取数通道
-    // （Shizuku → shell / su → root），读取走同一通道所以权限自洽。
+    // ⚠️ trace 文件写在 /data/misc/perfetto-traces（traced/客户端落盘、本通道可读）；cfg 写
+    // /data/misc/perfetto-configs（官方配置目录，见 [FTL_CFG_DIR_OFFICIAL] 的 SELinux 域说明）。
+    // 会话属主 = 拉起它的取数通道（Shizuku → shell / su → root），读取走同一通道所以权限自洽。
+    //
+    // ⚠️ WIF 落盘真机再验证（2026-10-04 HyperOS V816）：文件由**存活的 perfetto 客户端**逐秒
+    // 追加（8s 实测 1158→2778 字节持续增长、owner=shell），所以客户端必须常驻（setsid + 无
+    // duration 阻塞）——客户端一死增量就断；kill -INT 收尾时会触发最终 flush。
     //
     // ⚠️ 二进制安全：trace 是二进制 protobuf，**不能走 exec 的 String 回传**（UTF-16/
     // UTF-8 往返会损坏）—— 管道尾接 `base64` 再回传，Kotlin 侧解码（体积 ×4/3，子拍
@@ -1335,13 +1339,52 @@ object FrameRateSource {
     // 消失」（SIZE=-1，perfetto 被系统杀 / 从未启动成功），连续 [FTL_DEAD_STRIKES]
     // 次才判死回落 TIMESTATS，判死后 [maybeReviveFrameTimeline] 每 5s 重拉会话自愈。
     private const val FTL_TRACE_FILE = "/data/misc/perfetto-traces/powermeter_ftl.ptrace"
-    private const val FTL_CFG_FILE = "/data/local/tmp/powermeter_ftl.pbtxt"
-    private const val FTL_PID_FILE = "/data/local/tmp/powermeter_ftl.pid"
 
     /**
-     * perfetto 文本配置（write_into_file 每秒增量落盘；256MB 上限 ≈ 1.5h 高帧率录制） */
+     * cfg 官方目录 = /data/misc/perfetto-configs（AOSP init.rc 标准：0770 root shell，shell/root
+     * 通道都可写、perfetto 客户端域可读）。⚠️ 不能放 /data/local/tmp —— HyperOS V816（24031PN0DC
+     * / Android 16）实测把 perfetto 客户端转进了独立 SELinux 域，读 shell_data_file 一律
+     * errno 13（"Could not open ... Permission denied"），会话根本起不来；官方目录实测通过
+     * （2026-10-04 同机 perfetto v49 两种模式全验证）。目录不存在/不可写的 ROM 回退 /data/local/tmp。
+     */
+    private const val FTL_CFG_DIR_OFFICIAL = "/data/misc/perfetto-configs"
+    private const val FTL_CFG_FILE_TMP = "/data/local/tmp/powermeter_ftl.pbtxt"
+
+    /** 实际使用的 cfg 路径（[resolveFtlCfgFile] 探测一次后缓存；探测前先给临时路径占位） */
+    @Volatile
+    private var ftlCfgFile: String = FTL_CFG_FILE_TMP
+
+    /**
+     * 清扫本应用残留 perfetto 会话。⚠️⚠️ 不能直接 `kill -9 $(pgrep -f 'powermeter_ft[l]')`：
+     * 本命令自身（sh -c 的 cmdline 含字面路径 powermeter_ftl.ptrace/powermeter_ftl.pbtxt）
+     * 恒被 pgrep -f 命中（`[l]` 字符类只防"匹配模式文本自身"，防不了同串里的字面路径）
+     * → kill -9 把正在执行的 spawn/stop 命令自己杀掉（2026-10-04 真机实证 rc=137、零输出）
+     * → spawn 从未拉起 perfetto、pidfile 永不落盘 → FTL 全程静默判死回落 timestats
+     * （"FrameTimeline 模式 158Hz/异常波动"装机事故的根因之一，所有读数其实来自回落链）。
+     * 修法 = pgrep 命中的 pid 逐个检查 /proc/<pid>/cmdline 首词，只杀真 perfetto
+     * （cmdline 以 "perfetto" 开头），自家 sh / adb / Shizuku 包装进程全部跳过。
+     */
+    private const val FTL_SWEEP: String =
+        "pids=\"\"; for p in \$(pgrep -f 'powermeter_ft[l]' 2>/dev/null); do " +
+            "c=\$(cat /proc/\$p/cmdline 2>/dev/null); case \"\$c\" in perfetto*) pids=\"\$pids \$p\";; esac; done; " +
+            "[ -n \"\$pids\" ] && kill -9 \$pids 2>/dev/null; "
+
+    /**
+     * perfetto 文本配置（write_into_file 每秒增量落盘；256MB 上限 ≈ 1.5h 高帧率录制）。
+     *
+     * ⚠️ duration_ms = 5min 自杀保险丝：HyperOS V816（24031PN0DC）实测 perfetto 客户端在
+     * 独立 SELinux 域里，**shell 通道 signal 不到它**（kill = Permission denied），traced 也
+     * 动不了 —— 无法被杀的会话必须能自己死。traced 对每 uid 限 **5 个并发会话**
+     * （真机实测 "Too many concurrent tracing sessions (5) for uid 2000 limit is 5"），被弃
+     * 客户端（用户停采样 / 换采样源后）占着配额直到退出：duration 越长，反复启停越容易
+     * 耗尽 5 个槽位（真机事故：5 个无 duration 的泄漏客户端把 FTL 钉死在恒「—」）。
+     * 5min = 平衡点：槽位占用 ≤5min、跨期重建每 5min 一次（丢 2-3s 帧，见
+     * [readFrameTimelineSample] 的 DEAD 分支）。屏幕熄灭时无帧可写，**max_file_size 的
+     * 自停永远不会触发** —— 不能指望 256MB cap 兜底，duration 是唯一保险丝。
+     */
     private val FTL_CONFIG =
         "buffers { size_kb: 16384 }\n" +
+            "duration_ms: 300000\n" +
             "data_sources { config { name: \"android.surfaceflinger.frametimeline\" } }\n" +
             "write_into_file: true\n" +
             "file_write_period_ms: 1000\n" +
@@ -1349,31 +1392,59 @@ object FrameRateSource {
             "flush_period_ms: 1000\n"
 
     /**
-     * 后台拉起会话：cfg 写入 /data/local/tmp（printf 单引号字面量，cfg 内只有双引号）
-     * → `setsid sh -c 'echo $$ > pidfile; exec perfetto ...'` 脱离会话常驻。
+     * 后台拉起会话：cfg 写入 [ftlCfgFile]（printf 单引号字面量，cfg 内只有双引号）
+     * → `perfetto --background` **自守护**（内部 fork 双分离，父进程立即退出）。
      *
-     * ⚠️⚠️ pid 必须经 **pidfile（$$ 在 sh -c 内落盘）** 拿，不能用外层 `echo $!`：
-     * 真机实证（2026-10-03）setsid 会 fork，$! 是 setsid 包装进程、真 perfetto 是
-     * 另一个 pid —— 旧实现收尾 kill 杀错进程 → 旧会话泄漏、两个 perfetto 同写一个
-     * trace 文件 → 混流损坏、解析零帧（装机首翻车根因）。
+     * ⚠️⚠️ 必须用 --background，不能 `setsid sh -c 'exec perfetto...' &` 后台化：
+     * 真机实证（2026-10-04，HyperOS V816 / toybox sh 0.8.12）后台化场景下外层 sh 会
+     * sigtimedwait(SIGCHLD) 等常驻客户端退出才肯退场（adb shell 同命令 0.5s 完事、
+     * app 经 Shizuku 起的 sh 挂到 5 分钟 duration 到期）—— ShellService 的 readText
+     * 等 EOF 一等无限期，**采样循环冻死在 spawn exec 里**，tab 恒「—」而会话文件
+     * 却在正常增长（本轮装机事故的最终机制）。--background 下父 perfetto 秒退，
+     * 外层 sh 0.5s 收工（真机实测），循环零阻塞。
      *
-     * ⚠️ 拉起前先 `pgrep -f 'powermeter_ft[l]'` 清扫本应用的残留 perfetto（含上一版
-     * 泄漏的）；`[l]` 字符类防 pgrep 匹配到自身所在 shell 的 cmdline（经典自匹配坑）。
-     * 输出末行 `PID=<perfetto pid>`（sleep 0.3 等 pidfile 落盘）。
+     * ⚠️ 拉起前的清扫必须走 [FTL_SWEEP]（只杀真 perfetto）——直接 pgrep -f 会命中本命令
+     * 自身的 shell（cmdline 含字面路径）→ kill -9 自杀（2026-10-04 定案的装机事故）。
+     *
+     * ⚠️ PID 取 `pgrep -n -f`（最新匹配）：--background 后守护进程是 fork 出的新 pid，
+     * 没有可用的 pidfile；`perfett[o]` 字符类 + 要求 ` -c`（带空格）防止匹配到本命令
+     * 自身 / 读取命令的 cmdline（命令文本里同样含这两段字面量）。
      */
-    private val FTL_SPAWN_CMD: String =
-        "kill -9 \$(pgrep -f 'powermeter_ft[l]') 2>/dev/null; " +
-            "rm -f $FTL_TRACE_FILE $FTL_CFG_FILE $FTL_PID_FILE; " +
-            "printf '%s' '$FTL_CONFIG' > $FTL_CFG_FILE && " +
-            "setsid sh -c 'echo \$\$ > $FTL_PID_FILE; exec perfetto -c $FTL_CFG_FILE --txt -o $FTL_TRACE_FILE' >/dev/null 2>&1 & " +
-            "sleep 0.3; echo PID=\$(cat $FTL_PID_FILE 2>/dev/null)"
+    private fun ftlSpawnCmd(): String =
+        FTL_SWEEP +
+            "rm -f $FTL_TRACE_FILE $FTL_CFG_FILE_TMP $FTL_CFG_DIR_OFFICIAL/powermeter_ftl.pbtxt; " +
+            "printf '%s' '$FTL_CONFIG' > $ftlCfgFile && " +
+            "perfetto --background -c $ftlCfgFile --txt -o $FTL_TRACE_FILE >/dev/null 2>&1 </dev/null & " +
+            "sleep 1.5; echo PID=\$(pgrep -n -f 'perfett[o] -c.*powermeter_ftl.pbtxt' 2>/dev/null)"
 
-    /** 收尾：先 INT 优雅 flush，300ms 后兜底 -9，再按 pgrep 清扫漏网，最后删文件 */
-    private val FTL_STOP_CMD: String =
-        "kill -INT \$(cat $FTL_PID_FILE 2>/dev/null) 2>/dev/null; sleep 0.3; " +
-            "kill -9 \$(cat $FTL_PID_FILE 2>/dev/null) 2>/dev/null; " +
-            "kill -9 \$(pgrep -f 'powermeter_ft[l]') 2>/dev/null; " +
-            "rm -f $FTL_TRACE_FILE $FTL_CFG_FILE $FTL_PID_FILE"
+    /**
+     * 收尾：清扫（只杀真 perfetto；pid 列表空格分隔，多 pid 时 toybox kill 才能
+     * 解析）+ 删文件。cfg 两个候选路径都删（旧版本可能残留）。
+     * ⚠️ HyperOS V816 实测客户端 signal 不可达 —— 本命令在这些 ROM 上
+     * 实际生效的只有删文件：客户端被弃后往已 unlink 的 inode 继续写（cap 256MB），至
+     * duration 到期自行退出（见 [FTL_CONFIG]）。--background 后守护进程自己就是最终
+     * 进程，root 通道下 [FTL_SWEEP] 可直接杀掉它（-9 无最终 flush，增量读取下只丢
+     * 最后 <1s 帧，可接受）。
+     */
+    private fun ftlStopCmd(): String =
+        FTL_SWEEP +
+            "rm -f $FTL_TRACE_FILE $FTL_CFG_FILE_TMP $FTL_CFG_DIR_OFFICIAL/powermeter_ftl.pbtxt"
+
+    /**
+     * 解析 cfg 实际路径：官方目录可写（shell/root 通道实测可写，AOSP 标准目录）→ 用它；
+     * 否则回退 /data/local/tmp。进程内只探一次（结论随通道身份稳定，只宽不窄）。
+     */
+    private fun resolveFtlCfgFile() {
+        if (ftlCfgFile != FTL_CFG_FILE_TMP) return
+        val out = exec(
+            "if [ -d $FTL_CFG_DIR_OFFICIAL ] && [ -w $FTL_CFG_DIR_OFFICIAL ]; then echo OK; fi",
+            allowBlank = true,
+        )
+        if (out?.contains("OK") == true) {
+            ftlCfgFile = "$FTL_CFG_DIR_OFFICIAL/powermeter_ftl.pbtxt"
+            Log.i(TAG, "FrameTimeline cfg 使用官方目录：$ftlCfgFile")
+        }
+    }
 
     /** 连续多少拍「trace 文件消失」才判死（≈2.5s @4Hz 子拍，口径同 latency 的 strike） */
     private const val FTL_DEAD_STRIKES = 10
@@ -1406,6 +1477,44 @@ object FrameRateSource {
     @Volatile
     private var ftlDiagAt = 0L
 
+    private fun ftlDiagMark(summary: String) {
+        if (System.currentTimeMillis() - ftlDiagAt <= 2_000L) return
+        ftlDiagAt = System.currentTimeMillis()
+        ftlDiagWrite(summary)
+    }
+
+    /**
+     * 采样循环崩溃诊断（[com.chen.powermeter.service.FrameRecordController.runSamplingLoop]
+     * 的自愈壳调用）：立即落盘一行（不节流、不走搭车通道 —— 循环已经死了，没有下一拍）。
+     * 必须在后台线程调用（内部 exec）。
+     */
+    fun ftlLoopCrashDiag(e: Exception) {
+        ftlDiagWrite("loop crash " + e.javaClass.simpleName + ": " + (e.message ?: "").take(160))
+    }
+
+    /**
+     * 全部 FTL 诊断的**唯一落盘通道**：app 自己的 files 目录（File API 直写，
+     * **不依赖 exec 通道** —— 通道本身正是被排查对象，用它写诊断是循环依赖，真机教训：
+     * exec 诊断在通道异常时一条都不落，看起来像"循环没跑"）。run-as 读取：
+     * `adb shell run-as com.chen.powermeter cat files/ftl_diag.txt`
+     */
+    private val ftlDiagFile: java.io.File by lazy {
+        // context.filesDir（规范路径，兼容多用户/分身）优先；拿不到 context 退回字面路径
+        val base = runCatching { RootPowerReader.appContext()?.filesDir }.getOrNull()
+        java.io.File(base, "ftl_diag.txt")
+    }
+
+    private fun ftlDiagWrite(msg: String) {
+        try {
+            ftlDiagFile.appendText(msg.replace("$", "").replace("'", "").replace("\"", "").take(300) + "\n")
+            // 排障期全透明：路径 + 写后大小直接进 logcat（前台可见；后台被 HyperOS 抑制）
+            Log.i(TAG, "FTL diag ok file=${ftlDiagFile.absolutePath} size=${runCatching { ftlDiagFile.length() }.getOrDefault(-1)}")
+        } catch (e: Exception) {
+            // 诊断写入失败必须留痕（前台 logcat 可见；后台被 HyperOS 抑制就只剩 logcat 这条路）
+            Log.e(TAG, "FTL diag FAIL file=${ftlDiagFile.absolutePath}", e)
+        }
+    }
+
     /** 本机是否可用：root / Shizuku 任一通道即可（perfetto 由通道身份拉起与读取） */
     fun isFrameTimelineSupported(): Boolean =
         RootPowerReader.accessMode != RootPowerReader.AccessMode.NONE
@@ -1421,8 +1530,16 @@ object FrameRateSource {
     fun startFrameTimelineSession(): Boolean {
         if (ftlPid != 0L) return true
         if (!isFrameTimelineSupported()) return false
-        val out = exec(FTL_SPAWN_CMD) ?: run { ftlStrike(); return false }
-        // PID=<perfetto 真身>（pidfile 落盘的真实进程，口径见 FTL_SPAWN_CMD 注释）
+        resolveFtlCfgFile()
+        runCatching { ftlDiagFile.delete() } // 新会话清空诊断文件（app files 目录，与通道无关）
+        val out = exec(ftlSpawnCmd()) ?: run { ftlStrike(); return false }
+    if (out.contains("Too many concurrent tracing sessions")) {
+        // traced 每 uid 限 5 个并发会话：历史泄漏客户端（不可杀）占满配额，客户端秒死。
+        // 恢复 = 泄漏者 duration/cap 到期自退，或重启；走 strike → 判死 → 5s 节流重试
+        Log.w(TAG, "FrameTimeline 拉起失败：traced 并发会话配额耗尽（历史泄漏未退干净）")
+    }
+    // PID=<守护进程 pid>（--background fork 出的新进程，pgrep -n 最新匹配，见 ftlSpawnCmd）
+        // PID=<perfetto 守护进程>（--background fork 的新进程，pgrep -n 最新匹配，见 ftlSpawnCmd 注释）
         val pid = Regex("PID=(\\d+)").findAll(out).lastOrNull()?.groupValues?.get(1)?.toLongOrNull()
         if (pid == null) { ftlStrike(); return false }
         ftlPid = pid
@@ -1430,6 +1547,9 @@ object FrameRateSource {
         ftlPrevLastNs = 0L
         ftlLastPresentNs.clear()
         ftlParser = FtlStreamParser()
+        // spawn 成功即清 strike：新文件首次落盘（≤1s flush 周期 ≈ 4 个 SIZE=-1 子拍）不该
+        // 背上历史 strike —— 否则重建场景下 warmup 窗口 + 旧 strike 会凑满 10 次误判死
+        ftlDeadStrikes = 0
         Log.i(TAG, "FrameTimeline 会话已拉起：pid=$pid")
         return true
     }
@@ -1440,6 +1560,8 @@ object FrameRateSource {
     /**
      * 收尾会话：kill -INT 让 perfetto 优雅 flush 后自杀，300ms 后兜底 -9，trace 文件与
      * 配置一并删除（逐帧数据早已随子拍解析进采样循环，不依赖 trace 文件存活）。
+     * ⚠️ 不可杀 ROM（HyperOS V816 实测 signal Permission denied）上 kill 全部无效，
+     * 实际生效的只有删文件；被弃客户端至 duration（1h）或 256MB cap 自行退出。
      * 必须在后台线程调用（内部 exec，含 300ms sleep）。
      */
     fun stopFrameTimelineSession() {
@@ -1450,7 +1572,7 @@ object FrameRateSource {
         ftlLastPresentNs.clear()
         ftlParser = null
         if (pid != 0L) {
-            exec(FTL_STOP_CMD, allowBlank = true)
+            exec(ftlStopCmd(), allowBlank = true)
             Log.i(TAG, "FrameTimeline 会话已收尾：pid=$pid")
         }
     }
@@ -1494,46 +1616,118 @@ object FrameRateSource {
      * 必须在后台线程调用（内部 exec：tail + base64）。
      */
     fun readFrameTimelineSample(pkg: String): LatencySample? {
-        if (ftlPid == 0L || ftlDead) return null
-        val out = exec("echo SIZE=\$(stat -c %s $FTL_TRACE_FILE 2>/dev/null || echo -1); tail -c +${ftlReadOffset + 1} $FTL_TRACE_FILE 2>/dev/null | base64")
-            ?: run { ftlStrike(); return null }
-        // 首行 SIZE=<当前文件字节数>；-1 = 文件消失（perfetto 被杀 / 从未写盘）→ 判死链
-        var size = -1L
-        var b64 = out
-        val nl = out.indexOf('\n')
-        if (nl >= 0) {
-            size = out.substring(5, nl).trim().trimEnd('\r').toLongOrNull() ?: -1L
-            b64 = out.substring(nl + 1)
+        if (ftlPid == 0L || ftlDead) {
+            ftlDiagMark("state pid=$ftlPid dead=$ftlDead strikes=$ftlDeadStrikes pkg=$pkg -> 无会话")
+            return null
         }
-        if (size < 0) { ftlStrike(); return null }
+        // ⚠️ 第二行 = 客户端探活（ALIVE/DEAD）：perfetto 客户端在这台 ROM 的独立 SELinux 域里
+        // signal 不到（kill = Permission denied），--background 后也没有可依赖的 pidfile ——
+        // 探活 = 按「perfetto -c + 本应用 cfg 路径」pgrep。`perfett[o]` 字符类 + 要求 ` -c`
+        //（带空格）防自匹配：本读取命令的 cmdline 里既含 trace 路径（perfetto-traces/...）
+        // 又含 pgrep 模式文本本身。duration 到期自杀 / 被系统清理后据此免杀重建
+        //（见 FTL_CONFIG 与下面的 DEAD 分支）
+        val out = exec(
+            "echo SIZE=\$(stat -c %s $FTL_TRACE_FILE 2>/dev/null || echo -1); " +
+                "[ -n \"\$(pgrep -f 'perfett[o] -c.*powermeter_ftl.pbtxt' 2>/dev/null)\" ] && echo ALIVE || echo DEAD; " +
+                "tail -c +${ftlReadOffset + 1} $FTL_TRACE_FILE 2>/dev/null | base64",
+        )
+            ?: run { ftlStrike(); return null }
+        // 首行 SIZE=<当前文件字节数>；-1 = 文件消失（perfetto 被杀 / 从未写盘）→ 判死链；
+        // 第二行 ALIVE/DEAD = 客户端探活；其余 = base64 的 trace 增量
+        var size = -1L
+        var clientAlive = true
+        var b64 = out
+        run {
+            val lines = out.split("\n")
+            val first = lines.getOrNull(0)?.trim()?.trimEnd('\r') ?: return@run
+            if (!first.startsWith("SIZE=")) return@run
+            size = first.substring(5).toLongOrNull() ?: -1L
+            val second = lines.getOrNull(1)?.trim()?.trimEnd('\r')
+            if (second == "ALIVE" || second == "DEAD") {
+                clientAlive = second == "ALIVE"
+                b64 = lines.drop(2).joinToString("\n")
+            } else {
+                b64 = lines.drop(1).joinToString("\n")
+            }
+        }
+        if (!clientAlive) {
+            // 客户端没了（duration 到期 / 被系统清理）：会话状态归零，**保留 present 基线**
+            //（新文件的帧是后续 presents），下一子拍由采样循环的 isFrameTimelineSessionUp
+            // 分支重新拉起、从零读新文件 —— 免杀架构下的正常生命周期（每 5min 一次）。
+            // ⚠️ 仍计一次 strike：客户端秒死（如 traced 配额耗尽 "Too many concurrent
+            // tracing sessions"）时若不计，下一子拍立刻重生 → 4 次/秒的 spawn 风暴；
+            // 计 strike 则 10 拍（2.5s）判死 → 走 maybeRevive 的 5s 节流，spawn 失败被
+            // 压到 12 次/分。正常到期一次 strike 无碍（下拍成功即清零）。
+            ftlDiagMark("state pid=$ftlPid size=$size -> 客户端没了(DEAD)，重建")
+            ftlStrike()
+            ftlPid = 0L
+            ftlReadOffset = 0L
+            return null
+        }
+        if (size < 0) {
+            ftlDiagMark("state pid=$ftlPid -> SIZE=-1 trace 文件消失 strike=$ftlDeadStrikes")
+            ftlStrike()
+            return null
+        }
         ftlDeadStrikes = 0
         if (size < ftlReadOffset) {
             // 文件被重建（旧会话残留被清）：游标与图层基线全部归零，下一子拍从头读
+            ftlDiagMark("state size=$size offset=$ftlReadOffset -> 文件重建，游标归零")
             ftlReadOffset = 0L
             ftlPrevLastNs = 0L
             ftlLastPresentNs.clear()
             return null
         }
         val b64Compact = b64.filter { it != '\n' && it != '\r' && it != ' ' }
-        if (b64Compact.isEmpty()) return null // 本子拍无新增字节（静止期常态）
+        if (b64Compact.isEmpty()) {
+            ftlDiagMark("state size=$size offset=$ftlReadOffset -> 本拍零新增字节")
+            return null // 本子拍无新增字节（静止期常态）
+        }
         val bytes = try {
             Base64.decode(b64Compact, Base64.DEFAULT)
         } catch (e: IllegalArgumentException) {
             Log.w(TAG, "FrameTimeline tail base64 解码失败（${b64Compact.length} chars）", e)
+            ftlDiagMark("state b64=${b64Compact.length} -> base64 解码失败")
             return null
         }
         val parser = ftlParser ?: FtlStreamParser().also { ftlParser = it }
-        parser.feed(bytes)
+        try {
+            parser.feed(bytes)
+        } catch (e: Exception) {
+            // 流损坏（desync 滑窗踩中畸形数据 → readVarint 越界 throw 等）：丢掉本批字节、
+            // 重置解析器，下一拍从新数据续读自愈。⚠️ feed 绝不允许把异常抛进采样循环 ——
+            // 循环被静默杀死的表现就是「一切正常唯独没读数」（2026-10-04 真机事故形态）。
+            Log.w(TAG, "FrameTimeline 解析异常，丢弃本批并重置解析器自愈", e)
+            ftlReadOffset += bytes.size
+            ftlParser = FtlStreamParser()
+            ftlDiagMark("feed exception " + e.javaClass.simpleName + " b64=" + b64Compact.length + " -> 丢弃本批重置解析器")
+            return null
+        }
         ftlReadOffset += bytes.size
         // 认领口径同 parseTimestats：图层名含目标包名（"TXH - pkg/..."、"SurfaceView - pkg/..."）
         val all = parser.drain()
         val claimed = if (pkg.isEmpty()) emptyList() else all.filter { it.layer.contains(pkg) }
-        // 诊断日志（2s 节流）：装机排查 FrameTimeline 认领链
+        // 逐图层帧数：认领是 contains(pkg) 子串匹配，游戏/视频类典型有「窗口层 +
+        // SurfaceView(BLAST) 层」两个表面都含包名 —— 加总差分会给出超过刷新率的假帧率
+        // （timestats 侧 120Hz 屏实测 160+ 的同款教训，本路径曾复刻它：真机 158Hz 报障）。
+        // 单表面物理上 ≤ 刷新率；多表面取 max 恰好选中「正在渲染的主导表面」。
+        val countByLayer = HashMap<String, Int>()
+        for (f in claimed) countByLayer[f.layer] = (countByLayer[f.layer] ?: 0) + 1
+        var bestLayer = ""
+        var bestCount = 0
+        for ((l, c) in countByLayer) if (c > bestCount) { bestLayer = l; bestCount = c }
+        // 诊断（2s 节流）：logcat + files 目录直写双通道（HyperOS 后台日志抑制，见 ftlDiagFile）
+        ftlDiagMark(
+            "read size=$size offset=$ftlReadOffset all=${all.size} claimed=${claimed.size} " +
+                "layers=${countByLayer.size} best=$bestCount/${bestLayer.take(40)} pkg=$pkg " +
+                "first=${all.firstOrNull()?.layer?.take(40)}",
+        )
         if (System.currentTimeMillis() - ftlDiagAt > 2_000L) {
             ftlDiagAt = System.currentTimeMillis()
             Log.i(
                 TAG,
                 "FTL诊断: size=$size offset=$ftlReadOffset all=${all.size} claimed=${claimed.size} " +
+                    "layers=${countByLayer.size} best=$bestCount/${bestLayer.take(40)} " +
                     "pkg='$pkg' firstLayer=${all.firstOrNull()?.layer?.take(48)}",
             )
         }
@@ -1545,8 +1739,13 @@ object FrameRateSource {
         val maxTs = claimed.maxOf { it.ts }
         val dtSec = if (ftlPrevLastNs > 0L) (maxTs - ftlPrevLastNs) / 1e9 else 0.0
         ftlPrevLastNs = maxTs
-        if (dtSec <= 0.0) return null // 首拍只建基线（同 latency 的基线口径）
-        val fps = claimed.size / dtSec
+        if (dtSec <= 0.0) {
+            ftlDiagMark("read maxTs=$maxTs prev=$ftlPrevLastNs -> dt<=0 建基线")
+            return null // 首拍只建基线（同 latency 的基线口径）
+        }
+        // fps = 主导图层的帧数 ÷ 窗口；frames 必须同口径带 bestCount —— 上游用
+        // frames/fps 反推窗口长合成 1s 样本（Σframes ÷ Σdt），两者不同口径会错位
+        val fps = bestCount / dtSec
         // p2p 直方图：**按图层分组**算相邻间隔（多图层交错会污染间隔分布），跨子拍边界
         // 用 ftlLastPresentNs 接缝（每图层的最后一帧）
         val hist = HashMap<Int, Long>()
@@ -1562,7 +1761,7 @@ object FrameRateSource {
             }
             ftlLastPresentNs[layer] = prev
         }
-        return LatencySample(fps, claimed.size.toLong(), hist, "", overflow = false)
+        return LatencySample(fps, bestCount.toLong(), hist, "", overflow = false)
     }
 
     /** FrameTimeline 逐帧事件（认领前的原始形态） */
