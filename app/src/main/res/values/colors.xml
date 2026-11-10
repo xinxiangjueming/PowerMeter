@@ -6,11 +6,12 @@
         （见 ui/theme/Theme.kt 的 withSportLinkSurfaces）。
 
         取值必须与 Theme.kt 的 background **逐字一致**（2026-09-27 中性色钉成 SportLink
-        固定值后不再随壁纸/压暗推算）：
-        - 日间 = #E0E0E0，夜间 = #2A2A2A（见 values-night）。
-        此前 #D4CED6/#0F0D13 是旧动态底色（withDeeperBackground 时代）的推算值，已过期：
+        固定值后不再随壁纸/压暗推算；2026-11-11 随 SportLink 最新版更新）：
+        - 日间 = #F7F7F7，夜间 = #000000（见 values-night）。
+        此前 #D4CED6/#0F0D13 是旧动态底色（withDeeperBackground 时代）的推算值，
+        #E0E0E0/#2A2A2A 是 2026-09-27 钉的旧 SportLink 值，均已过期：
         跨 Activity 一镜到底转场中裁剪窗口外露出的正是 windowBackground，色值不一致
-        会在展开/收拢全程看到一圈紫灰底（2026-09-27 用户截图实锤）。
+        会在展开/收拢全程看到一圈异色底（2026-09-27 用户截图实锤）。
     -->
-    <color name="background">#E0E0E0</color>
+    <color name="background">#F7F7F7</color>
 </resources>

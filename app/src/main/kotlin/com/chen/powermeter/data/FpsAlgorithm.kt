@@ -38,14 +38,16 @@ enum class FpsAlgorithm(val key: String) {
      * **主动推送** FPS，零采样开销。只走 Shizuku（UserService = shell 身份持有
      * ACCESS_FPS_COUNTER，AOSP Shell manifest 自带）；root/su 通道与旧版 UserService
      * 不可用 → 自动回落 TIMESTATS。帧间隔为 1000/fps 推导值（系统不逐帧推时间戳）。
+     * ⚠️ 需 **Android 13+**（接口本体 T 引入；S 的等价物 SurfaceControlFpsListener 是另一套
+     * AIDL，未实现）——A12 及以下按不可用自动回落 TIMESTATS（isTaskFpsSupported 门控 SDK≥33）。
      */
     TASK_FPS("task_fps"),
 
     /**
      * 系统 FrameTimeline perfetto 流（2026-10-03 加，逆向 Metric 录制链定案）——
      * `/system/bin/perfetto` 抓 `android.surfaceflinger.frametimeline` 数据源，从
-     * trace 里解析**逐帧 actualPresent 绝对真值**（packet timestamp）+ SF 自带的逐帧
-     * jank 位掩码。AOSP 12+ 全机型可用（SF 作为 producer 注册该数据源，不依赖
+     * trace 里解析**逐帧 present 节奏真值**（packet timestamp = actualStart 打点，稳态与
+     * present 同周期）+ SF 自带的逐帧 jank 位掩码（f9，2026-11-11 修正字段号）。AOSP 12+ 全机型可用（SF 作为 producer 注册该数据源，不依赖
      * --latency 的 127 帧 FIFO，也不受 timestats 跟踪表上限约束）—— 24031PN0DC
      * （A16，--latency 已死）上它仍能出数，是精度最高的一条路。
      * ⚠️ 会话生命周期见 [FrameRateSource.startFrameTimelineSession]；静止画面零帧是

@@ -561,10 +561,12 @@ private fun FpsSourceSelector(modifier: Modifier = Modifier, shape: Shape) {
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Spacer(Modifier.height(10.dp))
-            // 2×2 两行布局（2026-10-03 用户定案"一行只显示两选项"）：单 Row 塞四个胶囊
-            // 会把最长的一个（FrameTimeline）挤压成竖排逐字换行
+            // 竖屏 2×2 两行（2026-10-03 用户定案"一行只显示两选项"）：单 Row 塞四个胶囊
+            // 会把最长的一个（FrameTimeline）挤压成竖排逐字换行；横屏宽度充裕，四枚
+            // 一行放得下（2026-11-11 用户定案"横屏时候一行就行"）
+            val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                entries.chunked(2).forEach { rowEntries ->
+                (if (landscape) listOf(entries) else entries.chunked(2)).forEach { rowEntries ->
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         rowEntries.forEach { (algo, label, available) ->
                             FpsSourceChip(

@@ -135,7 +135,9 @@ object FrameRateSource {
      * ⚠️⚠️ 必要性（2026-09-25 真机 24031PN0DC / Android 16 / HyperOS V816 实测定案，
      * Shizuku 帧率采不到的第三起事故；前两起见 [timestatsDumpCmd] 与 [readTopPackage] 的注释）：
      *
-     * 逐图层统计有**跟踪上限**（AOSP 默认 64）：图层数超限后，新渲染的图层请求跟踪被
+     * 逐图层统计有**跟踪上限**（AOSP MAX_NUM_LAYER_STATS = **200**，TimeStats.h；旧注释写
+     * 64 是误记——64 是每图层在途帧队列 MAX_NUM_TIME_RECORDS，2026-11-11 对质 AOSP 原文
+     * 修正）：图层数超限后，新渲染的图层请求跟踪被
      * **静默拒绝**，其帧数永远不计入；而图层随开机时长只增不减（本机开机数日实测
      * **304 个**），于是 dump 里能认领到的全是**早已停止渲染的老图层**——累计值冻结在
      * 历史值（如 213），录制期间一帧不涨 → 差分恒 0 → fps 恒 0.0、丢帧恒 0。
@@ -1146,7 +1148,13 @@ object FrameRateSource {
             val tokens = line.split(WHITESPACE_SPLIT_RE)
             if (tokens.size < 2) continue // "0 0 0" 终止行或残行
             val actual = tokens[1].toLongOrNull() ?: continue
-            if (actual > 0) actuals.add(actual)
+            // ⚠️ 哨兵双滤（2026-11-11 修）：AOSP FrameTracker 的空槽 / present fence 未决帧
+            // 把 actualPresentTime 写成 INT64_MAX（官方有效判据 isFrameValidLocked =
+            // actual > 0 && actual < INT64_MAX，FrameTracker.cpp）。旧写法只滤 > 0，哨兵被
+            // 收进列表后 sort 排到末尾 → latencyLastPresentNs 基线被钉死在哨兵值 → 之后每拍
+            // newFrames 恒空 → 读数恒 0.0，要等 5 拍空闲重选层（~1.4s）才自愈；120fps 下
+            // 未决帧概率 ~6%/拍 ≈ 每 4s 一次 0.0 读数窗。
+            if (actual > 0 && actual < Long.MAX_VALUE) actuals.add(actual)
         }
         actuals.sort()
         return actuals
@@ -1285,13 +1293,21 @@ object FrameRateSource {
     //
     // AOSP 隐藏 AIDL：IWindowManager.registerTaskFpsCallback(taskId, ITaskFpsCallback) ——
     // 系统对指定任务的帧呈现**主动推送** FPS（oneway onFpsReported(float)），零采样开销。
-    // 调用门槛 = ACCESS_FPS_COUNTER，AOSP Shell 包 manifest 自带（本机 granted=true 实测），
-    // 故只在 Shizuku（UserService = uid 2000）通道可用；注册/注销实现在 ShellService，
-    // 本类只做薄包装。口径细节见 IShellService.aidl 同段注释。
+    // ⚠️ 接口本体 T(13) 引入（S 的等价 API 是 SurfaceControlFpsListener，未实现，
+    // 见 [isTaskFpsSupported]）。调用门槛 = ACCESS_FPS_COUNTER，AOSP Shell 包 manifest
+    // 自带（本机 granted=true 实测），故只在 Shizuku（UserService = uid 2000）通道可用；
+    // 注册/注销实现在 ShellService，本类只做薄包装。口径细节见 IShellService.aidl 同段注释。
 
-    /** TaskFps 算法是否可用：需要 Shizuku UserService（v3+）且系统 ≥S（API 31 引入该 AIDL） */
+    /**
+     * TaskFps 算法是否可用：需要 Shizuku UserService（v3+）且系统 ≥T（SDK 33）。
+     * ⚠️ android.window.TaskFpsCallback / IWindowManager.registerTaskFpsCallback 是
+     * **Android 13 引入**（S 的等价物是 SurfaceControlFpsListener，另一套 AIDL 方法，
+     * 未实现）——旧门控 SDK≥31 会让 A12 设备选中本算法后注册反射恒抛 NoSuchMethod、
+     * 推送永不来、踢注册也救不回，卡在无读数且不回落（2026-11-11 对质 AOSP 原文定案）。
+     * A12 档由此返回 false → resolveAndSwitchAlgo 自动回落 TIMESTATS（回落不改写用户设置）。
+     */
     fun isTaskFpsSupported(): Boolean =
-        Build.VERSION.SDK_INT >= 31 && ShizukuHelper.serviceBound.value
+        Build.VERSION.SDK_INT >= 33 && ShizukuHelper.serviceBound.value
 
     /** 为前台任务注册系统 FPS 推送；见 [ShizukuHelper.registerTaskFps] 的返回语义 */
     fun taskFpsRegister(pkg: String): Triple<Boolean, Int, String?> =
@@ -1313,7 +1329,8 @@ object FrameRateSource {
     //
     // `/system/bin/perfetto` 抓 `android.surfaceflinger.frametimeline` 数据源（逆向
     // Metric 录制链定案的机制；它的实时侧反而不提供这条路）。SF 作为 perfetto
-    // producer 注册该数据源，逐帧 actualPresent 绝对真值直接来自系统 —— 不依赖
+    // producer 注册该数据源，逐帧 present 节奏真值直接来自系统（packet ts = actualStart
+    // 打点，稳态与 present 同周期）—— 不依赖
     // --latency 的 127 帧 FIFO（A16 上已死），也不受 timestats 跟踪表上限约束。
     //
     // 生命周期 = 一条常驻 trace 会话：录制/预览进入本算法时 [startFrameTimelineSession]
@@ -1456,10 +1473,15 @@ object FrameRateSource {
     /** 已消费的 trace 文件字节数（tail -c +offset+1 的增量游标） */
     private var ftlReadOffset = 0L
 
-    /** 上一子拍认领图层的最大 present ts（p2p 边界差分的基线；0 = 尚无基线） */
-    private var ftlPrevLastNs = 0L
+    /**
+     * 上一批**已消费字节**的墙钟时刻（ms）：批内不足 2 帧时 fps 的墙钟分母基线（0 = 尚无基线）。
+     * 只在真正消费了字节的读数点推进；零新增字节的拍不动（静止期不产包，分母如实变大）。
+     * （2026-11-11 取代 ftlPrevLastNs：fps 分母改批内 present 跨度后，跨批 present 基线
+     * 不再参与计算，见 [readFrameTimelineSample] 头注）
+     */
+    private var ftlLastConsumedAt = 0L
 
-    /** 每认领图层的最后 present ts（跨子拍边界间隔；图层销毁重建后旧名自然失活） */
+    /** 每认领图层的最后 present ts（p2p 直方图跨批接缝；图层销毁重建后旧名自然失活） */
     private val ftlLastPresentNs = HashMap<String, Long>()
 
     @Volatile
@@ -1544,7 +1566,7 @@ object FrameRateSource {
         if (pid == null) { ftlStrike(); return false }
         ftlPid = pid
         ftlReadOffset = 0L
-        ftlPrevLastNs = 0L
+        ftlLastConsumedAt = 0L
         ftlLastPresentNs.clear()
         ftlParser = FtlStreamParser()
         // spawn 成功即清 strike：新文件首次落盘（≤1s flush 周期 ≈ 4 个 SIZE=-1 子拍）不该
@@ -1568,7 +1590,7 @@ object FrameRateSource {
         val pid = ftlPid
         ftlPid = 0L
         ftlReadOffset = 0L
-        ftlPrevLastNs = 0L
+        ftlLastConsumedAt = 0L
         ftlLastPresentNs.clear()
         ftlParser = null
         if (pid != 0L) {
@@ -1577,10 +1599,10 @@ object FrameRateSource {
         }
     }
 
-    /** 目标切换时清 p2p 边界基线（图层认领口径变了，跨图层的间隔不能混算） */
+    /** 目标切换时清 p2p 接缝与墙钟分母基线（图层认领口径变了，跨图层的间隔不能混算） */
     fun resetFrameTimelineTarget() {
         ftlLastPresentNs.clear()
-        ftlPrevLastNs = 0L
+        ftlLastConsumedAt = 0L
     }
 
     private fun ftlStrike() {
@@ -1610,10 +1632,21 @@ object FrameRateSource {
     }
 
     /**
-     * 取一次子拍增量。null = 无可出数（会话未拉起 / 首拍建基线 / 文件暂缺），调用方按
+     * 取一次子拍增量。null = 无可出数（会话未拉起 / 零新增字节 / 批内 fps 无分母），调用方按
      * 「本拍无可差分」处理，不算通道失败。返回值复用 [LatencySample]（layerName 恒空，
-     * overflow 恒 false —— 语义同源：真实逐帧 present 间隔的聚合窗）。
+     * overflow 恒 false —— 语义同源：逐帧 present 时间戳的聚合窗）。
      * 必须在后台线程调用（内部 exec：tail + base64）。
+     *
+     * ── fps 口径（2026-11-11 重构）──────────────────────────────
+     * **fps = 主导图层本批帧数 ÷ 本批内它自己的 present 跨度**（maxTs−minTs，逐帧真值）；
+     * 批内不足 2 帧退墙钟（距上一批已消费字节的实际间隔）。旧口径 = 帧数 ÷ (本批 maxTs −
+     * 上批 maxTs)：分母是**跨批 present 跨度**，目标静止几秒后恢复的第一批把整个静止期吞进
+     * 分母 —— 真机 trace 仿真：22s 空闲后首拍读 2.2（真值 117.7）、单帧批读 0.4，
+     * MIN/1%Low 被 0.4~2.2 的假低值污染。批内跨度口径下静止期没有帧包、跨批间隙天然不进
+     * 任何一批，批内间隙 ≤ flush 周期（1s，write_into_file file_write_period_ms）——
+     * 与 timestats 的墙钟差分、GT/Scene 的「1 秒窗口内的帧数」同构（窗口内间隙按惯例摊入）。
+     * 旧「空拍把基线推进到其它图层 maxTs」的行为随跨批基线一并删除（恢复瞬间 dt 被其它
+     * 图层缩短 → 虚高，部分漏过守卫进样本）。
      */
     fun readFrameTimelineSample(pkg: String): LatencySample? {
         if (ftlPid == 0L || ftlDead) {
@@ -1674,7 +1707,7 @@ object FrameRateSource {
             // 文件被重建（旧会话残留被清）：游标与图层基线全部归零，下一子拍从头读
             ftlDiagMark("state size=$size offset=$ftlReadOffset -> 文件重建，游标归零")
             ftlReadOffset = 0L
-            ftlPrevLastNs = 0L
+            ftlLastConsumedAt = 0L
             ftlLastPresentNs.clear()
             return null
         }
@@ -1707,12 +1740,18 @@ object FrameRateSource {
         // 认领口径同 parseTimestats：图层名含目标包名（"TXH - pkg/..."、"SurfaceView - pkg/..."）
         val all = parser.drain()
         val claimed = if (pkg.isEmpty()) emptyList() else all.filter { it.layer.contains(pkg) }
-        // 逐图层帧数：认领是 contains(pkg) 子串匹配，游戏/视频类典型有「窗口层 +
+        // 逐图层帧数 + 起止 ts：认领是 contains(pkg) 子串匹配，游戏/视频类典型有「窗口层 +
         // SurfaceView(BLAST) 层」两个表面都含包名 —— 加总差分会给出超过刷新率的假帧率
         // （timestats 侧 120Hz 屏实测 160+ 的同款教训，本路径曾复刻它：真机 158Hz 报障）。
         // 单表面物理上 ≤ 刷新率；多表面取 max 恰好选中「正在渲染的主导表面」。
         val countByLayer = HashMap<String, Int>()
-        for (f in claimed) countByLayer[f.layer] = (countByLayer[f.layer] ?: 0) + 1
+        val firstTsByLayer = HashMap<String, Long>()
+        val lastTsByLayer = HashMap<String, Long>()
+        for (f in claimed) {
+            countByLayer[f.layer] = (countByLayer[f.layer] ?: 0) + 1
+            firstTsByLayer[f.layer] = minOf(firstTsByLayer[f.layer] ?: Long.MAX_VALUE, f.ts)
+            lastTsByLayer[f.layer] = maxOf(lastTsByLayer[f.layer] ?: 0L, f.ts)
+        }
         var bestLayer = ""
         var bestCount = 0
         for ((l, c) in countByLayer) if (c > bestCount) { bestLayer = l; bestCount = c }
@@ -1732,22 +1771,36 @@ object FrameRateSource {
             )
         }
         if (claimed.isEmpty()) {
-            // 目标本拍无帧（静止 / 不在前台）：0 帧语义，边界基线推进到本拍最大 ts
-            all.maxOfOrNull { it.ts }?.let { ftlPrevLastNs = it }
+            // 目标本批无帧（静止 / 不在前台）：0 帧语义。⚠️ 不推进任何 present 基线
+            // （2026-11-11 D2）：旧写法把基线推到**其它图层**的 maxTs，目标恢复渲染的第一拍
+            // dt 被缩短 → 虚高（部分漏过守卫进样本）。批内跨度口径下没有跨批 present 基线，
+            // 这里只推进墙钟分母基线（单帧批的退路分母）。
+            ftlLastConsumedAt = System.currentTimeMillis()
             return LatencySample(0.0, 0L, emptyMap(), "", overflow = false)
         }
-        val maxTs = claimed.maxOf { it.ts }
-        val dtSec = if (ftlPrevLastNs > 0L) (maxTs - ftlPrevLastNs) / 1e9 else 0.0
-        ftlPrevLastNs = maxTs
-        if (dtSec <= 0.0) {
-            ftlDiagMark("read maxTs=$maxTs prev=$ftlPrevLastNs -> dt<=0 建基线")
-            return null // 首拍只建基线（同 latency 的基线口径）
+        val now = System.currentTimeMillis()
+        // fps 分母（2026-11-11 D1）＝ 主导图层本批自己的 present 跨度（maxTs−minTs）。
+        // 分子用 (帧数−1)：跨度口径下 n 帧只含 n−1 个真实间隔 —— AOSP computeFps 同款
+        // （kOneSecond×(N−1)÷Σpresent-to-present，FrameTimeline.cpp）。n/span 会带 +1/span
+        // 的边界偏置：稳态 1s 批恒读 ~121.2，被共享守卫（refresh+1/dt）整批拒收
+        // （真机 trace 仿真实测）。frames 仍带 bestCount —— 上游用 frames/fps 反推窗口长
+        // 合成 1s 样本（Σframes ÷ Σdt），两者同口径才不会错位。
+        val fps = if (bestCount >= 2) {
+            val spanSec = (lastTsByLayer.getValue(bestLayer) - firstTsByLayer.getValue(bestLayer)) / 1e9
+            if (spanSec > 0.0) (bestCount - 1) / spanSec else 0.0
+        } else {
+            // 批内单帧没有跨度可除：退墙钟（距上一批已消费字节的实际间隔）。零新增字节的拍
+            // 不推进基线 → 静止期后的单帧批分母如实变大 → 读数趋 0（同 timestats 墙钟差分语义）
+            val wallDtSec = if (ftlLastConsumedAt > 0L) (now - ftlLastConsumedAt) / 1e3 else 0.0
+            if (wallDtSec > 0.0) 1.0 / wallDtSec else 0.0
         }
-        // fps = 主导图层的帧数 ÷ 窗口；frames 必须同口径带 bestCount —— 上游用
-        // frames/fps 反推窗口长合成 1s 样本（Σframes ÷ Σdt），两者不同口径会错位
-        val fps = bestCount / dtSec
-        // p2p 直方图：**按图层分组**算相邻间隔（多图层交错会污染间隔分布），跨子拍边界
-        // 用 ftlLastPresentNs 接缝（每图层的最后一帧）
+        ftlLastConsumedAt = now
+        if (fps <= 0.0) {
+            ftlDiagMark("read best=$bestCount -> fps<=0 无分母，建基线")
+            return null // 首读 / 退化批（全同 ts）：本拍只建基线
+        }
+        // p2p 直方图：**按图层分组**算相邻间隔（多图层交错会污染间隔分布），跨批边界
+        // 用 ftlLastPresentNs 接缝（每图层的最后一帧）—— present 跨度只在这里消费
         val hist = HashMap<Int, Long>()
         val byLayer = claimed.groupBy { it.layer }
         for ((layer, frames) in byLayer) {
@@ -1771,13 +1824,22 @@ object FrameRateSource {
      * perfetto trace 增量解析器 —— **手写最小 protobuf 流**（依赖极简口径同 xlsx 导出器）。
      *
      * 文件帧格式（真机 v46 实证）：`0x0A + varint(len) + TracePacket 载荷` 的顺序流；
-     * 逐帧数据在 `TracePacket.frame_timeline_event`（field 76）里，其中 **field 4 =
-     * SurfaceFrame（完成态，带图层名 + jank）**：f1=token、f2/f3=vsync id、f4=pid、
-     * f5=图层名、f6=jank_type 位掩码（1=无 2=AppDeadlineMissed 4=AppBufferDelay
-     * 8=SfDeadlineMissed 16=PredictionError 32=SfStuffing 64=DisplayHal 128=SfScheduling）、
-     * f7=present_type（1=onTime）。**逐帧 present 真值 = TracePacket 的 timestamp
-     * （field 8，ns，MONOTONIC 域）** —— 只消费完成态 SurfaceFrame 的包。
-     * field 1/2/5 = DisplayFrame 各阶段 / 批量标记，本路径不消费。
+     * 逐帧数据在 `TracePacket.frame_timeline_event`（field 76）里，FrameTimelineEvent 的
+     * oneof event：1=ExpectedDisplayFrameStart、2=ActualDisplayFrameStart、
+     * 3=ExpectedSurfaceFrameStart、**4=ActualSurfaceFrameStart**、5=FrameEnd
+     * （AOSP frameworks/native FrameTimeline proto；perfetto 侧镜像
+     * protos/third_party/android/frameworks/native/tracing/frameworks_native_trace_packet.proto）。
+     * 本路径**只消费 field 4**（每帧恰一个包；field 3 的 Expected 包同样带图层名，混入即双计）：
+     * f4=pid、f5=layer_name、f6=present_type（1=ON_TIME 2=LATE 3=EARLY 4=DROPPED）、
+     * **f9=jank_type 位掩码**（1=NONE 2=SF_SCHEDULING 4=PREDICTION_ERROR 8=DISPLAY_HAL
+     * 16=SF_CPU_DEADLINE_MISSED 32=SF_GPU_DEADLINE_MISSED 64=APP_DEADLINE_MISSED
+     * 128=BUFFER_STUFFING 256=UNKNOWN 512=SF_STUFFING 1024=DROPPED…；真机分布实证：
+     * f6∈{1,2}、f9 命中 1/64/128/256 等掩码值 —— 2026-11-11 修正：旧注释/旧实现把 f6 当
+     * jank，实为 present_type，jank_type 在 f9）。**帧时间 = TracePacket 的 timestamp
+     * （field 8，ns，BOOTTIME 域，SF 侧加 monoBootOffset）= 该帧 actualStart 的打点**，
+     * 帧节奏（start→start）稳态下与 present→present 同周期；present 真值在 FrameEnd
+     * （field 5）但它不带图层名，无法认领。
+     * field 1/2 = DisplayFrame 各阶段，本路径不消费。
      *
      * feed() 追加新字节；跨子拍收尾不齐的半个包留在缓冲里等下一拍续上。desync（首字节
      * 非 0x0A）逐字节滑窗重找帧头 —— 正常由 traced 落盘不会发生，兜底而已。
@@ -1897,7 +1959,7 @@ object FrameRateSource {
             }
         }
 
-        /** SurfaceFrame（field 4）：f4=pid、f5=图层名、f6=jank 位掩码；f1/f2/f3 本路径不用 */
+        /** ActualSurfaceFrameStart（field 4）：f5=图层名、f9=jank 位掩码；f6=present_type 本路径不用 */
         private fun parseSurfaceFrame(start: Int, end: Int, ts: Long): FtlFrame? {
             var layer = ""
             var hasLayer = false
@@ -1912,7 +1974,7 @@ object FrameRateSource {
                     0 -> {
                         val (v, q2) = readVarint(q)
                         q = q2
-                        if (f == 6) jank = v.toInt()
+                        if (f == 9) jank = v.toInt()
                     }
                     1 -> q += 8
                     5 -> q += 4

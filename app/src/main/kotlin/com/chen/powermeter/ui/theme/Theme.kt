@@ -133,33 +133,38 @@ fun PowerMeterTheme(
 }
 
 // ==================== 中性色系 = SportLink 固定色 ====================
-// 色值逐项取自 SportLink ui/theme/SportLinkTheme.kt 的 Light/DarkColorScheme（背景
-// #E0E0E0/#2A2A2A、卡片 #FFFFFF/#333333，surfaceContainer* 全档与 on* 文字透明度同源）。
+// 色值逐项取自 SportLink ui/theme/SportLinkTheme.kt 的 Light/DarkColorScheme（2026-11-11
+// 对齐其最新版：背景 #F7F7F7/#000000、卡片 #FFFFFF/#242424、surfaceVariant = background、
+// surfaceContainerLowest/Low/Container = surface、High = 弹窗色 #FFFFFF/#3A3A3A、
+// Highest = #F5F5F5/#424242，on* 文字透明度同源）。
 // 只钉中性槽位；primary/secondary/error 及容器对不动 —— 颜色胶囊莫奈取色等动态特性保留。
 // 消费面（全部自动跟随，无需散改）：卡片 surfaceContainerLow、弹窗 surfaceContainerHigh
 // （= SportLink DialogBg）、顶栏毛玻璃 tint = surface、转场截图底色 = background。
+// ⚠️ colors.xml 的 windowBackground（日/夜两份）必须随本处 background 逐字同步 ——
+// 转场裁剪窗口外、窗口首帧露的都是它（批次三十教训）；AppTransitions 的
+// themeBackgroundColor/themeCardColor 与 mapTone 分段断点同为镜像，改这里三处连带。
 private fun ColorScheme.withSportLinkSurfaces(darkTheme: Boolean): ColorScheme =
     if (darkTheme) {
         copy(
-            background = Color(0xFF2A2A2A),
+            background = Color(0xFF000000),
             onBackground = Color.White,
-            surface = Color(0xFF333333),
+            surface = Color(0xFF242424),
             onSurface = Color.White,
-            surfaceVariant = Color(0xFF2A2A2A),
+            surfaceVariant = Color(0xFF000000),
             onSurfaceVariant = Color(0xB3FFFFFF),
-            surfaceContainerLowest = Color(0xFF333333),
-            surfaceContainerLow = Color(0xFF333333),
-            surfaceContainer = Color(0xFF333333),
+            surfaceContainerLowest = Color(0xFF242424),
+            surfaceContainerLow = Color(0xFF242424),
+            surfaceContainer = Color(0xFF242424),
             surfaceContainerHigh = Color(0xFF3A3A3A),
             surfaceContainerHighest = Color(0xFF424242),
         )
     } else {
         copy(
-            background = Color(0xFFE0E0E0),
+            background = Color(0xFFF7F7F7),
             onBackground = Color(0xDE000000),
             surface = Color(0xFFFFFFFF),
             onSurface = Color(0xDE000000),
-            surfaceVariant = Color(0xFFE0E0E0),
+            surfaceVariant = Color(0xFFF7F7F7),
             onSurfaceVariant = Color(0x8A000000),
             surfaceContainerLowest = Color(0xFFFFFFFF),
             surfaceContainerLow = Color(0xFFFFFFFF),

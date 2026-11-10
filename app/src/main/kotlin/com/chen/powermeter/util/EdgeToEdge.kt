@@ -1,14 +1,25 @@
 package com.chen.powermeter.util
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.app.Activity
+import android.graphics.Insets
 import android.os.Build
 import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsAnimationControlListener
+import android.view.WindowInsetsAnimationController
+import android.view.WindowInsetsController
+import android.view.animation.PathInterpolator
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import java.util.WeakHashMap
+import kotlin.math.roundToInt
 
 /**
  * 小白条（手势导航栏）真沉浸适配。
@@ -80,9 +91,107 @@ object NavigationBarHelper {
     }
 
     /**
+     * 真沉浸的**动画**形态：系统栏从当前 inset 连续滑出（状态栏上移淡出、小白条下移
+     * 淡出），替代瞬时 hide()。动机 = 横屏主页点 `< >` 进全屏趋势时，瞬时收栏发生在
+     * 一镜到底展开之前且无任何过渡（用户实测"先硬切收栏、再展开"）；动画形态让收栏
+     * 与展开同段播完（2026-11-11）。
+     *
+     * 通过 [WindowInsetsController.controlWindowInsetsAnimation] 逐帧驱动系统栏 inset
+     * （API 30+，minSdk 30 无版本分支）：inset 连续变化还使**下方主页**的顶栏内缩变成
+     * 连续动画（主页 top bar 高度 = safeDrawing 顶部 inset，瞬时收栏时它整帧跳变）。
+     * 趋势页本身只消费 displayCutout insets（见 TrendFullscreenScreen），状态栏 inset
+     * 归零不触发其布局跳变。
+     *
+     * ⚠️ 调用时机 = 窗口持有焦点后（onWindowFocusChanged）：未聚焦窗口的 control 请求
+     * 会立即 onCancelled。系统栏已隐藏（当前 inset 全 0，重放/旋转场景）时直接返回，
+     * 不做无意义控制请求；已在途的控制请求（replayImmersive 同拍双发）也直接返回，
+     * 防止第二个请求把第一个取消、fallback 又瞬时收栏造成跳变。
+     *
+     * @param onCancelledFallback 控制权丢失（退出还栏的 show() / 未聚焦 / 系统接管）时
+     *   的终态处置：默认瞬时补一次 [enterImmersive] 保住沉浸；退出路径传自己的判定
+     *   （closing 时不补收，让"还栏"终态成立）。
+     */
+    fun enterImmersiveAnimated(
+        activity: Activity,
+        durationMs: Long = 300L,
+        onCancelledFallback: (() -> Unit)? = null,
+    ) {
+        WindowCompat.setDecorFitsSystemWindows(activity.window, false)
+        val window = activity.window
+        val controller = window.insetsController ?: return enterImmersive(activity)
+        controller.systemBarsBehavior =
+            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        val mask = WindowInsets.Type.systemBars()
+        if (insetAnimationsInFlight.containsKey(activity)) return
+        val start = window.decorView.rootWindowInsets?.getInsets(mask)
+        if (start == null || (start.left == 0 && start.top == 0 && start.right == 0 && start.bottom == 0)) {
+            return // 已是隐藏态：无需动画
+        }
+        var animator: ValueAnimator? = null
+        insetAnimationsInFlight[activity] = Unit
+        controller.controlWindowInsetsAnimation(
+            mask,
+            durationMs,
+            PathInterpolator(0.4f, 0f, 0.2f, 1f),
+            null,
+            object : WindowInsetsAnimationControlListener {
+                override fun onReady(
+                    c: WindowInsetsAnimationController,
+                    types: Int,
+                ) {
+                    animator = ValueAnimator.ofFloat(0f, 1f).apply {
+                        duration = durationMs
+                        addUpdateListener { anim ->
+                            val f = anim.animatedValue as Float
+                            c.setInsetsAndAlpha(
+                                Insets.of(
+                                    (start.left * (1f - f)).roundToInt(),
+                                    (start.top * (1f - f)).roundToInt(),
+                                    (start.right * (1f - f)).roundToInt(),
+                                    (start.bottom * (1f - f)).roundToInt(),
+                                ),
+                                1f,
+                                f,
+                            )
+                        }
+                        addListener(object : AnimatorListenerAdapter() {
+                            override fun onAnimationEnd(animation: Animator) = c.finish(true)
+                        })
+                        start()
+                    }
+                }
+
+                override fun onFinished(c: WindowInsetsAnimationController) {
+                    insetAnimationsInFlight.remove(activity)
+                }
+
+                override fun onCancelled(c: WindowInsetsAnimationController?) {
+                    insetAnimationsInFlight.remove(activity)
+                    animator?.cancel()
+                    if (onCancelledFallback != null) onCancelledFallback() else enterImmersive(activity)
+                }
+            },
+        )
+    }
+
+    /** 在途的 insets 控制请求（每 Activity 一个）：防同拍双发互相取消（见 [enterImmersiveAnimated]） */
+    private val insetAnimationsInFlight = WeakHashMap<Activity, Unit>()
+
+    /**
+     * 显式**保持**系统栏显示（SportLink DetailFullscreenActivity 的"非全屏沉浸"姿态照抄：
+     * 其源码注释"对比测试：状态栏 + 小白条改为显示"，沉浸代码已删，栏全程不动）。
+     * 帧率详情页与趋势全屏页用它钉住"栏恒显示"（2026-11-11 定案 A：两页从不 hide、
+     * 转场中不碰栏），这笔是对 HyperOS 在半透明全屏窗口打开瞬间的自动收栏行为的反制。
+     * show 幂等（栏已显示时 no-op），聚焦 / 配置重放处反复调用无害。
+     */
+    fun keepSystemBarsShown(activity: Activity) {
+        WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+            .show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    /**
      * 退出真沉浸：恢复状态栏与小白条常驻显示。
      *
-     * 调用点：`TrendFullscreenActivity.requestClose()`（关闭全屏页的 C+ 时序第一步）。
      * 必须在 finish 之前调用 —— 主页顶栏高度 = `safeDrawing` 顶部 inset + 64dp，若等窗口销毁
      * 才由系统恢复系统栏，主页首帧会先按"无系统栏"排一次、再跳一次（返回瞬闪的第二个来源）。
      *

@@ -515,19 +515,24 @@ object AppTransitions {
     /**
      * 跨方向进场的旋转沉降下限（ms，SportLink ROTATION_SETTLE_MIN_MS 同值照搬）：系统
      * 旋转叠层（截图交叉淡出的全屏动画）会比源页完成重排更晚撤下，展开的 FastOutSlowIn
-     * 快启动段落在叠层之下 = 观感"没有展开动画、页面直接蹦出来"。轮询现拍展开必须
+     * 快启动段落在叠层之下 = 观感"没有展开动画、页面直接蹦出来"。中心线直角带展开必须
      * 等满此时长（见 [CollapseHost.tryApplyRotatedAnchor]）。
      */
     private const val CROSS_DIRECTION_MIN_SETTLE_MS = 380L
 
     /**
-     * 跨方向进场轮询的**时间**预算（ms）。SportLink 原版按帧计数（ROTATION_WAIT_MAX_FRAMES=60），
-     * 帧数预算随刷新率缩水：120Hz 下 60 帧 ≈ 0.5s，而"显示旋转落地 + 源页（pause 态但可见）
-     * 重排 + Compose 重组"实测需要 ~1s（2026-09-30 装机 dumpsys 实锤：两窗口均已 3200×1440
-     * 而轮询已超时）→ 每次进场都误降级全宽中心线。改为纯时间预算，[CollapseHost.tryApplyRotatedAnchor]
-     * 仍逐帧轮询、新鲜判定不变。
+     * 跨方向进场展开的四角圆角（px）：恒 0 = 直角（SportLink 2026-11-02 定案
+     * CROSS_ORIENTATION_BAND_RADIUS_PX 同值照搬）。
+     *
+     * 竖屏点击 → 锁横屏全屏页时，源方向那张卡片在新方向下已不成立，几何按横屏现取矩形
+     * 重新推导，展开出来的是"一条全宽水平带"从中间上下撑开——它不是卡片，四角必须是
+     * 直角。旧实现起始圆角沿用 defaultAnchorRadiusPx（≈屏幕物理圆角）、终态屏幕圆角，
+     * 整段都是圆角（SportLink 真机观感"圆角带子"，PM 同款分叉）。
+     *
+     * 与同方向展开严格分开：横握主页点击仍按卡片实际圆角展开；收拢（返回）恒按目标
+     * 卡片形状圆角（真实卡片），不受本常量影响（startClipCollapse 还原本体圆角）。
      */
-    private const val ROTATION_WAIT_BUDGET_MS = 2500L
+    private const val CROSS_DIRECTION_BAND_RADIUS_PX = 0f
 
     /** 收拢宿主（每 Activity 一个，装配进场时登记，收拢结束/取消时移除） */
     private class CollapseHost(
@@ -560,6 +565,13 @@ object AppTransitions {
         val liveSource: Source? = null,
         /** 源窗口视图弱引用（[Capture.sourceWindowRef]）：重定位时重新绘制取新截图 */
         val sourceWindowRef: WeakReference<View>? = null,
+        /**
+         * 跨方向会话收拢期垫不透明退出遮罩（SportLink blockBackgroundOnExit 同款照抄，
+         * 2026-11-11 用户拍板）：收拢期间透明窗口**不再透出真实父页**，裁剪窗口外统一
+         * 页面底色。遮罩在 requestClose 时插入，finishNow 不移除（系统 finish 过渡取
+         * 纯色末帧，SportLink 同口径）。
+         */
+        val blockBackgroundOnExit: Boolean = false,
     ) {
         var closing = false
         var finishRequested = false
@@ -641,6 +653,10 @@ object AppTransitions {
             enterScrim?.let { scrim ->
                 (scrim.parent as? ViewGroup)?.removeView(scrim)
                 enterScrim = null
+                // ⚠️ 必须同步清 exitScrims 登记（SportLink 同款教训）：否则退出遮罩的
+                // 去重路径拿到这张**已脱树**的旧遮罩直接 return——新遮罩永不挂树，跨方向
+                // 收拢的退出遮罩整体失效（SportLink 2026-09-29 实锤）
+                exitScrims.remove(activity)
                 Log.i(TAG, "removeEnterScrim")
             }
         }
@@ -678,9 +694,13 @@ object AppTransitions {
             expandSet?.cancel()
             expandSet = null
             page.alpha = 1f
-            // 拆旋转期遮罩（若还在 —— 收拢在跨方向旋转等待期被要求关闭的极端时序）：
-            // 收拢期间窗口外必须透出真实源页才是一镜到底（SportLink requestClose 同步序）
+            // 拆旋转期遮罩（若还在 —— 收拢在跨方向旋转等待期被要求关闭的极端时序）
             removeEnterScrim()
+            // 跨方向会话垫不透明退出遮罩（SportLink requestClose 同序，2026-11-11 照抄）：
+            // 遮罩插在最底层，收拢期间裁剪窗口外透出纯色页面底色而非父页；finishNow 不
+            // 移除，让系统 finish 过渡取到纯色末帧。同方向会话不垫 = 窗口外透真实源页，
+            // 一镜到底不变
+            if (blockBackgroundOnExit) addExitScrim(content, activity)
             // 转屏/分屏守卫（2026-09-27 用户实测：竖屏开详情 → 查看页转横屏 → 返回收拢
             // 位置异常，反向同理）：当前窗口与截图时尺寸不一致 = 截图时刻的源矩形在当前
             // 窗口坐标系失效。旧守卫在此直接放弃收拢（列表 stopped 拿不到卡片新位置），
@@ -855,108 +875,40 @@ object AppTransitions {
         }
 
         /**
-         * 跨方向进场补偿（竖屏主页 → 本页锁横屏，SportLink beginExpandWithRotationCompensation
-         * 同款照搬）：Handoff 矩形是源方向坐标，在横屏窗口里直接展开会错位/退化。目标首帧时
-         * 源页往往**尚未**完成新旋转下的重布局（拿到的是竖屏旧坐标，钳进横屏窗口成垃圾矩形）
-         * —— 逐帧轮询等待，矩形**落在窗口内且已偏离 Handoff 矩形**（= 源页按新旋转重排完成）
-         * 才现拍展开；超时退化全宽中心线。进场前置条件由 installWindowTransform 保证：
-         * 不透明遮罩已垫底 + 整窗零尺寸裁剪（等待期与重取间隙都不穿帮）。
+         * 跨方向进场补偿（竖屏主页 → 本页锁横屏）：Handoff 矩形是源方向坐标，在横屏窗口里
+         * 直接展开会错位/退化。**展开形态 = 全宽直角带从垂直中心上下撑开**（2026-11-11
+         * 用户拍板照抄 SportLink 观感："全屏纯色遮罩 → 一镜到底展开后变全屏界面"，不从源
+         * 卡片的新矩形展开 —— 源卡片在新方向的落位随滚动/分栏漂移，从它展开会"从右下角"
+         * 起跑）。流程 = 纯色遮罩垫底（installWindowTransform）+ 整窗零尺寸裁剪 → 等
+         * 旋转沉降（[CROSS_DIRECTION_MIN_SETTLE_MS]，展开的快启动段不能被系统旋转叠层
+         * 盖住）→ 清锚点层、中心线直角带展开。不轮询源页重排矩形、不现拍。
          */
         fun beginExpandWithRotationCompensation(clip: ClipRevealLayout) {
             expandPollStartMs = SystemClock.uptimeMillis()
             tryApplyRotatedAnchor(clip, 0)
         }
 
-        /** [ROTATION_WAIT_BUDGET_MS] 内等到「旋转已沉降 + 新鲜矩形」就现拍展开，
-         *  否则清锚点层退化全宽中心线（SportLink v1 形态） */
+        /** 等 [CROSS_DIRECTION_MIN_SETTLE_MS] 旋转沉降后起跑中心线直角带展开（逐帧轮询） */
         private fun tryApplyRotatedAnchor(clip: ClipRevealLayout, attempt: Int) {
             if (closing || finishRequested) return
-            val src = liveSource
-            val b = src?.bounds
-            // 新鲜判定：非空、在本窗口内（竖屏旧坐标 y 必然超出横屏高度）、已偏离
-            // Handoff 矩形（= onGloballyPositioned 已按新旋转回调过）、且系统旋转动画
-            // 已沉降（提前展开会被旋转全屏叠层盖住快启动段 → 观感"没有展开动画"）
             val settledMs = SystemClock.uptimeMillis() - expandPollStartMs
-            val fresh = settledMs >= CROSS_DIRECTION_MIN_SETTLE_MS &&
-                b != null && !b.isEmpty &&
-                b.left >= 0 && b.top >= 0 &&
-                b.right <= clip.width && b.bottom <= clip.height &&
-                (sourceCapture == null || b != sourceCapture.rect)
-            if (fresh) {
-                Log.i(
-                    TAG,
-                    "cross-direction enter: settle ${settledMs}ms + fresh rect ${b.toShortString()} → re-capture",
-                )
-                // 现拍（SportLink buildAnchorSnapshot 口径）：register+capture 复用进场
-                // 管线，裁出源页按新旋转重排后的卡片矩形 + 当前主题像素 + 文字层。
-                // View.draw 同步绘制（数 ms），无需挂起
-                register(src)
-                val mainDecor = sourceWindowRef?.get()
-                val fresh = mainDecor?.let { capture(it, sourceCapture?.bgColor ?: 0) }
-                // 源窗口坐标 → 本窗口坐标：两个全屏窗口按屏上原点差平移（双方 edge-to-edge
-                // 全屏时差值为 0，保留换算以兼容窗口错位的分屏/自由窗口形态）
-                val sLoc = IntArray(2)
-                val dLoc = IntArray(2)
-                mainDecor?.getLocationOnScreen(sLoc)
-                activity.window?.decorView?.getLocationOnScreen(dLoc)
-                val mapped = Rect(
-                    b.left - sLoc[0] + dLoc[0],
-                    b.top - sLoc[1] + dLoc[1],
-                    b.right - sLoc[0] + dLoc[0],
-                    b.bottom - sLoc[1] + dLoc[1],
-                )
-                val loc = IntArray(2)
-                clip.getLocationInWindow(loc)
-                if (fresh != null) {
-                    sourceRect = Rect(mapped)
-                    clip.setAnchorBitmap(
-                        fresh.bitmap,
-                        (mapped.left - loc[0]).toFloat(),
-                        (mapped.top - loc[1]).toFloat(),
-                        (mapped.right - loc[0]).toFloat(),
-                        (mapped.bottom - loc[1]).toFloat(),
-                    )
-                    val tr = fresh.textRect
-                    if (tr != null && fresh.textBitmap != null) {
-                        clip.setAnchorTextBitmap(
-                            fresh.textBitmap,
-                            (tr.left - sLoc[0] + dLoc[0] - loc[0]).toFloat(),
-                            (tr.top - sLoc[1] + dLoc[1] - loc[1]).toFloat(),
-                            (tr.right - sLoc[0] + dLoc[0] - loc[0]).toFloat(),
-                            (tr.bottom - sLoc[1] + dLoc[1] - loc[1]).toFloat(),
-                        )
-                    } else {
-                        clip.setAnchorTextBitmap(null, 0f, 0f, 0f, 0f)
-                    }
-                } else {
-                    // 现拍失败：锚点位图清空（展开无截图交叉淡变，纯裁剪撑开），
-                    // 收拢终点仍登记现矩形（本体纯色填充 + 遮罩承担视觉）
-                    Log.w(TAG, "cross-direction enter: re-capture failed → clip-only expand")
-                    sourceRect = Rect(mapped)
-                    clip.setAnchorBitmap(null, 0f, 0f, 0f, 0f)
-                    clip.setAnchorTextBitmap(null, 0f, 0f, 0f, 0f)
-                }
-                beginExpand(buildRotatedGeometry(clip, mapped), clip)
+            if (settledMs < CROSS_DIRECTION_MIN_SETTLE_MS) {
+                clip.postOnAnimation { tryApplyRotatedAnchor(clip, attempt + 1) }
                 return
             }
-            if (SystemClock.uptimeMillis() - expandPollStartMs < ROTATION_WAIT_BUDGET_MS) {
-                clip.postOnAnimation { tryApplyRotatedAnchor(clip, attempt + 1) }
-            } else {
-                Log.w(
-                    TAG,
-                    "cross-direction enter: rotation wait timeout (${attempt} frames, ${settledMs}ms) → center-line expand" +
-                        " bounds=${b?.toShortString()}",
-                )
-                // 退化全宽中心线（SportLink v1 形态）：清锚点层 + sourceRect 置空 ——
-                // buildRevealGeometry 对空矩形退化中心线，收拢同款
-                sourceRect = Rect()
-                clip.setAnchorBitmap(null, 0f, 0f, 0f, 0f)
-                clip.setAnchorTextBitmap(null, 0f, 0f, 0f, 0f)
-                beginExpand(buildRotatedGeometry(clip, null), clip)
-            }
+            Log.i(TAG, "cross-direction enter: settle ${settledMs}ms → center-line band expand")
+            // 清锚点层（本体/文字层/截图全不参与，纯色带 + 遮罩）；sourceRect 置空 →
+            // buildRevealGeometry 对空矩形退化中心线；跨方向会话的收拢（横屏停留退出）
+            // 另由 collapseAndFinish(relocateAnchor=true) 现取真实卡片矩形，见 requestClose
+            sourceRect = Rect()
+            clip.setAnchorBitmap(null, 0f, 0f, 0f, 0f)
+            clip.setAnchorTextBitmap(null, 0f, 0f, 0f, 0f)
+            beginExpand(buildRotatedGeometry(clip, null), clip)
         }
 
-        /** 由给定矩形构建展开几何；null = 全宽中心线（超时降级） */
+        /** 由给定矩形构建跨方向展开几何；null = 全宽中心线（超时降级）。
+         *  起始/终态圆角恒 [CROSS_DIRECTION_BAND_RADIUS_PX]（直角带，SportLink 2026-11-02
+         *  定案）：展开出来的是一条全宽水平带而非卡片，四角不能带屏幕圆角 */
         private fun buildRotatedGeometry(clip: ClipRevealLayout, rect: Rect?): ClipReveal.RevealGeometry {
             val loc = IntArray(2)
             clip.getLocationInWindow(loc)
@@ -965,10 +917,11 @@ object AppTransitions {
                 height = clip.height.toFloat(),
                 anchorRectInWindow = rect,
                 anchorYInWindow = clip.height / 2f + loc[1],
-                anchorCornerRadiusPx = null,
+                anchorCornerRadiusPx = CROSS_DIRECTION_BAND_RADIUS_PX,
                 clipOriginX = loc[0].toFloat(),
                 clipOriginY = loc[1].toFloat(),
                 activity = activity,
+                endCornerRadiusPx = CROSS_DIRECTION_BAND_RADIUS_PX,
             )
         }
 
@@ -1065,6 +1018,11 @@ object AppTransitions {
                 finishNow()
                 return
             }
+            // 本体圆角还原图标卡片值：跨方向进场把本体设成直角带（[CROSS_DIRECTION_BAND_RADIUS_PX]）
+            // 后，收拢终点是**真实卡片**（SportLink 口径"收拢恒按目标卡片形状圆角"），几何的
+            // startRadius 也是默认卡片圆角（下方 anchorCornerRadiusPx=null）——本体不同步还原
+            // 会在收拢末期四角露出容器色缺口。同方向会话此行是 no-op（装配时本就是该值）
+            clip.setAnchorCornerRadiusPx(ClipReveal.defaultAnchorRadiusPx(activity))
             val loc = IntArray(2)
             clip.getLocationInWindow(loc)
             val geometry = ClipReveal.buildRevealGeometry(
@@ -1129,6 +1087,31 @@ object AppTransitions {
     private val collapseHosts = WeakHashMap<Activity, CollapseHost>()
 
     /**
+     * 已插入的退出遮罩（finishNow 不移除，让系统 finish→旋转过渡取到纯色末帧）。
+     * 进场的旋转期遮罩也经 [addExitScrim] 创建并登记在此——收拢时 removeEnterScrim
+     * 摘除并清登记，requestClose 才能补上真正的新遮罩（共用去重表，SportLink 同构）。
+     */
+    private val exitScrims = WeakHashMap<Activity, View>()
+
+    /** 向 content 插入一张不透明页面底色遮罩（去重，插在最底层），返回遮罩视图供拆除 */
+    private fun addExitScrim(content: ViewGroup, activity: Activity): View {
+        exitScrims[activity]?.let { old ->
+            // 复用已有遮罩时按当前主题刷新颜色：深浅色切换后旧色会穿帮（SportLink 同款）
+            old.setBackgroundColor(resolveColorBackground(activity))
+            return old
+        }
+        val scrim = View(activity).apply { setBackgroundColor(resolveColorBackground(activity)) }
+        content.addView(
+            scrim,
+            0,
+            ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
+        )
+        exitScrims[activity] = scrim
+        Log.i(TAG, "addExitScrim activity=${activity.componentName?.shortClassName}")
+        return scrim
+    }
+
+    /**
      * 跨 Activity 启动：登记 Handoff（源条目截图 + 矩形）+ 普通启动（单次压制窗口滑动，
      * 目标页动画由 [installWindowTransform] 手动播放）。无锚点/过期时降级为普通启动
      * （主题 windowAnimationStyle 滑动）。
@@ -1191,21 +1174,16 @@ object AppTransitions {
      * **同方向进场**（源窗口横屏，2026-09-29 照抄 SportLink）：首帧 PreDraw 直接从
      * Handoff 矩形四向撑开 —— 横屏源窗口本就是终态尺寸、无旋转叠层，无需任何等待。
      *
-     * **跨方向进场**（源窗口竖屏 → 本页锁横屏；SportLink 图表卡 1d64dd9/baaeca3/
-     * 8452508 全套口径照搬）：Handoff 矩形是竖屏坐标无法直接用，源页此刻也尚未按
-     * 新旋转重排 —— 三步：
-     * ① 垫**不透明页面底色遮罩**（[Capture.bgColor]，content 最底层）盖住旋转期透出
-     *   的源页（源页正被系统重排，透出会闪重排中间态），并整窗零尺寸裁剪（等待期
-     *   什么都不画）；
-     * ② 逐帧轮询活性源条目（[CollapseHost.beginExpandWithRotationCompensation]）：
-     *   等 ≥[CROSS_DIRECTION_MIN_SETTLE_MS] 旋转沉降（更快展开会被旋转全屏叠层盖住
-     *   快启动段 = 观感"没有展开动画"）且源页矩形**落在窗口内并已偏离 Handoff 矩形**
-     *   （= 源页按新旋转重排完成）；
-     * ③ 对活性源条目**现拍**新鲜截图（register+capture 复用进场管线：真实横屏矩形 +
-     *   当前主题像素 + 文字层）→ 重钉锚点层 → 从真实卡片矩形四向撑开。轮询超时
-     *   （时间预算 [ROTATION_WAIT_BUDGET_MS]，分屏/自由窗口方向被忽略）→ 清锚点层
-     *   退化全宽中心线展开。遮罩在展开完成（onAnimationEnd）或开始收拢（requestClose）
-     *   时拆除，露出真实源页。
+     * **跨方向进场**（源窗口竖屏 → 本页锁横屏）：Handoff 矩形是竖屏坐标无法直接用，
+     * 源页此刻也尚未按新旋转重排 —— 两步：
+     * ① 垫**不透明页面底色遮罩**（content 最底层）盖住旋转期透出的源页（源页正被系统
+     *   重排，透出会闪重排中间态），并整窗零尺寸裁剪（等待期什么都不画）；
+     * ② 等 ≥[CROSS_DIRECTION_MIN_SETTLE_MS] 旋转沉降（更快展开会被旋转全屏叠层盖住
+     *   快启动段 = 观感"没有展开动画"）后，清锚点层、**全宽直角带从垂直中心上下撑开**
+     *   （2026-11-11 用户拍板照抄 SportLink 观感：不从源卡片的新矩形展开 —— 源卡片在
+     *   新方向的落位随滚动/分栏漂移，从它展开会"从右下角"起跑；详见
+     *   [CollapseHost.beginExpandWithRotationCompensation]）。遮罩在展开完成
+     *   （onAnimationEnd）或开始收拢（requestClose）时拆除，露出真实源页。
      */
     fun installWindowTransform(
         activity: Activity,
@@ -1230,8 +1208,8 @@ object AppTransitions {
         val crossDirection = landscapeTarget && capture.sourceWidth < capture.sourceHeight
         // expandOnEnter=false（collapse-back，无展开 PreDraw）的收拢终点必须装配时就绪；
         // 该形态均同方向（FrameDetailActivity），原样取用。expandOnEnter=true 时矩形由
-        // 进场路径登记：同方向 = Handoff 矩形直用（下方 PreDraw）；跨方向 = 轮询现拍
-        // 后登记（见 CollapseHost.tryApplyRotatedAnchor），此处留空占位。
+        // 进场路径登记：同方向 = Handoff 矩形直用（下方 PreDraw）；跨方向 = 恒中心线
+        // 直角带、不落矩形（见 CollapseHost.tryApplyRotatedAnchor），此处留空占位。
         val anchorRect = if (expandOnEnter) Rect() else Rect(capture.rect)
         val page = content.getChildAt(0) ?: return
         Log.i(
@@ -1320,6 +1298,9 @@ object AppTransitions {
             sourceCapture = capture,
             liveSource = capture.liveSource,
             sourceWindowRef = capture.sourceWindowRef,
+            // 跨方向会话收拢期垫不透明退出遮罩（SportLink blockBackgroundOnExit 同款，
+            // 2026-11-11 用户拍板照抄）：旋转重排/收拢期间窗口外统一页面底色
+            blockBackgroundOnExit = crossDirection,
         )
         // 容器底色来源（与上面 setBackgroundColor 同一判据）：主题过期修复据此选新主题色
         host.containerColorIsCard = capture.textBitmap != null && capture.cardSurface != 0
@@ -1330,15 +1311,11 @@ object AppTransitions {
         // 遮罩插在最底层（ClipRevealLayout 之下），旋转等待期与展开窗口外透出的都是
         // 纯色；展开完成/开始收拢时由宿主拆除（removeEnterScrim），露出真实源页
         if (crossDirection && expandOnEnter) {
-            host.enterScrim = View(activity).apply {
-                setBackgroundColor(capture.bgColor)
-            }.also { scrim ->
-                content.addView(
-                    scrim,
-                    0,
-                    ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
-                )
-            }
+            // 旋转期遮罩经 addExitScrim 统一登记（SportLink 同款）：旋转等待期它是
+            // "旋转期遮罩"，收拢时 removeEnterScrim 摘除并清登记、requestClose 再补
+            // 真正的退出遮罩——两条路径共用去重表才不会互相挡。颜色 = View 层主题页面色
+            // （colors.xml windowBackground 已与 Theme.kt 中性色逐字同步，批次三十口径）
+            host.enterScrim = addExitScrim(content, activity)
         }
 
         // 整窗截图垫底层（index 0，比后加的 ClipRevealLayout 更底）。同方向 collapse-back
@@ -1566,28 +1543,29 @@ private class PageSnapshotView(context: Context, val snapshot: Bitmap) : View(co
 // ── 截图素材的主题重映射（2026-09-28 深浅色切换后退场旧色修复）────────────────
 // 冻结快照与锚点卡片截图都是"进详情页那一刻"拍的旧主题位图；详情页期间系统深浅变化后，
 // 返回收拢动画会带着旧色（用户实测：整屏旧色转场）。这里按固定中性色对做**分段亮度
-// 映射**（色值引用 PowerMeterTheme.withSportLinkSurfaces 的钉死中性色：页底 E0↔2A、
-// 卡片白↔33、文字黑↔白），彩色按亮度等比缩放保色相；抗锯齿过渡像素由分段连续映射
-// 自然覆盖（黑字与浅底的混合 → 白字与深底的同比例混合）。
+// 映射**（色值引用 PowerMeterTheme.withSportLinkSurfaces 的钉死中性色，2026-11-11 随
+// SportLink 最新版更新：页底 F7↔00、卡片白↔24、文字黑↔白），彩色按亮度等比缩放保色相；
+// 抗锯齿过渡像素由分段连续映射自然覆盖（黑字与浅底的混合 → 白字与深底的同比例混合）。
 
 /** 主题页底色（withSportLinkSurfaces 固定值，仅深浅两套） */
 internal fun themeBackgroundColor(dark: Boolean): Int =
-    if (dark) 0xFF2A2A2A.toInt() else 0xFFE0E0E0.toInt()
+    if (dark) 0xFF000000.toInt() else 0xFFF7F7F7.toInt()
 
 /** 主题卡片表面色（同上） */
 internal fun themeCardColor(dark: Boolean): Int =
-    if (dark) 0xFF333333.toInt() else 0xFFFFFFFF.toInt()
+    if (dark) 0xFF242424.toInt() else 0xFFFFFFFF.toInt()
 
 /**
- * 分段亮度映射（0..255 → 0..255）：
- * - 浅→深：0(黑字)→255(白)，224(页底)→42，255(卡片白)→51 —— [0,224] 与 [224,255] 两段线性；
- * - 深→浅：42(页底)→224，51(卡片)→255，255(白字)→0 —— [0,51] 与 [51,255] 两段线性。
+ * 分段亮度映射（0..255 → 0..255，断点 = withSportLinkSurfaces 中性色的亮度，2026-11-11
+ * 随 SportLink 最新版重算：日页底 F7=247、夜页底 00=0、日卡片 FF=255、夜卡片 24=36）：
+ * - 浅→深：0(黑字)→255(白)，247(页底)→0，255(卡片白)→36 —— [0,247] 与 [247,255] 两段线性；
+ * - 深→浅：0(页底)→247，36(卡片)→255，255(白字)→0 —— [0,36] 与 [36,255] 两段线性。
  */
 private fun mapTone(v: Int, darkTarget: Boolean): Int {
     val f = if (darkTarget) {
-        if (v <= 224) 255f - 0.95f * v else 42f + 0.29f * (v - 224)
+        if (v <= 247) 255f - 255f * v / 247f else 36f * (v - 247) / 8f
     } else {
-        if (v <= 51) 224f + 31f * v / 51f else 255f - 1.25f * (v - 51)
+        if (v <= 36) 247f + 8f * v / 36f else 255f - 255f * (v - 36) / 219f
     }
     return f.roundToInt().coerceIn(0, 255)
 }

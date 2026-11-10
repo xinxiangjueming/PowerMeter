@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 夜间窗口底色：与 ui/theme/Theme.kt withSportLinkSurfaces 的 background #2A2A2A
-         逐字一致（日间取值与历史说明见 values/colors.xml）。 -->
-    <color name="background">#2A2A2A</color>
+    <!-- 夜间窗口底色：与 ui/theme/Theme.kt withSportLinkSurfaces 的 background #000000
+         逐字一致（2026-11-11 随 SportLink 最新版从 #2A2A2A 更新；日间取值与历史说明见
+         values/colors.xml）。 -->
+    <color name="background">#000000</color>
 </resources>

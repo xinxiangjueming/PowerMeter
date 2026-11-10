@@ -973,8 +973,8 @@ object FrameRecordController {
                     if (sessionPkg.isEmpty()) {
                         _fps.value = Double.NaN
                     } else if (ls == null) {
-                        // 首拍建边界基线 / 会话刚拉起 trace 未落盘：不出数（不算失败，
-                        // 持续读不到走 FrameRateSource 内部的 strike → 判死回落链）
+                        // 零新增字节 / 批内无分母（首读）/ 会话刚拉起 trace 未落盘：不出数
+                        // （不算失败，持续读不到走 FrameRateSource 内部的 strike → 判死回落链）
                     } else if (ls.frames == 0L) {
                         // 本子拍无认领帧：读数 0.0（「本周期无合成帧」语义，同 timestats）
                         _fps.value = 0.0
@@ -984,7 +984,8 @@ object FrameRecordController {
                     } else {
                         val dtSec = if (ls.fps > 0) ls.frames / ls.fps else 0.0
                         if (!checkFpsCeiling(ls.fps, dtSec, "frametimeline")) {
-                            // 守卫拒收：读数保持上一窗（边界基线已推进，下一窗自愈）
+                            // 守卫拒收：读数保持上一窗（fps 分母 = 批内 present 跨度，本批帧已
+                            // 消费、无跨批基线，下一批自愈）
                         } else {
                             if (_error.value == ERROR_NO_TARGET_APP) _error.value = null
                             _fps.value = ls.fps
@@ -1400,8 +1401,8 @@ object FrameRecordController {
                         // 置 NaN —— 4Hz 下 3/4 拍都被打成「—」，tab 观感 = 一直没数（2026-10-04 装机
                         // 报障）。首拍本就是 NaN 照样显示「—」；出过数后落盘间隙不再闪「—」，与
                         // timestats 守卫拒收的「读数保持上一拍」口径一致。1s 样本合成不受影响：
-                        // null 拍不进 accFrames / accDtSec（录制循环本就如此，跨间隙的窗口由
-                        // present 基线天然 telescoping 补齐）。
+                        // null 拍不进 accFrames / accDtSec（录制循环本就如此；fps 分母 = 批内
+                        // present 跨度，静止期无帧包不进批，跨间隙无需基线）。
                     } else if (ls.frames == 0L) {
                         _fps.value = 0.0
                     } else {
@@ -1494,8 +1495,13 @@ object FrameRecordController {
             // 详情页与帧率的相关性分析，整条丢弃会在曲线上挖洞。
             // 刷新率未知（0，无法判定）或全部超限（刷新率上报异常）→ 退回全量：
             // 宁可保守也不要 NaN / 少样本，超限样本终归是少数。
+            // D5（2026-11-11）：avg 在超上限过滤之上再剔 0.0 —— 0 的语义是"该秒无合成帧"
+            // （静止 / 不在前台），不是"帧率掉到 0"；MIN / 1% / 5% Low 一直是正样本口径
+            // （见 lowSource），avg 混入静止秒会把带加载 / 大厅段场次的均值大幅稀释。
+            // ⚠️ 全场 0 帧（整场静止）时不强行剔成空 —— "没有帧" 是真实读数，avg=0 如实落库。
             val fpsValues = pending
                 .filter { refreshHz <= 0 || it.fps <= refreshHz + FPS_CEILING_TOLERANCE }
+                .let { ceilingFiltered -> ceilingFiltered.filter { it.fps > 0.0 }.ifEmpty { ceilingFiltered } }
                 .ifEmpty { pending }
                 .map { it.fps }
             // MIN / 1% / 5% Low 的取值源：**帧率采样点表优先**（frame_fps_samples，

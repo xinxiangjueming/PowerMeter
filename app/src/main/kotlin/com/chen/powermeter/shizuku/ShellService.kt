@@ -295,6 +295,11 @@ class ShellService : IShellService.Stub() {
 
     // ── 系统 TaskFpsCallback 桥（2026-09-29，AIDL v3）────────────────────
     //
+    // ⚠️ 接口本体（android.window.TaskFpsCallback + IWindowManager.registerTaskFpsCallback）
+    // 是 **Android 13(T) 引入**；S(12) 的等价物是 SurfaceControlFpsListener（另一套 AIDL
+    // 方法，未实现）——A12 及以下反射必抛 NoSuchMethod，可用性由 FrameRateSource
+    // .isTaskFpsSupported 的 SDK≥33 门控挡住（2026-11-11 对质 AOSP 原文定案）。
+    //
     // 机制与口径见 IShellService.aidl 的同段注释。三层设计：
     // ① 回调侧**不引用任何框架隐藏类**——手写同 descriptor 的 [taskFpsCallbackBinder]
     //    （ITaskFpsCallback 单方法 onFpsReported(float)，事务码 = FIRST_CALL_TRANSACTION）；

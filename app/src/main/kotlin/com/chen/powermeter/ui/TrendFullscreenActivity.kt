@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FilterChip
@@ -69,18 +70,14 @@ import com.chen.powermeter.util.AppTransitions
 import com.chen.powermeter.util.NavigationBarHelper
 
 /**
- * 横屏停留退出时「还栏 → 收拢」的等待时长（ms，SportLink ChartFullscreenActivity
- * barSettleDelayMs 同口径）：半透明窗口下的主页被连带排成无栏全高布局，还栏后要等它
- * 重排回"有栏"终态，收拢前向活性源条目现取的锚点矩形才是还栏后位置 —— 否则收拢落点
- * 与真实卡片差一个系统栏高度，finish 恢复后主页再跳一次（"还栏防列表跳动"）。
- */
-private const val BAR_SETTLE_DELAY_MS = 300L
-
-/**
  * 趋势卡全屏页。
  *
  * 三条硬性要求（对应本次需求）：
- * 1. **隐藏状态栏与小白条**：[NavigationBarHelper.enterImmersive]，上滑可瞬时唤出。
+ * 1. **系统栏全程显示**（2026-11-11 定案 A，SportLink DetailFullscreenActivity"非全屏沉浸"
+ *    姿态同款）：本页从不 hide，转场中更不碰栏——收栏会把 statusBars inset 归零、半透明
+ *    窗下的源页连带重排上移、首帧已按"有栏布局"采集的展开几何失效（显示区域变化/内容
+ *    侵入状态栏区）。聚焦 / 配置重放时显式 show（[NavigationBarHelper.keepSystemBarsShown]），
+ *    反制 HyperOS 半透明窗打开瞬间的自动收栏。
  * 2. **小白条真沉浸**：系统栏透明 + 关闭 contrast（[NavigationBarHelper.setupEdgeToEdge]），
  *    内容延伸到系统栏之下（背景铺满，**不**用 safeDrawing 全边 padding，否则只是
  *    "把系统栏区域换成背景色"而非沉浸）。
@@ -98,9 +95,9 @@ private const val BAR_SETTLE_DELAY_MS = 300L
  * 因此从主页面进入本页时看到的一定是同一份数据。
  *
  * **关闭时序（2026-09-30 用户定案：按设备物理朝向分流，判据平放加固）**：✕ / 返回手势
- * 经 [requestClose] 全部路由进 [finish]：设备横握/平放（finish 后显示停留横屏）= 还栏
- * 等 300ms → 收拢前向活性源条目**现取**趋势卡当前矩形/新截图再收拢（终点 = 主页横屏
- * 两列布局里趋势卡的真实位置，无还栏跳动）；明确竖握 = **不收拢**，主题窗口动画滑出
+ * 经 [requestClose] 全部路由进 [finish]：设备横握/平放（finish 后显示停留横屏）=
+ * 收拢前向活性源条目**现取**趋势卡当前矩形/新截图再收拢（终点 = 主页横屏两列布局里
+ * 趋势卡的真实位置）；明确竖握 = **不收拢**，主题窗口动画滑出
  * （收拢播在被钉住的横屏窗口里"先强制横屏再旋转"已被用户否决）。进入/退出的窗口内
  * 转场都由 AppTransitions 的 ClipReveal 裁剪承担（同方向首帧直开；跨方向垫遮罩 + 轮询
  * 源页重排 + 现拍新鲜锚点再展开），窗口滑动动画在一镜到底路径双向压 0。
@@ -152,17 +149,8 @@ class TrendFullscreenActivity : ComponentActivity() {
      */
     private var closing by mutableStateOf(false)
 
-    /**
-     * 退出时序已启动（含还栏后的 300ms 等待期）：requestClose 的幂等护栏。
-     * 与 [closing] 分开 —— 等待期内容**不能**开始淡出（SportLink 同款：还栏等待期间
-     * 全屏页保持完整可见），期间系统栏已恢复，[replayImmersive] 类重放也必须跳过
-     * （否则把刚还的栏再收回去）。
-     */
+    /** 退出时序已启动：requestClose 的幂等护栏（与 [closing] 分开，语义保留）。 */
     private var closeRequested = false
-
-    /** 还栏动作是否已做（SportLink exitBarRestoreDone 同款）：finish() 会被收拢完成后的
-     *  finishNow 重入，本标记保证还栏 + 300ms 等待只做一次 */
-    private var exitBarRestoreDone = false
 
     // ── 退出朝向判定（SportLink ChartFullscreenActivity 同款分流 + 平放加固）────────
     // 本页恒锁 sensorLandscape：resources.orientation 恒为横屏，判不出"finish 后显示
@@ -235,13 +223,10 @@ class TrendFullscreenActivity : ComponentActivity() {
 
         // ① edge-to-edge：系统栏透明 + 关 contrast + decorFitsSystemWindows(false)
         //    + 注册 decorView insets 监听（180° 翻转不回调 onConfigurationChanged 的兜底）
-        NavigationBarHelper.setupEdgeToEdge(
-            this,
-            lightStatusBar = !isNightMode(),
-            immersive = true,
-        )
-        // ② 真沉浸：隐藏状态栏 + 小白条
-        NavigationBarHelper.enterImmersive(this)
+        NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
+        // ② 系统栏全程显示（2026-11-11 定案 A，见类注释第 1 条）：不在 onCreate/转场中
+        //    收栏。聚焦 / 配置重放时由 replaySystemBars 显式 show，反制 HyperOS 半透明窗
+        //    打开瞬间的自动收栏。
 
         // ③ 允许窗口延伸到摄像头区域；避让交给 Compose 的 displayCutout insets。
         //    minSdk 30 ≥ API 28，无需版本分支。
@@ -303,16 +288,11 @@ class TrendFullscreenActivity : ComponentActivity() {
      * （2026-09-29 用户定案"进入和退出都完全照搬"）：
      *
      * **横屏停留退出**（[exitWillBeLandscape] = true，设备横握，finish 后显示仍横屏、
-     * 主页停留横屏两列布局 = 最终态）：
-     * ⓪ 首次 finish：还系统栏 → 等 [BAR_SETTLE_DELAY_MS]（"还栏防列表跳动"：半透明
-     *    窗口下的主页被连带排成无栏全高布局，收拢前现取的锚点必须是还栏后位置；
-     *    等待期本页内容完整可见、不淡出）；等待期内用户可能翻回竖握 → 重评口径同
-     *    SportLink 每次 finish 都重评；
-     * ① 再次 finish：[closing] 置位 → [AppTransitions.collapseAndFinish](relocateAnchor
-     *    = true) 收拢 —— 收拢前向活性源条目**现取**趋势卡当前矩形/新截图，终点与真实
-     *    卡片逐像素重合（跨方向会话的进场锚点已在旋转沉降后现拍过一次，此处再取的是
-     *    还栏后的最终位置）；
-     * ② 收拢结束 finishNow → finish → 无宿主可收 → `super.finish()`，无额外等待。
+     * 主页停留横屏两列布局 = 最终态）：[closing] 置位 →
+     * [AppTransitions.collapseAndFinish](relocateAnchor = true) 收拢 —— 收拢前向活性源
+     * 条目**现取**趋势卡当前矩形/新截图，终点与真实卡片逐像素重合；收拢结束 finishNow
+     * → finish → 无宿主可收 → `super.finish()`。本页栏全程显示（2026-11-11 定案 A），
+     * 源页布局从未被收栏重排过，无需 SportLink 图表页的"还栏 + 300ms 沉降"。
      *
      * **竖屏返回退出**（设备竖握 / 判定失败）：**不收拢**（SportLink 定案：显示即将
      * 转回竖屏，任何横屏坐标系里的收拢终点在转回后必然失配）→ `super.finish()` 主题
@@ -333,13 +313,11 @@ class TrendFullscreenActivity : ComponentActivity() {
      * 判据经平放加固，见 [exitWillBeLandscape]）：
      *
      * **停留横屏**（设备横握/平放，finish 后显示仍横屏、主页停留横屏两列布局 = 最终态）：
-     * ⓪ 首次 finish：还系统栏 → 等 [BAR_SETTLE_DELAY_MS]（"还栏防列表跳动"：半透明
-     *    窗口下的主页被连带排成无栏全高布局，收拢前现取的锚点必须是还栏后位置；
-     *    等待期本页内容完整可见、不淡出）；
-     * ① 再次 finish：[closing] 置位 → [AppTransitions.collapseAndFinish](relocateAnchor
-     *    = true) 收拢 —— 收拢前向活性源条目**现取**趋势卡当前矩形/新截图（共享槽位
-     *    修复后读到的必是主页横屏布局的真实卡片，2026-09-30）；
-     * ② 收拢结束 finishNow → finish → 无宿主可收 → `super.finish()`（关闭转场已压 0）。
+     * [closing] 置位 → [AppTransitions.collapseAndFinish](relocateAnchor = true) 收拢 ——
+     * 收拢前向活性源条目**现取**趋势卡当前矩形/新截图（共享槽位修复后读到的必是主页
+     * 横屏布局的真实卡片，2026-09-30）；收拢结束 finishNow → finish → 无宿主可收 →
+     * `super.finish()`（关闭转场已压 0）。本页栏全程显示（2026-11-11 定案 A），源页布局
+     * 从未被收栏重排过，无需 SportLink 图表页的"还栏 + 300ms 沉降"。
      *
      * **转回竖屏**（设备明确竖握）：**不收拢** —— 收拢动画播在被本页钉住的横屏窗口里
      * （内容横着），finish 后显示再转回竖屏 = "先强制横屏再旋转"（2026-09-30 用户
@@ -356,34 +334,22 @@ class TrendFullscreenActivity : ComponentActivity() {
             "PowerMeterTransit",
             "trend exit split: landscapeExit=$landscapeExit quadrant=$sensorQuadrant flat=$sensorFlat",
         )
-        if (!exitBarRestoreDone && landscapeExit) {
-            // ⓪ 还系统栏 + 等主页按"有栏"重排落定（SportLink exitBarRestoreDone 同款：
-            // finish() 会被收拢完成后的 finishNow 重入，本标记保证还栏只做一次）
-            exitBarRestoreDone = true
-            NavigationBarHelper.exitImmersive(this)
-            window.decorView.postDelayed({
-                if (!isDestroyed && !isFinishing) finish()
-            }, BAR_SETTLE_DELAY_MS)
-            return
-        }
         if (landscapeExit) {
-            // ① 停留横屏：收拢（收拢前现取锚点当前位置，语义见 collapseAndFinish）
+            // 停留横屏：收拢（收拢前现取锚点当前位置，语义见 collapseAndFinish）
             closing = true
             if (AppTransitions.collapseAndFinish(this, relocateAnchor = true)) return
             super.finish()
             return
         }
-        // ② 转回竖屏：不收拢，主题窗口动画滑出（SportLink 同款）
+        // 转回竖屏：不收拢，主题窗口动画滑出（SportLink 同款）
         super.finish()
     }
 
     /**
-     * 旋转 / 深浅色切换（声明 configChanges → 不重建 Activity）后重放沉浸设置。
-     * 系统与 MIUI/HyperOS 会在配置变更后按主题默认值重放系统栏属性，可能把栏重新显示出来。
-     *
-     * ⚠️ 关闭中（[closing]）走另一条分支：此时系统栏**已恢复**，重放 [replayImmersive] 会把刚
-     * 显示的栏再收回去；而这里的配置变更正是"方向已转回"的信号 —— 只重放窗口属性（不 hide），
-     * 等一帧让窗口按新尺寸完成绘制，再执行关闭。
+     * 旋转 / 深浅色切换（声明 configChanges → 不重建 Activity）后重放窗口属性 + 显式
+     * 保持系统栏显示：系统与 MIUI/HyperOS 会在配置变更后按主题默认值重放系统栏属性。
+     * 关闭中也照常重放 —— 本页从不 hide（2026-11-11 定案 A），show 幂等无害，不存在
+     * "把刚还的栏再收回去"问题。
      */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -397,19 +363,10 @@ class TrendFullscreenActivity : ComponentActivity() {
             // 首帧判定：宿主已 RESUMED → 播圆孔揭露；仍 paused 可见 → 闸门静默落地
             darkThemeState.value = dark
         }
-        if (closing || closeRequested) {
-            // 关闭中/还栏等待期：系统与 MIUI/HyperOS 会在配置变更后按主题默认值重放
-            // 系统栏属性，这里只重放窗口属性（不 hide）——否则把刚还的栏再收回去
-            // （等待期）或把收拢所需的"有栏"终态打回无栏（收拢中）。180° 翻面（横屏↔
-            // 横屏，orientation 不变）也走这里：收拢中翻面的终点失配为已知遗留（批次
-            // 五十五），还栏等待期翻面由收拢前的现拍兜底
-            NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
-            return
-        }
-        replayImmersive()
+        replaySystemBars()
         // 延迟一帧兜底：确保系统重放之后再压一次
         window.decorView.post {
-            if (!isFinishing && !isDestroyed) replayImmersive()
+            if (!isFinishing && !isDestroyed) replaySystemBars()
         }
     }
 
@@ -430,19 +387,20 @@ class TrendFullscreenActivity : ComponentActivity() {
         super.onPause()
     }
 
-    /** 从多任务/锁屏回到前台时系统可能重新显示系统栏，重新隐藏（关闭中/退出等待期不再隐藏） */
+    /** 聚焦时重放窗口属性 + 显式保持系统栏显示（show 幂等；本页从不 hide，关闭中同样无害） */
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && !closing && !closeRequested) replayImmersive()
+        if (hasFocus) replaySystemBars()
     }
 
-    private fun replayImmersive() {
-        NavigationBarHelper.setupEdgeToEdge(
-            this,
-            lightStatusBar = !isNightMode(),
-            immersive = true,
-        )
-        NavigationBarHelper.enterImmersive(this)
+    /**
+     * 重放窗口属性 + 显式保持系统栏显示（2026-11-11 定案 A）：edge-to-edge 属性照旧
+     * 重放（旋转/重放链的公共出口，见 NavigationBarHelper.applyWindowProperties 的注释），
+     * 栏恒显示、永不 hide——聚焦 / 配置变更都走这里。
+     */
+    private fun replaySystemBars() {
+        NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
+        NavigationBarHelper.keepSystemBarsShown(this)
     }
 
     private fun isNightMode(): Boolean =
@@ -516,9 +474,11 @@ private fun TrendFullscreenScreen(
             Modifier
                 .fillMaxSize()
                 // 避开摄像头（竖屏顶部中央打孔 / 横屏左右侧打孔，全边避让一次覆盖）。
-                // 只避 cutout，**不**避 systemBars：系统栏已隐藏，内容必须延伸到屏幕最底，
-                // 这才是真沉浸；用 safeDrawing 全边避让只会把系统栏区域换成一条背景色带。
                 .windowInsetsPadding(WindowInsets.displayCutout)
+                // 系统栏全程显示（2026-11-11 定案 A）：顶部避开状态栏（SportLink
+                // DetailFullscreenActivity 同款"进屏时卡片顶部避开状态栏"），透明状态栏
+                // 悬浮在页面底色之上；导航小白条仍延伸到其下（与主页同观感）
+                .windowInsetsPadding(WindowInsets.statusBars)
                 // padding 无「horizontal + top + bottom」混合重载，须拆成两次调用
                 .padding(horizontal = 12.dp)
                 .padding(vertical = 12.dp),

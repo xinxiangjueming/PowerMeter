@@ -15,7 +15,7 @@ import androidx.compose.ui.unit.dp
  * 帧率详情页概览卡(tonal=3) 与其余卡(tonal=2)。
  *
  * 为什么 tonal 差异会**真的显色**（而非只影响阴影）：Theme 把 surfaceContainerLow
- * 钉成与 surface 同值（深 0xFF333333 / 浅 0xFFFFFFFF，见 Theme.withSportLinkSurfaces），
+ * 钉成与 surface 同值（深 0xFF242424 / 浅 0xFFFFFFFF，见 Theme.withSportLinkSurfaces），
  * 而 material3 1.5.0-alpha27 的 Surface 无条件走
  * `applyTonalElevation(color, absoluteElevation)`，该函数仅在 `color == surface` 时
  * 叠加 surfaceTint —— 两个条件同时成立，于是 tonal 2/3 让卡片带上 primary 色偏，
@@ -48,7 +48,7 @@ fun AppCard(
  *
  * ⚠️ 恒 0 是**有意的**（基准 = 帧率列表卡旧观感）：surfaceContainerLow 与 surface 同值，
  * 一旦给非零 tonal，M3 就会往卡片上叠 surfaceTint（primary 色偏），卡片不再是纯
- * surfaceContainerLow（深 0xFF333333 / 浅 0xFFFFFFFF）。要恢复带色调的版本改这里即可，
+ * surfaceContainerLow（深 0xFF242424 / 浅 0xFFFFFFFF）。要恢复带色调的版本改这里即可，
  * 但必须三页一起变。
  */
 private val APP_CARD_TONAL_ELEVATION = 0.dp

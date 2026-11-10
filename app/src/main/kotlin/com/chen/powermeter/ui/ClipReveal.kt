@@ -70,8 +70,8 @@ import com.chen.powermeter.ui.theme.screenCornerRadiusPx
  * 的 rect 换算逻辑）。
  *
  * 动画公式（f: 0=锚点卡片矩形 → 1=全屏；收拢反向；实现见 [RevealGeometry.applyTo]）：
- * - left    = anchorLeft * (1 - f)                        （锚点矩形缺省 = 全宽/中心线）
- * - right   = width - (width - anchorRight) * (1 - f)
+ * - left    = anchorLeft → targetLeft 线性插值（targetLeft = 挖孔安全区左界，竖屏 = 0）
+ * - right   = anchorRight → targetRight 线性插值（targetRight = 安全区右界，竖屏 = width）
  * - top     = anchorTop * (1 - f)
  * - bottom  = height - (height - anchorBottom) * (1 - f)
  * - cornerR = startRadius + (endRadius - startRadius) * f （小米系两端相等 = 恒定）
@@ -324,13 +324,16 @@ object ClipReveal {
         private val anchorBottom: Float,
         private val startRadius: Float,
         private val endRadius: Float,
+        /** 展开/收拢终态左右边界（2026-11-11 钳到挖孔安全区；竖屏 = 0/width = 旧行为） */
+        private val targetLeft: Float,
+        private val targetRight: Float,
     ) {
         /** 把进度 f 对应的裁剪窗口（矩形 + 圆角）应用到 [clip]。透明度由调用方按进/收拢时间窗驱动 */
         fun applyTo(clip: ClipRevealLayout, f: Float) {
             clip.setClipBounds(
-                anchorLeft * (1f - f),
+                anchorLeft + (targetLeft - anchorLeft) * f,
                 anchorTop * (1f - f),
-                width - (width - anchorRight) * (1f - f),
+                anchorRight + (targetRight - anchorRight) * f,
                 height - (height - anchorBottom) * (1f - f),
                 startRadius + (endRadius - startRadius) * f,
             )
@@ -342,6 +345,8 @@ object ClipReveal {
      * fitsSystemWindows 差全部抵消），并钳到容器内保证裁剪值合法。
      * 锚点矩形缺省/退化（宽或高 ≤ 0 / 钳后为空）时退化为旧行为：全宽 + 过
      * [anchorYInWindow] 的水平线。
+     * 展开/收拢终态左右边界钳到挖孔安全区（横屏摄像头条，2026-11-11，见实现内注释）：
+     * 进场/退场/同窗口覆盖层/跨 Activity 共用本出口，一处钳制全链生效。
      */
     internal fun buildRevealGeometry(
         width: Float,
@@ -352,6 +357,8 @@ object ClipReveal {
         clipOriginX: Float,
         clipOriginY: Float,
         activity: Activity,
+        /** 终态圆角覆盖（跨方向进场 2026-11-02 SportLink 同款）：null = 既有行为（屏幕物理圆角） */
+        endCornerRadiusPx: Float? = null,
     ): RevealGeometry {
         val rect = anchorRectInWindow?.takeIf { it.width() > 0 && it.height() > 0 }
         var anchorLeft = 0f
@@ -371,9 +378,22 @@ object ClipReveal {
             }
         }
         val startRadius = anchorCornerRadiusPx ?: defaultAnchorRadiusPx(activity)
+        // 展开/收拢终态的左右边界钳到挖孔安全区（2026-11-11）：窗口 edge-to-edge（挖孔
+        // ALWAYS）物理上含横屏左右长边的摄像头条，旧终态 = 全窗矩形 → 进场末段/退场起段
+        // 扩张矩形越过安全区扫进摄像头条、条带先被容器底色（卡片白）刷一遍再被页面底色
+        // 盖回 = 结构性穿帮（终态边界问题，调速率救不了：四边共用同一进度 f，边再慢也
+        // 终会到达）。钳制后裁剪窗口从始至终出不了安全区（[ClipRevealLayout.draw] 把
+        // 全部绘制含容器底色都裁在窗口内，窗口外恒透真实页面）；竖屏 displayCutout 左右
+        // 恒 0 = 行为完全不变。顶/底不钳：竖屏顶部圆点随顶边扫过是既有观感，系统栏区域
+        // 本就随内容延伸（SportLink 同窗口覆盖层同口径）
+        val cut = activity.window?.decorView?.rootWindowInsets
+            ?.getInsets(android.view.WindowInsets.Type.displayCutout())
+        val targetLeft = ((cut?.left ?: 0) - clipOriginX).coerceIn(0f, width)
+        val targetRight = width - ((cut?.right ?: 0) - clipOriginX).coerceIn(0f, width)
         return RevealGeometry(
             width, height, anchorLeft, anchorTop, anchorRight, anchorBottom,
-            startRadius, screenEndRadiusPx(activity),
+            startRadius, endCornerRadiusPx ?: screenEndRadiusPx(activity),
+            targetLeft, targetRight,
         )
     }
 

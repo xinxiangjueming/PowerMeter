@@ -288,6 +288,11 @@ class FrameDetailActivity : ComponentActivity() {
         ChartPerf.orientation = resources.configuration.orientation
         initialDark = isNightMode()
         NavigationBarHelper.setupEdgeToEdge(this, lightStatusBar = !isNightMode())
+        // 允许内容延伸到摄像头区域（SportLink DetailFullscreen 同款）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.attributes.layoutInDisplayCutoutMode =
+                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
 
         val sessionId = intent?.getLongExtra(EXTRA_SESSION_ID, NO_ID) ?: NO_ID
 
@@ -345,6 +350,10 @@ class FrameDetailActivity : ComponentActivity() {
                     withFrameNanos { }
                     AppTransitions.notifyPageReady(this@FrameDetailActivity)
                 }
+                // 系统栏口径（2026-11-11 定案 A）：本页栏全程显示、转场中不碰——转场中
+                // 收栏会把 statusBars inset 归零，半透明窗下的列表连带重排上移、首帧已按
+                // "有栏布局"采集的展开几何失效 = 显示区域变化/界面侵入状态栏区；HyperOS
+                // 半透明窗打开瞬间的自动收栏由 onWindowFocusChanged 显式 show 反制
 
                 // DialogBackdropHost：详情页弹窗（稳帧指数 / Jank ⓘ）走「宿主 + slot」玻璃路径。
                 // ⚠️ 缺宿主时 GlassDialog 降级为**就地渲染**——说明弹窗长在统计卡里，
@@ -393,6 +402,24 @@ class FrameDetailActivity : ComponentActivity() {
     }
 
     /**
+     * 聚焦时显式保持系统栏显示（2026-11-11 定案 A，SportLink DetailFullscreenActivity
+     * "非全屏沉浸"姿态同款）：本页从不 hide，这笔是对 HyperOS 在半透明全屏窗打开瞬间
+     * 的自动收栏行为的反制——聚焦与自动收栏几乎同时发生，show 幂等（栏已显示时 no-op）；
+     * post 一拍兜底，确保压在系统重放之后。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && !isFinishing) {
+            NavigationBarHelper.keepSystemBarsShown(this)
+            window.decorView.post {
+                if (!isFinishing && !isDestroyed) {
+                    NavigationBarHelper.keepSystemBarsShown(this@FrameDetailActivity)
+                }
+            }
+        }
+    }
+
+    /**
      * 跨 Activity 转场装配（SportLink DeviceManageActivity / 本项目 TrendFullscreenActivity
      * 同款时机）：有新鲜 Handoff（从列表卡片点进）→ 页面根包进 ClipRevealLayout，进场
      * 首帧从卡片矩形四向撑开、返回整页收拢（expandOnEnter 默认 true，2026-09-30 试验
@@ -408,6 +435,10 @@ class FrameDetailActivity : ComponentActivity() {
     /**
      * 返回 = 收拢转场优先（onBack 按钮 / 返回手势 / 返回键都经此）：有收拢宿主 → 整页
      * 裁剪收回源卡片矩形后 finish（一镜到底）；无 → 直接 finish（主题窗口动画）。
+     *
+     * 系统栏口径（2026-11-11 定案 A）：本页栏全程显示、从不 hide，源页布局从未被收栏
+     * 重排过 → 无需 SportLink 图表页的"还栏 + 300ms 沉降"（原 BAR_SETTLE_DELAY_MS
+     * 分支已随沉浸机制一并拆除）。
      */
     override fun finish() {
         // staleTheme（2026-09-28）：详情页期间系统深浅变化过 → 收拢截图素材（冻结列表 /
@@ -421,6 +452,7 @@ class FrameDetailActivity : ComponentActivity() {
         if (
             AppTransitions.collapseAndFinish(
                 this,
+                relocateAnchor = true,
                 staleTheme = darkTarget != initialDark,
                 darkTarget = darkTarget,
             )
